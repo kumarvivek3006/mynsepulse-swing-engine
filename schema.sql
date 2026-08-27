@@ -6,8 +6,9 @@
 -- names like `signals` and `symbols` would otherwise collide. Every product
 -- gets its own schema; `public` is reserved for genuinely shared entities.
 
-create extension if not exists "uuid-ossp";
-
+-- gen_random_uuid() is built into Postgres 13+ and always resolvable,
+-- unlike uuid_generate_v4() which lives in the extensions schema and
+-- breaks once search_path is set to swing.
 create schema if not exists swing;
 set search_path to swing, public;
 
@@ -20,7 +21,7 @@ grant usage on schema swing to service_role;
 -- ---------------------------------------------------------------
 create table symbols (
     symbol            text primary key,          -- 'RELIANCE'
-    fyers_symbol      text not null unique,       -- 'NSE:RELIANCE-EQ'
+    upstox_instrument_key text unique,            -- 'NSE_EQ|INE002A01018'
     isin              text,
     company_name      text,
     series            text,                       -- EQ / BE / T2T
@@ -66,7 +67,7 @@ create table ohlcv_weekly (
 -- Corporate actions — drives adj_factor
 -- ---------------------------------------------------------------
 create table corporate_actions (
-    id            uuid primary key default uuid_generate_v4(),
+    id            uuid primary key default gen_random_uuid(),
     symbol        text not null references symbols(symbol) on delete cascade,
     ex_date       date not null,
     action_type   text not null,     -- split | bonus | dividend | demerger | rights
@@ -129,7 +130,7 @@ create table events_calendar (
 );
 
 create table news (
-    id            uuid primary key default uuid_generate_v4(),
+    id            uuid primary key default gen_random_uuid(),
     symbol        text references symbols(symbol) on delete cascade,
     published_at  timestamptz not null,
     source        text,
@@ -160,7 +161,7 @@ create table market_regime (
 -- Engine output
 -- ---------------------------------------------------------------
 create table signals (
-    id                uuid primary key default uuid_generate_v4(),
+    id                uuid primary key default gen_random_uuid(),
     symbol            text not null references symbols(symbol),
     generated_at      timestamptz not null default now(),
     as_of_date        date not null,
