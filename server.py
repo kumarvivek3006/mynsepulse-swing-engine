@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import secrets
+import threading
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -128,6 +130,90 @@ def callback(code: str | None = Query(None), state: str | None = Query(None)):
     expires = store.read().get("expires_at", "unknown")
     log.info("Upstox token stored, valid until %s", expires)
     return HTMLResponse(_page("Connected", f"Token valid until {expires}."))
+
+
+# ---------------------------------------------------------------------
+# Long-running jobs
+#
+# The backfill has to run in this process: it needs the Upstox token on
+# the /data volume, and a Railway volume attaches to one service only.
+# It runs on a background thread so the HTTP request returns immediately
+# — a 20-minute request would be killed by the proxy long before the job
+# finished. Progress is read back from the ingestion_runs table.
+# ---------------------------------------------------------------------
+_job_lock = threading.Lock()
+_job_state: dict = {"name": None, "running": False, "started_at": None,
+                    "finished_at": None, "error": None}
+
+
+def _run_job(name: str, fn) -> None:
+    try:
+        fn()
+        with _job_lock:
+            _job_state.update(running=False, finished_at=datetime.now(IST).isoformat(),
+                              error=None)
+        log.info("Job %s finished", name)
+    except Exception:
+        detail = traceback.format_exc(limit=6)
+        with _job_lock:
+            _job_state.update(running=False, finished_at=datetime.now(IST).isoformat(),
+                              error=detail)
+        log.error("Job %s failed:\n%s", name, detail)
+
+
+@app.post("/jobs/cold-start")
+def cold_start_job(request: Request):
+    """Kicks off the full ingestion. Idempotent and resumable if re-run."""
+    require_internal_key(request)
+
+    if store.valid_token() is None:
+        raise HTTPException(409, "No valid Upstox token — connect Upstox first")
+
+    with _job_lock:
+        if _job_state["running"]:
+            raise HTTPException(409, f"Job already running: {_job_state['name']}")
+        _job_state.update(name="cold_start", running=True,
+                          started_at=datetime.now(IST).isoformat(),
+                          finished_at=None, error=None)
+
+    from ingest import cold_start
+    threading.Thread(target=_run_job, args=("cold_start", cold_start), daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+@app.get("/jobs/status")
+def jobs_status(request: Request):
+    require_internal_key(request)
+    with _job_lock:
+        current = dict(_job_state)
+
+    runs, counts = [], {}
+    try:
+        from ingest import connect
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select job, started_at, finished_at, status, rows_written, "
+                            "error from ingestion_runs order by id desc limit 12")
+                runs = [
+                    {"job": r[0], "started_at": str(r[1]), "finished_at": str(r[2]),
+                     "status": r[3], "rows_written": r[4],
+                     "error": (r[5][:300] if r[5] else None)}
+                    for r in cur.fetchall()
+                ]
+                cur.execute("select (select count(*) from symbols), "
+                            "(select count(*) from ohlcv_daily), "
+                            "(select count(*) from corporate_actions), "
+                            "(select count(*) from surveillance)")
+                s, o, c, v = cur.fetchone()
+                counts = {"symbols": s, "ohlcv_daily": o,
+                          "corporate_actions": c, "surveillance": v}
+        finally:
+            conn.close()
+    except Exception as exc:
+        counts = {"error": str(exc)[:200]}
+
+    return {"current": current, "recent_runs": runs, "row_counts": counts}
 
 
 @app.post("/auth/upstox/disconnect")
