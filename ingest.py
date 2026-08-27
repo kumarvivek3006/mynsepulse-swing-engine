@@ -28,8 +28,8 @@ from datetime import date, datetime, timedelta
 import psycopg
 from psycopg import sql
 
-from data.nse_client import NSEClient, NSEUnavailable
-from data.upstox_client import InstrumentMaster, UpstoxClient
+from nse_client import NSEClient, NSEUnavailable
+from upstox_client import InstrumentMaster, UpstoxClient
 
 log = logging.getLogger(__name__)
 

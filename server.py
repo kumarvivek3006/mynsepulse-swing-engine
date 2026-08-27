@@ -24,7 +24,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from data.upstox_client import (
+from upstox_client import (
     IST,
     TokenStore,
     UpstoxCredentials,
