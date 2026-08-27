@@ -1,0 +1,174 @@
+"""
+mynsepulse swing engine — auth + health service.
+
+Exists for one reason: Upstox access tokens die at 03:30 IST every day and
+cannot be refreshed, so a human has to approve a fresh authorisation once
+daily. This serves the two endpoints that flow needs, plus a health page
+that tells you at a glance whether today's token is in place.
+
+Deliberately minimal. No market data is served from here — the scanner
+runs as a scheduled job and talks to Supabase directly.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import secrets
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+from data.upstox_client import (
+    IST,
+    TokenStore,
+    UpstoxCredentials,
+    authorization_url,
+    exchange_auth_code,
+)
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+log = logging.getLogger("auth-server")
+
+app = FastAPI(title="mynsepulse swing engine", docs_url=None, redoc_url=None)
+
+STATE_PATH = Path("/data/oauth_state.json")
+STATE_TTL = timedelta(minutes=10)
+
+store = TokenStore()
+
+
+def creds() -> UpstoxCredentials:
+    try:
+        return UpstoxCredentials(
+            api_key=os.environ["UPSTOX_API_KEY"],
+            api_secret=os.environ["UPSTOX_API_SECRET"],
+            redirect_uri=os.environ["UPSTOX_REDIRECT_URI"],
+        )
+    except KeyError as missing:
+        raise HTTPException(503, f"Server misconfigured: {missing} not set")
+
+
+# ---------------------------------------------------------------------
+# Internal auth — same lesson as the NSE Pulse endpoints. Never a
+# publishable key, always a timing-safe compare, fail closed.
+# ---------------------------------------------------------------------
+def require_internal_key(request: Request) -> None:
+    expected = os.environ.get("INTERNAL_API_KEY")
+    if not expected:
+        raise HTTPException(503, "INTERNAL_API_KEY not configured")
+    provided = request.headers.get("x-internal-key", "")
+    if not hmac.compare_digest(
+        hashlib.sha256(provided.encode()).digest(),
+        hashlib.sha256(expected.encode()).digest(),
+    ):
+        raise HTTPException(401, "Unauthorized")
+
+
+# ---------------------------------------------------------------------
+# CSRF state — single use, short lived
+# ---------------------------------------------------------------------
+def issue_state() -> str:
+    state = secrets.token_urlsafe(32)
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps({
+        "state": state,
+        "expires_at": (datetime.now(IST) + STATE_TTL).isoformat(),
+    }))
+    return state
+
+
+def consume_state(provided: str) -> bool:
+    """Single use: the state is destroyed whether or not it matched."""
+    if not STATE_PATH.exists():
+        return False
+    try:
+        row = json.loads(STATE_PATH.read_text())
+    except json.JSONDecodeError:
+        return False
+    finally:
+        STATE_PATH.unlink(missing_ok=True)
+
+    if datetime.fromisoformat(row.get("expires_at", "1970-01-01T00:00:00+05:30")) < datetime.now(IST):
+        log.warning("OAuth state expired")
+        return False
+    return hmac.compare_digest(row.get("state", ""), provided)
+
+
+# ---------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------
+@app.get("/auth/upstox/login")
+def login():
+    """Tap this once a day. Redirects to Upstox for approval."""
+    return RedirectResponse(authorization_url(creds(), state=issue_state()), status_code=302)
+
+
+@app.get("/auth/upstox/callback", response_class=HTMLResponse)
+def callback(code: str | None = Query(None), state: str | None = Query(None)):
+    if not code or not state:
+        return HTMLResponse(_page("Login failed", "Upstox did not return a code."), 400)
+
+    if not consume_state(state):
+        log.warning("OAuth callback with bad or expired state")
+        return HTMLResponse(_page("Login failed", "State mismatch. Start again."), 400)
+
+    try:
+        token = exchange_auth_code(creds(), code)
+    except Exception as exc:
+        log.error("Token exchange failed: %s", exc)
+        return HTMLResponse(_page("Login failed", "Token exchange rejected."), 502)
+
+    store.write(token)
+    expires = store.read().get("expires_at", "unknown")
+    log.info("Upstox token stored, valid until %s", expires)
+    return HTMLResponse(_page("Connected", f"Token valid until {expires}."))
+
+
+@app.post("/auth/upstox/disconnect")
+def disconnect(request: Request):
+    """
+    Clears the stored token. Protected by the internal key: the UI must
+    call this through a Lovable server function, never from the browser,
+    so the key stays server-side. Worst case if it leaked is a forced
+    re-login, but a forced re-login at 16:10 means a missed scan.
+    """
+    require_internal_key(request)
+    was_connected = store.valid_token() is not None
+    store.path.unlink(missing_ok=True)
+    log.info("Upstox token cleared (was_connected=%s)", was_connected)
+    return {"ok": True, "was_connected": was_connected}
+
+
+@app.get("/health")
+def health():
+    """Public but says nothing sensitive: no token, no expiry, just fit/unfit."""
+    return {"ok": True, "authenticated": store.valid_token() is not None}
+
+
+@app.get("/status")
+def status(request: Request):
+    require_internal_key(request)
+    row = store.read()
+    return {
+        "authenticated": store.valid_token() is not None,
+        "issued_at": row.get("issued_at"),
+        "expires_at": row.get("expires_at"),
+        "now_ist": datetime.now(IST).isoformat(),
+        "paper_mode": os.environ.get("PAPER_MODE", "true"),
+        "universe": os.environ.get("UNIVERSE"),
+    }
+
+
+def _page(title: str, detail: str) -> str:
+    return f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{{font:16px system-ui;background:#0b0f14;color:#e6edf3;display:grid;
+place-items:center;height:100vh;margin:0;text-align:center}}
+.c{{max-width:32rem;padding:2rem}}h1{{color:#2dd4bf;font-size:1.25rem}}
+p{{color:#8b949e;line-height:1.6}}</style>
+<div class=c><h1>{title}</h1><p>{detail}</p></div>"""
