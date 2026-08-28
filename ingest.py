@@ -264,8 +264,13 @@ def apply_adjustments(conn) -> int:
             # ratio_from/ratio_to arrive as Decimal from a numeric column;
             # mixing Decimal with float literals raises TypeError.
             a, b = float(a), float(b)
-            expected = (a / b) if kind == "split" else (a / (a + b))
-            if not expected or not (0 < expected < 1):
+            # Split "1:N": one share becomes N, so price scales by a/b.
+            # Bonus "X:Y": X new shares per Y held, leaving X+Y shares for
+            # every Y originally owned — the price factor is b/(a+b), not
+            # a/(a+b). The two agree only when X == Y, which is why 1:1
+            # bonuses hid this.
+            expected = (a / b) if kind == "split" else (b / (a + b))
+            if not expected or not (0 < expected < 0.95):
                 continue
 
             cur.execute("""
@@ -287,10 +292,10 @@ def apply_adjustments(conn) -> int:
                 continue
 
             observed = float(row[2]) / float(row[1])
-            # If the series were unadjusted, observed would land near the
-            # ratio itself (0.1 for a 1:10 split). Allow generous slack for
-            # genuine price movement on the day.
-            if observed < expected * 1.5:
+            # An unadjusted series moves by roughly the ratio across the
+            # ex-date; an adjusted one barely moves at all. Flag only when
+            # the observed move sits closer to the ratio than to 1.0.
+            if observed < (1.0 + expected) / 2.0:
                 suspect.append((symbol, ex_date, kind, expected, round(observed, 4)))
 
     conn.commit()
