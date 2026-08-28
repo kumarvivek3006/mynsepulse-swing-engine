@@ -22,7 +22,6 @@ from __future__ import annotations
 import io
 import logging
 import os
-from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 import psycopg
@@ -230,15 +229,27 @@ def backfill_prices(conn, client: UpstoxClient, years: int = BACKFILL_YEARS,
 # ---------------------------------------------------------------------
 def apply_adjustments(conn) -> int:
     """
-    Back-adjust prices for splits and bonuses.
+    Verify that prices are corporate-action adjusted. Do not adjust them.
 
-    A bar's factor is the cumulative product of every split/bonus factor
-    with an ex-date AFTER that bar. Bars after all actions get 1.0. This
-    is recomputed from scratch each run rather than incrementally, because
-    an incremental error compounds silently across three years and would
-    only surface as a base that looks tighter than it was.
+    Upstox returns history already adjusted for splits and bonuses. An
+    earlier version of this job applied its own back-adjustment factors on
+    top, which double-adjusted the series and inserted a 10x cliff into
+    NESTLEIND across its 1:10 split — precisely the kind of artefact that
+    base detection would read as a breakout.
+
+    So this step now checks rather than mutates. For every split/bonus we
+    know about, it measures the close-to-close move across the ex-date. On
+    an already-adjusted series that move is ordinary. A move close to the
+    action's ratio means the source stopped adjusting, and that must fail
+    loudly rather than quietly feeding wrong levels into every stop loss.
     """
     with conn.cursor() as cur:
+        # Any leftover factors from the old behaviour must go.
+        cur.execute("update ohlcv_daily set adj_factor = 1.0 where adj_factor <> 1.0")
+        reset = cur.rowcount
+        if reset:
+            log.warning("Reset %d bars carrying stale adjustment factors", reset)
+
         cur.execute("""
             select symbol, ex_date, action_type, ratio_from, ratio_to
             from corporate_actions
@@ -248,37 +259,49 @@ def apply_adjustments(conn) -> int:
         """)
         actions = cur.fetchall()
 
-    by_symbol: dict[str, list[tuple[date, float]]] = defaultdict(list)
-    for symbol, ex_date, kind, a, b in actions:
-        factor = (a / b) if kind == "split" else (a / (a + b))
-        if factor and 0 < factor < 1:
-            by_symbol[symbol].append((ex_date, float(factor)))
+        suspect = []
+        for symbol, ex_date, kind, a, b in actions:
+            expected = (a / b) if kind == "split" else (a / (a + b))
+            if not expected or not (0 < expected < 1):
+                continue
 
-    if not by_symbol:
-        log.info("No split/bonus actions to apply")
-        return 0
-
-    updated = 0
-    with conn.cursor() as cur:
-        cur.execute("update ohlcv_daily set adj_factor = 1.0 where adj_factor <> 1.0")
-
-        for symbol, events in by_symbol.items():
-            events.sort()
-            # Walk backwards: each earlier bar carries the product of all
-            # later actions.
-            cumulative = 1.0
-            for ex_date, factor in reversed(events):
-                cumulative *= factor
-                cur.execute(
-                    "update ohlcv_daily set adj_factor = %s "
-                    "where symbol = %s and trade_date < %s",
-                    (cumulative, symbol, ex_date),
+            cur.execute("""
+                with bars as (
+                    select trade_date, close,
+                           lag(close) over (order by trade_date) as prev
+                    from ohlcv_daily
+                    where symbol = %s
+                      and trade_date between %s::date - 10 and %s::date + 10
                 )
-                updated += cur.rowcount
+                select trade_date, prev, close
+                from bars
+                where trade_date >= %s and prev is not null
+                order by trade_date
+                limit 1
+            """, (symbol, ex_date, ex_date, ex_date))
+            row = cur.fetchone()
+            if not row or not row[1]:
+                continue
+
+            observed = row[2] / row[1]
+            # If the series were unadjusted, observed would land near the
+            # ratio itself (0.1 for a 1:10 split). Allow generous slack for
+            # genuine price movement on the day.
+            if observed < expected * 1.5:
+                suspect.append((symbol, ex_date, kind, expected, round(observed, 4)))
+
     conn.commit()
-    log.info("Adjustment factors applied to %d bars across %d symbols",
-             updated, len(by_symbol))
-    return updated
+
+    if suspect:
+        detail = "; ".join(f"{s} {d} {k} expected~{e:.3f} observed {o}"
+                           for s, d, k, e, o in suspect[:10])
+        raise RuntimeError(
+            f"{len(suspect)} corporate action(s) appear UNADJUSTED in the price "
+            f"series. Prices cannot be trusted for level derivation. {detail}"
+        )
+
+    log.info("Adjustment check passed: %d split/bonus events, none unadjusted", len(actions))
+    return len(actions)
 
 
 # ---------------------------------------------------------------------
@@ -321,7 +344,7 @@ def cold_start() -> None:
             ("sync_universe", lambda: sync_universe(conn, nse, master)),
             ("sync_corporate_actions", lambda: sync_corporate_actions(conn, nse)),
             ("backfill_prices", lambda: backfill_prices(conn, client)),
-            ("apply_adjustments", lambda: apply_adjustments(conn)),
+            ("verify_adjustments", lambda: apply_adjustments(conn)),
             ("sync_surveillance", lambda: sync_surveillance(conn, nse)),
         ]:
             log.info("=== %s ===", name)
