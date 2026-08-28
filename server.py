@@ -181,6 +181,24 @@ def cold_start_job(request: Request):
     return {"ok": True, "started": True}
 
 
+@app.post("/jobs/scan")
+def scan_job(request: Request):
+    """
+    Runs the gate scan and returns the candidate list synchronously.
+
+    Unlike the backfill this is seconds, not minutes — one query and some
+    pandas — so there is no reason to hide it behind a background thread
+    and a polling loop.
+    """
+    require_internal_key(request)
+    from scan import run_scan
+    try:
+        return run_scan()
+    except Exception as exc:
+        log.error("Scan failed: %s", exc)
+        raise HTTPException(500, f"Scan failed: {exc}")
+
+
 @app.get("/jobs/status")
 def jobs_status(request: Request):
     require_internal_key(request)
