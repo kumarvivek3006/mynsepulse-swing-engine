@@ -261,6 +261,9 @@ def apply_adjustments(conn) -> int:
 
         suspect = []
         for symbol, ex_date, kind, a, b in actions:
+            # ratio_from/ratio_to arrive as Decimal from a numeric column;
+            # mixing Decimal with float literals raises TypeError.
+            a, b = float(a), float(b)
             expected = (a / b) if kind == "split" else (a / (a + b))
             if not expected or not (0 < expected < 1):
                 continue
@@ -283,7 +286,7 @@ def apply_adjustments(conn) -> int:
             if not row or not row[1]:
                 continue
 
-            observed = row[2] / row[1]
+            observed = float(row[2]) / float(row[1])
             # If the series were unadjusted, observed would land near the
             # ratio itself (0.1 for a 1:10 split). Allow generous slack for
             # genuine price movement on the day.
