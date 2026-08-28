@@ -181,6 +181,83 @@ def cold_start_job(request: Request):
     return {"ok": True, "started": True}
 
 
+@app.get("/signals")
+def signals(request: Request):
+    """
+    Current signals for the dashboard, grouped into score bands.
+
+    Band labels are NOT conviction claims. Until resolved outcomes exist
+    the hit rate is null and the UI must say so — a score band asserting a
+    success probability nothing has measured is exactly the badge the
+    intraday desk had to remove.
+    """
+    require_internal_key(request)
+    from ingest import connect
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                select s.symbol, y.company_name, y.industry, s.as_of_date,
+                       s.setup_type, s.pattern, s.entry_trigger, s.stop_loss,
+                       s.t1, s.t2, s.r_multiple_t1, s.qty_suggested, s.risk_amount,
+                       s.score_total, s.score_breakdown, s.regime_state,
+                       s.notes, s.status, s.expires_on, s.base_low,
+                       s.base_start_date, s.pivot_bar_date
+                from signals s
+                join symbols y on y.symbol = s.symbol
+                where s.status in ('pending','triggered')
+                order by s.score_total desc
+            """)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            cur.execute("select state, breadth_above_50dma, vix, distribution_days, as_of "
+                        "from market_regime order by as_of desc limit 1")
+            reg = cur.fetchone()
+
+            # Realised hit rate per band, once outcomes exist.
+            cur.execute("""
+                select case when s.score_total >= 80 then 'high'
+                            when s.score_total >= 65 then 'medium'
+                            else 'low' end as band,
+                       count(*) filter (where o.r_realised is not null) as resolved,
+                       count(*) filter (where o.r_realised > 0) as wins
+                from signals s
+                left join signal_outcomes o on o.signal_id = s.id
+                group by 1
+            """)
+            calib = {r[0]: {"resolved": r[1], "wins": r[2],
+                            "hit_rate": (r[2] / r[1]) if r[1] and r[1] >= 20 else None}
+                     for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    def band(score):
+        return "high" if score >= 80 else "medium" if score >= 65 else "low"
+
+    for r in rows:
+        r["band"] = band(float(r["score_total"]))
+        for k in ("entry_trigger", "stop_loss", "t1", "t2", "r_multiple_t1",
+                  "score_total", "risk_amount", "base_low"):
+            if r.get(k) is not None:
+                r[k] = float(r[k])
+        for k in ("as_of_date", "expires_on", "base_start_date", "pivot_bar_date"):
+            if r.get(k) is not None:
+                r[k] = str(r[k])
+
+    return {
+        "regime": {"state": reg[0], "breadth_above_50dma": float(reg[1]) if reg and reg[1] is not None else None,
+                   "vix": float(reg[2]) if reg and reg[2] is not None else None,
+                   "distribution_days": reg[3], "as_of": str(reg[4])} if reg else None,
+        "calibration": {b: calib.get(b, {"resolved": 0, "wins": 0, "hit_rate": None})
+                        for b in ("high", "medium", "low")},
+        "signals": rows,
+        "counts": {b: sum(1 for r in rows if r["band"] == b)
+                   for b in ("high", "medium", "low")},
+    }
+
+
 @app.post("/jobs/scan")
 def scan_job(request: Request):
     """

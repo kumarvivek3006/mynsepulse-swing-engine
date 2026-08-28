@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -28,12 +28,16 @@ from gates import (
     relative_strength,
 )
 from ingest import connect
+from setups import Rejected, build_setup
 
 log = logging.getLogger(__name__)
 
 INDEX_SYMBOLS = ("NIFTY50", "NIFTY500", "INDIAVIX")
 MIN_BARS = 210          # enough for a 200 DMA plus slope
 FUNDAMENTALS_READY = False   # flip when NSE XBRL ingestion exists
+CAPITAL = float(os.environ.get("SWING_CAPITAL", "0") or 0)
+RISK_PCT = float(os.environ.get("RISK_PCT", "1.0"))
+SIGNAL_EXPIRY_SESSIONS = int(os.environ.get("SIGNAL_EXPIRY_SESSIONS", "5"))
 
 
 def _load_frames(conn) -> dict[str, pd.DataFrame]:
@@ -125,7 +129,7 @@ def run_scan(as_of: date | None = None) -> dict:
 
         # --- Gates 0 / 2 / 3 per symbol -------------------------------
         counts: dict[str, int] = {}
-        candidates: list[dict] = []
+        signals: list[dict] = []
         log_rows: list[tuple] = []
 
         for sym in universe:
@@ -158,30 +162,102 @@ def run_scan(as_of: date | None = None) -> dict:
             rs63 = relative_strength(df, nifty, 63)
             rs126 = relative_strength(df, nifty, 126)
             last = df.iloc[-1]
+            counts["passed_gates_0_3"] = counts.get("passed_gates_0_3", 0) + 1
 
-            candidates.append({
+            # Gates 4-7. In a risk-off regime the correct output is nothing,
+            # so setups are not even constructed — an empty list is the
+            # answer, not a failure.
+            if regime["state"] == "risk_off":
+                log_rows.append((as_of, sym, "gate1", "regime_risk_off", "{}"))
+                continue
+
+            try:
+                setup = build_setup(sym, df, rs63, rs126, FUNDAMENTALS_READY)
+            except Rejected as rej:
+                counts[rej.reason] = counts.get(rej.reason, 0) + 1
+                log_rows.append((as_of, sym, rej.gate, rej.reason,
+                                 json.dumps(rej.detail)))
+                continue
+
+            risk_per_share = setup.entry - setup.stop
+            qty = risk_amount = None
+            if CAPITAL > 0 and risk_per_share > 0:
+                budget = CAPITAL * (RISK_PCT / 100.0)
+                if regime["state"] == "neutral":
+                    budget /= 2          # half size in a mixed tape
+                qty = int(budget // risk_per_share)
+                cap_qty = int((CAPITAL * 0.10) // setup.entry)
+                qty = max(0, min(qty, cap_qty))
+                risk_amount = round(qty * risk_per_share, 2)
+
+            signals.append({
                 "symbol": sym,
+                "setup_type": setup.setup_type,
+                "pattern": setup.pattern,
+                "entry_trigger": setup.entry,
+                "stop_loss": setup.stop,
+                "t1": setup.t1,
+                "t2": setup.t2,
+                "r_multiple_t1": setup.r_multiple_t1,
+                "qty_suggested": qty,
+                "risk_amount": risk_amount,
+                "score_total": setup.score_total,
+                "score_breakdown": setup.score_breakdown,
+                "pivot_bar_date": str(df["trade_date"].iloc[setup.base.pivot_idx])[:10],
+                "base_start_date": str(df["trade_date"].iloc[setup.base.start_idx])[:10],
+                "base_low": setup.base.base_low,
                 "close": round(float(last["close"]), 2),
                 "atr14": round(float(last["atr14"]), 2),
-                "turnover20_cr": r0.detail.get("turnover20_cr"),
-                "pct_from_52w_high": r3.detail.get("pct_from_52w_high"),
-                "pct_above_52w_low": r3.detail.get("pct_above_52w_low"),
                 "rs63": rs63,
                 "rs126": rs126,
+                "stop_basis": setup.stop_basis,
+                "t1_basis": setup.t1_basis,
+                "notes": setup.notes,
             })
-            counts["passed"] = counts.get("passed", 0) + 1
-            log_rows.append((as_of, sym, None, "passed_gates_0_3",
-                             json.dumps({"rs63": rs63, "rs126": rs126})))
+            counts["signal"] = counts.get("signal", 0) + 1
+            log_rows.append((as_of, sym, None, "signal_generated",
+                             json.dumps({"score": setup.score_total,
+                                         "rr": setup.r_multiple_t1})))
+
+        signals.sort(key=lambda s: -s["score_total"])
 
         with conn.cursor() as cur:
             cur.executemany(
                 "insert into gate_log (as_of_date, symbol, failed_gate, reason_code, detail) "
                 "values (%s,%s,%s,%s,%s)", log_rows)
-        conn.commit()
 
-        # Strongest relative strength first — the ranking a trader would
-        # apply before looking at a single chart.
-        candidates.sort(key=lambda c: (c["rs63"] is None, -(c["rs63"] or 0)))
+            # Supersede today's previous run rather than accumulating
+            # duplicates; untriggered signals from earlier days keep running
+            # to their own expiry.
+            cur.execute("delete from signals where as_of_date = %s and status = 'pending'",
+                        (as_of,))
+
+            for s_ in signals:
+                cur.execute("""
+                    insert into signals
+                        (symbol, as_of_date, setup_type, pattern, entry_trigger,
+                         stop_loss, t1, t2, r_multiple_t1, qty_suggested, risk_amount,
+                         score_total, score_breakdown, pivot_bar_date, base_start_date,
+                         base_low, regime_state, notes, status, expires_on)
+                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                            'pending', %s)
+                """, (s_["symbol"], as_of, s_["setup_type"], s_["pattern"],
+                      s_["entry_trigger"], s_["stop_loss"], s_["t1"], s_["t2"],
+                      s_["r_multiple_t1"], s_["qty_suggested"], s_["risk_amount"],
+                      s_["score_total"], json.dumps(s_["score_breakdown"]),
+                      s_["pivot_bar_date"], s_["base_start_date"], s_["base_low"],
+                      regime["state"],
+                      json.dumps({"stop_basis": s_["stop_basis"],
+                                  "t1_basis": s_["t1_basis"],
+                                  "rs63": s_["rs63"], "rs126": s_["rs126"],
+                                  "close": s_["close"], "atr14": s_["atr14"],
+                                  "notes": s_["notes"]}),
+                      as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2)))
+
+            # Age out anything past its window.
+            cur.execute("update signals set status = 'expired' "
+                        "where status = 'pending' and expires_on < %s", (as_of,))
+        conn.commit()
 
         summary = {
             "as_of": str(as_of),
@@ -190,13 +266,13 @@ def run_scan(as_of: date | None = None) -> dict:
             "vix": regime["vix"],
             "distribution_days": regime["distribution_days"],
             "universe": len(universe),
-            "passed": len(candidates),
+            "passed_structure": counts.get("passed_gates_0_3", 0),
+            "signals": len(signals),
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": FUNDAMENTALS_READY,
-            "candidates": candidates,
         }
-        log.info("Scan complete: %d/%d passed gates 0-3 in a %s regime",
-                 len(candidates), len(universe), regime["state"])
+        log.info("Scan complete: %d signals from %d structural candidates (%s regime)",
+                 len(signals), counts.get("passed_gates_0_3", 0), regime["state"])
         return summary
 
     finally:
