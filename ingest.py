@@ -305,6 +305,91 @@ def apply_adjustments(conn) -> int:
 
 
 # ---------------------------------------------------------------------
+# 4b. Indices
+#
+# Gate 1 (market regime) needs the index series themselves, which are not
+# in the constituent universe. Upstox exposes them under the NSE_INDEX
+# segment. Breadth is computed from our own 500 symbols, so only the
+# headline index and VIX need fetching.
+# ---------------------------------------------------------------------
+INDEX_NAMES = {
+    "NIFTY50": ["nifty 50", "nifty50"],
+    "NIFTY500": ["nifty 500", "nifty500"],
+    "INDIAVIX": ["india vix", "indiavix"],
+}
+
+
+def sync_indices(conn, client: UpstoxClient, master: InstrumentMaster,
+                 years: int = BACKFILL_YEARS) -> int:
+    master.load()
+    index_instruments = [
+        i for i in master._by_key.values() if i.segment == "NSE_INDEX"
+    ]
+
+    resolved: dict[str, str] = {}
+    for code, aliases in INDEX_NAMES.items():
+        for inst in index_instruments:
+            label = (inst.name or inst.trading_symbol or "").strip().lower()
+            if label in aliases:
+                resolved[code] = inst.instrument_key
+                break
+
+    missing = set(INDEX_NAMES) - set(resolved)
+    if "NIFTY50" in missing or "INDIAVIX" in missing:
+        raise RuntimeError(
+            f"Could not resolve required indices {sorted(missing)} in the Upstox "
+            "instrument master. Market regime cannot be computed without them."
+        )
+    if missing:
+        log.warning("Optional indices unresolved: %s", sorted(missing))
+
+    end = date.today()
+    default_start = end - timedelta(days=365 * years)
+    total = 0
+
+    with conn.cursor() as cur:
+        for code, key in resolved.items():
+            cur.execute("""
+                insert into symbols (symbol, upstox_instrument_key, company_name,
+                                     series, is_active, updated_at)
+                values (%s, %s, %s, 'INDEX', true, now())
+                on conflict (symbol) do update set
+                    upstox_instrument_key = excluded.upstox_instrument_key,
+                    series = 'INDEX', updated_at = now()
+            """, (code, key, code))
+
+            cur.execute("select max(trade_date) from ohlcv_daily where symbol = %s", (code,))
+            latest = cur.fetchone()[0]
+            start = (latest + timedelta(days=1)) if latest else default_start
+            if start > end:
+                continue
+
+            try:
+                candles = client.historical_daily(key, start, end)
+            except Exception as exc:
+                log.error("Index backfill failed for %s: %s", code, exc)
+                continue
+
+            for c in candles:
+                ts = c[0][:10] if isinstance(c[0], str) else \
+                    datetime.fromtimestamp(c[0] / 1000).date()
+                cur.execute("""
+                    insert into ohlcv_daily
+                        (symbol, trade_date, open, high, low, close, volume)
+                    values (%s, %s, %s, %s, %s, %s, %s)
+                    on conflict (symbol, trade_date) do update set
+                        open = excluded.open, high = excluded.high,
+                        low = excluded.low, close = excluded.close
+                """, (code, ts, c[1], c[2], c[3], c[4], int(c[5] or 0)))
+                total += 1
+            log.info("%s: %d bars", code, len(candles))
+
+    conn.commit()
+    log.info("Index backfill complete: %d bars", total)
+    return total
+
+
+# ---------------------------------------------------------------------
 # 5. Surveillance
 # ---------------------------------------------------------------------
 def sync_surveillance(conn, nse: NSEClient) -> int:
@@ -344,6 +429,7 @@ def cold_start() -> None:
             ("sync_universe", lambda: sync_universe(conn, nse, master)),
             ("sync_corporate_actions", lambda: sync_corporate_actions(conn, nse)),
             ("backfill_prices", lambda: backfill_prices(conn, client)),
+            ("sync_indices", lambda: sync_indices(conn, client, master)),
             ("verify_adjustments", lambda: apply_adjustments(conn)),
             ("sync_surveillance", lambda: sync_surveillance(conn, nse)),
         ]:
