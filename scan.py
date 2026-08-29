@@ -276,14 +276,24 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # Only setups worth acting on are published. Everything else is
             # logged and stays out of the recommendation list — the desk
             # shows trades, not a research feed.
-            floor = {"risk_on": MIN_SCORE,
-                     "neutral": MIN_SCORE_NEUTRAL,
-                     "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]]
+            # The floors are expressed on a 100-point scale, but the
+            # achievable max is lower while fundamentals and news score
+            # zero. Comparing a 72 threshold against an 85-point ceiling
+            # silently applies an 85th-percentile bar instead of the 72%
+            # the spec intends, so scale the floor to what is actually
+            # scoreable.
+            max_possible = float(setup.score_breakdown.get("max_possible", 100)) or 100.0
+            floor_pct = {"risk_on": MIN_SCORE,
+                         "neutral": MIN_SCORE_NEUTRAL,
+                         "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]]
+            floor = round(floor_pct * max_possible / 100.0, 1)
             if setup.score_total < floor:
                 counts["below_min_score"] = counts.get("below_min_score", 0) + 1
                 log_rows.append((as_of, sym, "score", "below_min_score",
                                  json.dumps({"score": setup.score_total,
                                              "floor": floor,
+                                             "floor_pct": floor_pct,
+                                             "max_possible": max_possible,
                                              "regime": regime["state"]})))
                 continue
 
@@ -379,8 +389,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": fundamentals_ready,
             "gate2_coverage": len(snapshots),
-            "min_score": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
-                          "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],
+            "min_score_pct": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
+                              "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],
             "regime_detail": regime["notes"],
             "mode": mode,
         }
