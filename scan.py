@@ -363,6 +363,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "atr14": round(float(last["atr14"]), 2),
                 "rs63": rs63,
                 "rs126": rs126,
+                "extension": setup.extension,
                 "stop_basis": setup.stop_basis,
                 "t1_basis": setup.t1_basis,
                 "notes": setup.notes,
@@ -414,6 +415,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                                   "t1_basis": s_["t1_basis"],
                                   "rs63": s_["rs63"], "rs126": s_["rs126"],
                                   "close": s_["close"], "atr14": s_["atr14"],
+                                  "extension": s_["extension"],
                                   "notes": s_["notes"]}),
                       as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2),
                       first_seen.get(s_["symbol"])))

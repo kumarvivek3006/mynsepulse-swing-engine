@@ -68,6 +68,8 @@ class Setup:
     t1_basis: str
     score_total: float = 0.0
     score_breakdown: dict = field(default_factory=dict)
+    # Diagnostic only — no gate reads this. See extension_metrics().
+    extension: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
 
 
@@ -346,6 +348,39 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str) -> dict:
             "stop_basis": stop_basis, "t1_basis": t1_basis}
 
 
+def extension_metrics(df: pd.DataFrame, entry: float) -> dict:
+    """
+    How stretched the entry is. RECORDED, NOT ACTED ON.
+
+    Extension is the obvious next filter and I have deliberately not made
+    it one. Distance from the 20 EMA correlates with momentum, so a cut
+    here would reject the strongest breakouts before it rejected any
+    mediocre ones — the same failure mode as an RSI ceiling, measured
+    differently. It also partly duplicates checks that already exist: an
+    extended stock usually has a distant structural stop, which already
+    fails the 8% stop-width limit or the R:R floor.
+
+    So this logs the numbers and changes nothing. When the backtest runs,
+    the question to ask is whether extended entries actually underperformed.
+    If they did, add the filter with a threshold taken from that answer
+    rather than from my judgement.
+    """
+    last = df.iloc[-1]
+    atr = float(last["atr14"])
+    ema20 = float(last["ema20"]) if pd.notna(last["ema20"]) else None
+    sma50 = float(last["sma50"]) if pd.notna(last["sma50"]) else None
+    high52 = float(last["high52"]) if pd.notna(last["high52"]) else None
+
+    return {
+        "atr_above_ema20": round((entry - ema20) / atr, 2)
+        if ema20 and atr > 0 else None,
+        "pct_above_ema20": round((entry / ema20 - 1) * 100, 2) if ema20 else None,
+        "pct_above_sma50": round((entry / sma50 - 1) * 100, 2) if sma50 else None,
+        "pct_from_52w_high": round((entry / high52 - 1) * 100, 2) if high52 else None,
+        "atr_pct_of_price": round(atr / entry * 100, 2) if atr and entry else None,
+    }
+
+
 # ---------------------------------------------------------------------
 # Scoring — weights reflect what actually decides a swing trade
 # ---------------------------------------------------------------------
@@ -416,12 +451,15 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126,
                                    fundamentals_ready)
 
+    extension = extension_metrics(df, levels["entry"])
+
     return Setup(
         symbol=symbol, setup_type=setup_type, pattern=base.pattern,
         entry=levels["entry"], stop=levels["stop"], t1=levels["t1"], t2=levels["t2"],
         r_multiple_t1=levels["r_multiple_t1"], base=base,
         stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
         score_total=total, score_breakdown=breakdown,
+        extension=extension,
         notes=[f"base {base.duration}d, depth {base.depth_pct:.1f}%",
                f"stop from {levels['stop_basis']}", f"T1 from {levels['t1_basis']}"],
     )
