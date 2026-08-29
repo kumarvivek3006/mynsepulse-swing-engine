@@ -977,13 +977,24 @@ def fundamentals_job(request: Request):
                           finished_at=None, error=None)
 
     def run():
-        from fundamentals import connect as _c, sync_quarterly_results, sync_shareholding
-        conn = _c()
+        # _run_log lives in ingest, not here. Each step is logged separately
+        # and a failure in one is recorded before it propagates — otherwise
+        # a shareholding failure would hide the fact that results succeeded.
+        from fundamentals import sync_quarterly_results, sync_shareholding
+        from ingest import _run_log, connect as _connect
+
+        conn = _connect()
         try:
-            _run_log(conn, "sync_shareholding", "success",
-                     sync_shareholding(conn)["written"])
-            _run_log(conn, "sync_quarterly_results", "success",
-                     sync_quarterly_results(conn)["written"])
+            for name, fn in (("sync_shareholding", sync_shareholding),
+                             ("sync_quarterly_results", sync_quarterly_results)):
+                try:
+                    result = fn(conn)
+                    _run_log(conn, name, "success", result.get("written", 0))
+                    log.info("%s: %s", name, result)
+                except Exception as exc:
+                    conn.rollback()
+                    _run_log(conn, name, "failed", 0, str(exc)[:500])
+                    raise
         finally:
             conn.close()
 
