@@ -388,9 +388,39 @@ WEIGHTS = {"trigger": 20, "base": 20, "trend": 18, "rs": 15,
            "trade_math": 12, "fundamentals": 10, "news": 5}
 
 
+def _score_fundamentals(snap) -> float | None:
+    """
+    Grade the two things we actually hold: promoter behaviour and the
+    revenue/profit trend. Returns None when there is no data, which keeps
+    the block out of the achievable ceiling entirely rather than awarding
+    a token half-mark nobody can improve on.
+    """
+    if snap is None or not getattr(snap, "has_data", False):
+        return None
+
+    parts: list[float] = []
+
+    if snap.promoter_pct is not None and snap.promoter_pct_2q_ago is not None:
+        change = snap.promoter_pct - snap.promoter_pct_2q_ago
+        # Promoters adding is the strongest signal available; flat is fine;
+        # selling is already a Gate 2 veto at 2pp, so anything reaching here
+        # is a mild drift.
+        parts.append(1.0 if change > 0.25 else 0.6 if change > -0.5 else 0.2)
+
+    rev, pat = snap.revenue_trend, snap.pat_trend
+    if len(rev) >= 3:
+        growth = (rev[-1] / rev[-3] - 1) if rev[-3] > 0 else 0
+        parts.append(min(max(growth / 0.20, 0.0), 1.0))
+    if len(pat) >= 3 and pat[-3] > 0:
+        growth = pat[-1] / pat[-3] - 1
+        parts.append(min(max(growth / 0.25, 0.0), 1.0))
+
+    return (sum(parts) / len(parts)) if parts else None
+
+
 def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
                 rs63: float | None, rs126: float | None,
-                fundamentals_ready: bool = False) -> tuple[float, dict]:
+                snap=None) -> tuple[float, dict]:
     last = df.iloc[-1]
     vol50 = float(last["vol50"]) if pd.notna(last["vol50"]) else 0.0
     rng = float(last["high"] - last["low"])
@@ -425,31 +455,32 @@ def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
 
     math_score = min(max((levels["r_multiple_t1"] - MIN_RR) / 2.0, 0), 1) * 0.7 + 0.3
 
-    # Absent inputs score zero, not a neutral default. A missing check is
-    # not a passed check, and the total must reflect that.
-    fundamentals = 0.0 if not fundamentals_ready else 0.5
-    news = 0.0
+    # A block with no data is excluded from the ceiling rather than scored
+    # zero out of its full weight. Scoring it zero would punish the stock
+    # for our missing ingestion; counting it in the ceiling would make the
+    # maximum unreachable. Neither is honest, so the weight is removed.
+    fundamentals = _score_fundamentals(snap)
+    news = None                      # no source ingested
 
     parts = {"trigger": trigger, "base": base_q, "trend": float(trend),
              "rs": float(rs_score), "trade_math": math_score,
              "fundamentals": fundamentals, "news": news}
 
-    breakdown = {k: round(v * WEIGHTS[k], 1) for k, v in parts.items()}
-    breakdown["max_possible"] = sum(
-        WEIGHTS[k] for k in WEIGHTS
-        if not (k == "fundamentals" and not fundamentals_ready) and k != "news"
-    )
+    breakdown = {k: (round(v * WEIGHTS[k], 1) if v is not None else 0.0)
+                 for k, v in parts.items()}
+    breakdown["max_possible"] = sum(WEIGHTS[k] for k, v in parts.items()
+                                    if v is not None)
+    breakdown["blocks_unscored"] = [k for k, v in parts.items() if v is None]
     return round(sum(breakdown[k] for k in parts), 1), breakdown
 
 
 # ---------------------------------------------------------------------
 def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
-                rs126: float | None, fundamentals_ready: bool = False) -> Setup:
+                rs126: float | None, snap=None) -> Setup:
     base = detect_base(df)
     setup_type = detect_trigger(df, base)
     levels = derive_levels(df, base, setup_type)
-    total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126,
-                                   fundamentals_ready)
+    total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126, snap)
 
     extension = extension_metrics(df, levels["entry"])
 

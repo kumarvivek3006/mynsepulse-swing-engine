@@ -906,10 +906,17 @@ def jobs_status(request: Request):
                 cur.execute("select (select count(*) from symbols), "
                             "(select count(*) from ohlcv_daily), "
                             "(select count(*) from corporate_actions), "
-                            "(select count(*) from surveillance)")
-                s, o, c, v = cur.fetchone()
+                            "(select count(*) from surveillance), "
+                            "(select count(*) from shareholding), "
+                            "(select count(*) from fundamentals_quarterly), "
+                            "(select count(distinct symbol) from shareholding), "
+                            "(select max(period_end) from fundamentals_quarterly)")
+                s, o, c, v, sh, fq, shs, latest = cur.fetchone()
                 counts = {"symbols": s, "ohlcv_daily": o,
-                          "corporate_actions": c, "surveillance": v}
+                          "corporate_actions": c, "surveillance": v,
+                          "shareholding": sh, "fundamentals_quarterly": fq,
+                          "fundamentals_symbols": shs,
+                          "fundamentals_latest_period": str(latest) if latest else None}
         finally:
             conn.close()
     except Exception as exc:

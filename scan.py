@@ -300,8 +300,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
 
             try:
                 setup = build_setup(sym, df, rs63, rs126,
-                                    fundamentals_ready and
-                                    snapshots.get(sym) is not None)
+                                    snapshots.get(sym) if fundamentals_ready else None)
             except Rejected as rej:
                 counts[rej.reason] = counts.get(rej.reason, 0) + 1
                 log_rows.append((as_of, sym, rej.gate, rej.reason,
