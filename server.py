@@ -379,6 +379,105 @@ def signals(request: Request):
     }
 
 
+@app.get("/signals/live")
+def signals_live(request: Request):
+    """
+    Live LTP and progress for open signals only.
+
+    The rest of the desk runs on end-of-day bars, which is correct for
+    deriving levels — but an armed setup sitting 2% under its trigger is
+    only actionable if you can see where price actually is. This fetches
+    quotes for the handful of symbols currently on screen, not the whole
+    universe.
+
+    Outside market hours Upstox returns the last traded price, which is the
+    previous close. That is reported honestly via `is_live` rather than
+    dressed up as a live tick.
+    """
+    require_internal_key(request)
+    from ingest import connect
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                select s.id, s.symbol, y.upstox_instrument_key,
+                       s.entry_trigger, s.stop_loss, s.t1,
+                       o.entry_price
+                from signals s
+                join symbols y on y.symbol = s.symbol
+                left join signal_outcomes o on o.signal_id = s.id
+                where s.status in ('pending','triggered')
+                  and y.upstox_instrument_key is not null
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"is_live": False, "as_of": datetime.now(IST).isoformat(), "quotes": []}
+
+    now = datetime.now(IST)
+    weekday = now.weekday() < 5
+    minutes = now.hour * 60 + now.minute
+    market_open = weekday and 555 <= minutes <= 945      # 09:15-15:45 IST
+
+    quotes: dict = {}
+    error = None
+    try:
+        from upstox_client import UpstoxClient
+        client = UpstoxClient(store=store)
+        quotes = client.quotes([r[2] for r in rows])
+    except Exception as exc:
+        # A failed quote fetch must not blank the dashboard — the cards
+        # still hold valid levels from the last close.
+        error = str(exc)[:200]
+        log.warning("Live quote fetch failed: %s", error)
+
+    def find(key: str) -> dict:
+        if key in quotes:
+            return quotes[key]
+        for k, v in quotes.items():           # Upstox echoes a different key form
+            if k.endswith(key.split("|")[-1]):
+                return v
+        return {}
+
+    out = []
+    for sig_id, symbol, key, entry, stop, t1, entry_price in rows:
+        q = find(key)
+        ltp = q.get("last_price") or q.get("ltp")
+        if ltp is None:
+            continue
+        ltp = float(ltp)
+        entry, stop, t1 = float(entry), float(stop), float(t1)
+        prev_close = q.get("close_price") or (q.get("ohlc") or {}).get("close")
+        risk = entry - stop
+        basis = float(entry_price) if entry_price is not None else entry
+
+        out.append({
+            "signal_id": str(sig_id),
+            "symbol": symbol,
+            "ltp": round(ltp, 2),
+            "change_pct": round((ltp / float(prev_close) - 1) * 100, 2)
+            if prev_close else None,
+            "pct_to_entry": round((entry / ltp - 1) * 100, 2),
+            "r_now": round((ltp - basis) / risk, 2) if risk > 0 else None,
+            "state": ("stopped" if entry_price is not None and ltp <= stop else
+                      "target_hit" if entry_price is not None and ltp >= t1 else
+                      "open" if entry_price is not None else
+                      "triggered" if ltp >= entry else
+                      "invalidated" if ltp <= stop else "waiting"),
+        })
+
+    return {
+        "is_live": market_open and not error and bool(out),
+        "market_open": market_open,
+        "as_of": now.isoformat(),
+        "error": error,
+        "quotes": out,
+    }
+
+
 @app.get("/daily-log")
 def daily_log(request: Request, day: str | None = Query(None)):
     """
