@@ -198,6 +198,72 @@ def gate0_tradability(symbol: str, df: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------
+# Gate 2 — fundamental vetoes
+#
+# A veto, never a stock picker. It removes structurally unsound companies
+# that gap against you on news; it does not rank anything.
+#
+# Two rules are implemented, both from data we actually hold. The pledge
+# and balance-sheet vetoes in the spec are NOT here — NSE's shareholding
+# endpoint carries no pledge figure, and cash flow / debt-equity / ROCE
+# live in annual filings we have not ingested. Those return `None` from
+# `gate2_missing_vetoes()` so the gap stays visible instead of being
+# mistaken for a pass.
+# ---------------------------------------------------------------------
+PROMOTER_DROP_PP = float(os.environ.get("PROMOTER_DROP_PP", "2.0"))
+
+
+def gate2_fundamentals(symbol: str, snap) -> GateResult:
+    """
+    snap is a FundamentalSnapshot, or None when we hold no data.
+
+    No data means the gate cannot run. It is logged as skipped and the
+    stock proceeds — but the signal is flagged so the score never implies
+    a check that did not happen.
+    """
+    if snap is None or not snap.has_data:
+        return GateResult(symbol, True, reason="gate2_no_data",
+                          detail={"checked": False})
+
+    # Promoter selling down is the single loudest governance signal
+    # available to us. Two percentage points over two quarters is a
+    # deliberate exit, not portfolio noise.
+    if snap.promoter_pct is not None and snap.promoter_pct_2q_ago is not None:
+        drop = snap.promoter_pct_2q_ago - snap.promoter_pct
+        if drop >= PROMOTER_DROP_PP:
+            return GateResult(symbol, False, "gate2", "promoter_holding_falling",
+                              {"now": round(snap.promoter_pct, 2),
+                               "two_quarters_ago": round(snap.promoter_pct_2q_ago, 2),
+                               "drop_pp": round(drop, 2)})
+
+    # Two consecutive quarters where revenue AND profit both fell.
+    # Either alone is noise; both together is deterioration.
+    rev, pat = snap.revenue_trend, snap.pat_trend
+    if len(rev) >= 3 and len(pat) >= 3:
+        rev_falling = rev[-1] < rev[-2] < rev[-3]
+        pat_falling = pat[-1] < pat[-2] < pat[-3]
+        if rev_falling and pat_falling:
+            return GateResult(symbol, False, "gate2", "revenue_and_profit_declining",
+                              {"revenue": [round(x, 1) for x in rev[-3:]],
+                               "pat": [round(x, 1) for x in pat[-3:]]})
+
+    return GateResult(symbol, True, detail={"checked": True,
+                                            "promoter_pct": snap.promoter_pct})
+
+
+def gate2_missing_vetoes() -> list[str]:
+    """Vetoes in the spec that no ingested source can currently satisfy."""
+    return [
+        "promoter_pledge_above_25pct",   # needs SHP filing Column XIV
+        "pledge_increased_qoq",          # needs SHP filing Column XIV
+        "negative_operating_cash_flow",  # needs annual filings
+        "debt_equity_above_2",           # needs annual filings
+        "auditor_qualification",         # needs annual filings
+        "receivable_days_rising",        # needs annual filings
+    ]
+
+
+# ---------------------------------------------------------------------
 # Gate 3 — trend structure (Stage 2)
 # ---------------------------------------------------------------------
 def gate3_trend_structure(symbol: str, df: pd.DataFrame) -> GateResult:

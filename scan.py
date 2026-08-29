@@ -21,6 +21,7 @@ from datetime import date, timedelta
 import pandas as pd
 
 from gates import (
+    gate2_fundamentals,
     add_indicators,
     evaluate_regime,
     gate0_tradability,
@@ -28,6 +29,7 @@ from gates import (
     relative_strength,
 )
 from ingest import connect
+from fundamentals import load_snapshots
 from setups import Rejected, build_setup
 
 log = logging.getLogger(__name__)
@@ -154,6 +156,14 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
 
         frames = _load_frames(conn)
 
+        # Gate 2 inputs. Absence is recorded per symbol, never assumed to
+        # be a pass — a stock we hold no fundamentals for is flagged as
+        # unchecked rather than quietly treated as clean.
+        snapshots = load_snapshots(conn)
+        fundamentals_ready = len(snapshots) >= len(universe) * 0.5
+        log.info("Fundamentals: %d symbols with data (gate 2 %s)",
+                 len(snapshots), "enforced" if fundamentals_ready else "advisory only")
+
         # --- Gate 1: regime, once for the whole run -------------------
         nifty = frames.get("NIFTY50")
         vix = frames.get("INDIAVIX")
@@ -222,10 +232,14 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 log_rows.append((as_of, sym, "gate0", r0.reason, json.dumps(r0.detail)))
                 continue
 
-            if not FUNDAMENTALS_READY:
-                # Recorded, not enforced. See module docstring.
-                log_rows.append((as_of, sym, None, "gate2_skipped",
-                                 json.dumps({"reason": "fundamentals not ingested"})))
+            r2 = gate2_fundamentals(sym, snapshots.get(sym))
+            if not r2.passed:
+                counts[r2.reason] = counts.get(r2.reason, 0) + 1
+                log_rows.append((as_of, sym, "gate2", r2.reason, json.dumps(r2.detail)))
+                continue
+            if r2.reason == "gate2_no_data":
+                counts["gate2_no_data"] = counts.get("gate2_no_data", 0) + 1
+                log_rows.append((as_of, sym, None, "gate2_no_data", "{}"))
 
             r3 = gate3_trend_structure(sym, df)
             if not r3.passed:
@@ -250,7 +264,9 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 df = add_indicators(live)
 
             try:
-                setup = build_setup(sym, df, rs63, rs126, FUNDAMENTALS_READY)
+                setup = build_setup(sym, df, rs63, rs126,
+                                    fundamentals_ready and
+                                    snapshots.get(sym) is not None)
             except Rejected as rej:
                 counts[rej.reason] = counts.get(rej.reason, 0) + 1
                 log_rows.append((as_of, sym, rej.gate, rej.reason,
@@ -361,7 +377,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "passed_structure": counts.get("passed_gates_0_3", 0),
             "signals": len(signals),
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
-            "gate2_enforced": FUNDAMENTALS_READY,
+            "gate2_enforced": fundamentals_ready,
+            "gate2_coverage": len(snapshots),
             "min_score": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
                           "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],
             "regime_detail": regime["notes"],

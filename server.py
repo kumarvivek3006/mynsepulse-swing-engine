@@ -713,6 +713,53 @@ def scan_job(request: Request):
         raise HTTPException(500, f"Scan failed: {exc}")
 
 
+@app.post("/jobs/fundamentals")
+def fundamentals_job(request: Request):
+    """
+    Ingest promoter holding and quarterly P&L. Weekly cadence — this data
+    changes once a quarter, and it is ~1000 calls through NSE's fragile
+    path, so there is nothing to gain from running it daily.
+    """
+    require_internal_key(request)
+    with _job_lock:
+        if _job_state["running"]:
+            raise HTTPException(409, f"Job already running: {_job_state['name']}")
+        _job_state.update(name="fundamentals", running=True,
+                          started_at=datetime.now(IST).isoformat(),
+                          finished_at=None, error=None)
+
+    def run():
+        from fundamentals import connect as _c, sync_quarterly_results, sync_shareholding
+        conn = _c()
+        try:
+            _run_log(conn, "sync_shareholding", "success",
+                     sync_shareholding(conn)["written"])
+            _run_log(conn, "sync_quarterly_results", "success",
+                     sync_quarterly_results(conn)["written"])
+        finally:
+            conn.close()
+
+    threading.Thread(target=_run_job, args=("fundamentals", run), daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+@app.get("/jobs/fundamentals/probe")
+def fundamentals_probe(request: Request, symbol: str = Query("RELIANCE")):
+    """
+    Fetch one symbol and report the real response shape.
+
+    Field names on these NSE endpoints are undocumented. Running 500
+    symbols against guessed keys would write hundreds of null rows that
+    look like real data — so confirm the shape on one symbol first.
+    """
+    require_internal_key(request)
+    from fundamentals import probe
+    try:
+        return probe(symbol)
+    except Exception as exc:
+        raise HTTPException(500, f"Probe failed: {exc}")
+
+
 @app.get("/jobs/status")
 def jobs_status(request: Request):
     require_internal_key(request)
