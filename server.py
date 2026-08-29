@@ -229,6 +229,9 @@ def signals(request: Request):
                 where s.status in ('pending','triggered')
                 order by s.score_total desc
             """)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
             cur.execute("select state, breadth_above_50dma, vix, distribution_days, as_of "
                         "from market_regime order by as_of desc limit 1")
             reg = cur.fetchone()
