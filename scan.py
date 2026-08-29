@@ -331,16 +331,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                                              "regime": regime["state"]})))
                 continue
 
-            risk_per_share = setup.entry - setup.stop
+            # Position sizing is no longer stored at scan time. It is derived
+            # on read from the capital setting, so editing capital updates
+            # every card immediately rather than waiting for the next scan.
             qty = risk_amount = None
-            if CAPITAL > 0 and risk_per_share > 0:
-                budget = CAPITAL * (RISK_PCT / 100.0)
-                if regime["state"] == "neutral":
-                    budget /= 2          # half size in a mixed tape
-                qty = int(budget // risk_per_share)
-                cap_qty = int((CAPITAL * 0.10) // setup.entry)
-                qty = max(0, min(qty, cap_qty))
-                risk_amount = round(qty * risk_per_share, 2)
 
             signals.append({
                 "symbol": sym,

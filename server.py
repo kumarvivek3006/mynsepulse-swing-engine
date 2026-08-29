@@ -192,6 +192,95 @@ def cold_start_job(request: Request):
     return {"ok": True, "started": True}
 
 
+# ---------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------
+def _read_settings(cur) -> dict:
+    cur.execute("select key, value from engine_settings")
+    rows = dict(cur.fetchall())
+    return {
+        "capital": float(rows.get("capital") or 0),
+        "risk_pct": float(rows.get("risk_pct") or 2.5),
+    }
+
+
+def size_position(capital: float, risk_pct: float, entry: float,
+                  stop: float) -> dict:
+    """
+    qty = floor(capital * risk_pct% / (entry - stop))
+
+    No caps. Position value is reported alongside so an oversized position
+    is visible rather than silent: a very tight stop can produce a
+    quantity worth more than the capital it is sized from, which is
+    arithmetically correct and practically unfillable.
+    """
+    risk_per_share = entry - stop
+    if capital <= 0 or risk_per_share <= 0:
+        return {"qty": None, "risk_per_share": None, "risk_amount": None,
+                "position_value": None, "exceeds_capital": False,
+                "pct_of_capital": None}
+
+    budget = capital * (risk_pct / 100.0)
+    qty = int(budget // risk_per_share)
+    position_value = qty * entry
+    return {
+        "qty": qty,
+        "risk_per_share": round(risk_per_share, 2),
+        "risk_amount": round(qty * risk_per_share, 2),
+        "position_value": round(position_value, 2),
+        "exceeds_capital": position_value > capital,
+        "pct_of_capital": round(position_value / capital * 100, 1),
+    }
+
+
+@app.get("/settings")
+def get_settings(request: Request):
+    require_internal_key(request)
+    from ingest import connect
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            return _read_settings(cur)
+    finally:
+        conn.close()
+
+
+@app.put("/settings")
+def put_settings(request: Request, body: dict = Body(...)):
+    """Capital and per-trade risk. Neither affects scanning or scoring."""
+    require_internal_key(request)
+    from ingest import connect
+
+    updates = {}
+    if "capital" in body:
+        capital = float(body["capital"] or 0)
+        if capital < 0:
+            raise HTTPException(400, "capital cannot be negative")
+        updates["capital"] = capital
+    if "risk_pct" in body:
+        risk = float(body["risk_pct"] or 0)
+        if not 0 < risk <= 100:
+            raise HTTPException(400, "risk_pct must be between 0 and 100")
+        updates["risk_pct"] = risk
+    if not updates:
+        raise HTTPException(400, "nothing to update")
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            for key, value in updates.items():
+                cur.execute("""
+                    insert into engine_settings (key, value, updated_at)
+                    values (%s, to_jsonb(%s::numeric), now())
+                    on conflict (key) do update set
+                        value = excluded.value, updated_at = now()
+                """, (key, value))
+            conn.commit()
+            return _read_settings(cur)
+    finally:
+        conn.close()
+
+
 @app.get("/signals")
 def signals(request: Request):
     """
@@ -231,6 +320,8 @@ def signals(request: Request):
             """)
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            settings = _read_settings(cur)
 
             cur.execute("select state, breadth_above_50dma, vix, distribution_days, as_of "
                         "from market_regime order by as_of desc limit 1")
@@ -355,6 +446,14 @@ def signals(request: Request):
                             "text": f"Within {prog['pct_to_entry']}% of the trigger."})
 
         r["advisories"] = adv
+        # Sizing is computed here, on read, rather than stored at scan time.
+        # Editing capital then updates every card immediately instead of
+        # waiting for the next scan. Levels are read, never modified.
+        r["sizing"] = size_position(settings["capital"], settings["risk_pct"],
+                                    entry, stop)
+        r["qty_suggested"] = r["sizing"]["qty"]
+        r["risk_amount"] = r["sizing"]["risk_amount"]
+
         r["progress"] = prog
         for k in ("entry_trigger", "stop_loss", "t1", "t2", "r_multiple_t1",
                   "score_total", "risk_amount", "base_low", "last_close",
@@ -368,6 +467,7 @@ def signals(request: Request):
                 r[k] = str(r[k])
 
     return {
+        "settings": settings,
         "regime": {"state": reg[0], "breadth_above_50dma": float(reg[1]) if reg and reg[1] is not None else None,
                    "vix": float(reg[2]) if reg and reg[2] is not None else None,
                    "distribution_days": reg[3], "as_of": str(reg[4])} if reg else None,
@@ -665,6 +765,7 @@ def my_trades(request: Request):
             """)
             cols = [d[0] for d in cur.description]
             trades = [dict(zip(cols, r)) for r in cur.fetchall()]
+            settings = _read_settings(cur)
     finally:
         conn.close()
 
@@ -711,6 +812,11 @@ def my_trades(request: Request):
             entry_dt = None
             if t.get("entry_date"):
                 entry_dt = datetime.strptime(t["entry_date"], "%Y-%m-%d").date()
+            # Recomputed against the price actually paid, not the published
+            # trigger. Display only — it changes nothing about the position.
+            t["sizing"] = size_position(settings["capital"], settings["risk_pct"],
+                                        t["entry_price"], t["stop_loss"])
+
             t["thesis"] = _thesis_health(
                 bars_by_symbol.get(t["symbol"], []), nifty_closes,
                 t["entry_price"], t["stop_loss"],
@@ -718,6 +824,24 @@ def my_trades(request: Request):
             open_t.append(t)
         else:
             closed.append(t)
+
+    # Portfolio exposure. Visibility only — nothing in the scan, the gates,
+    # scoring or signal generation reads any of this.
+    capital = settings["capital"]
+    open_risk = sum(t["sizing"]["risk_amount"] for t in open_t
+                    if t.get("sizing", {}).get("risk_amount"))
+    open_value = sum(t["sizing"]["position_value"] for t in open_t
+                     if t.get("sizing", {}).get("position_value"))
+    exposure = {
+        "capital": capital,
+        "risk_pct_per_trade": settings["risk_pct"],
+        "open_positions": len(open_t),
+        "open_risk": round(open_risk, 2) if open_risk else 0.0,
+        "open_risk_pct": round(open_risk / capital * 100, 2) if capital > 0 else None,
+        "deployed_value": round(open_value, 2) if open_value else 0.0,
+        "deployed_pct": round(open_value / capital * 100, 1) if capital > 0 else None,
+        "exceeds_capital": capital > 0 and open_value > capital,
+    }
 
     resolved = [t["r_realised"] for t in closed if t.get("r_realised") is not None]
     stats = {
@@ -730,7 +854,8 @@ def my_trades(request: Request):
         "expectancy_r": round(sum(resolved) / len(resolved), 3) if resolved else None,
         "total_r": round(sum(resolved), 2) if resolved else None,
     }
-    return {"open": open_t, "closed": closed, "stats": stats}
+    return {"open": open_t, "closed": closed, "stats": stats,
+            "exposure": exposure, "settings": settings}
 
 
 @app.post("/signals/take")
