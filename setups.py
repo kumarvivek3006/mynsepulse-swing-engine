@@ -29,6 +29,11 @@ MIN_RR = float(os.environ.get("MIN_RR", "1.0"))
 MIN_STOP_ATR_MULT = float(os.environ.get("MIN_STOP_ATR_MULT", "0.75"))
 MAX_STOP_PCT = float(os.environ.get("MAX_STOP_PCT", "8"))
 PRIOR_UPTREND_PCT = float(os.environ.get("PRIOR_UPTREND_PCT", "25"))
+# Bars over which the prior advance is measured. The classic trend-template
+# looks at the whole advance into the base, not a fixed two-month window —
+# a stock that ran 40% over five months and then consolidated is a valid
+# base, and a 60-bar window wrongly rejects it.
+PRIOR_UPTREND_WINDOW = int(os.environ.get("PRIOR_UPTREND_WINDOW", "120"))
 ENTRY_BUFFER = 0.0025
 
 
@@ -117,7 +122,15 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
     best: Base | None = None
 
     # Try several base lengths and keep the highest-quality structure.
-    for lookback in range(BASE_MIN_SESSIONS, min(BASE_MAX_SESSIONS, n - 60) + 1, 5):
+    # Why each candidate window failed, so a zero-signal day is diagnosable
+    # rather than a shrug.
+    fail_counts: dict[str, int] = {}
+
+    def _note(reason: str) -> None:
+        fail_counts[reason] = fail_counts.get(reason, 0) + 1
+
+    for lookback in range(BASE_MIN_SESSIONS,
+                          min(BASE_MAX_SESSIONS, n - PRIOR_UPTREND_WINDOW // 2) + 1, 5):
         seg_start = n - lookback
         seg_high, seg_low = highs[seg_start:], lows[seg_start:]
 
@@ -129,21 +142,26 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
         # the older part of the base. A high made yesterday is not a level
         # the stock has been coiling under.
         if pivot_rel > lookback * 0.7:
+            _note("pivot_too_recent")
             continue
 
         base_low = float(seg_low.min())
         if base_low <= 0:
+            _note("bad_low")
             continue
         depth = (pivot - base_low) / pivot * 100
         if depth > 35:
+            _note("base_too_deep")
             continue
 
         # Prior uptrend: a base with nothing to consolidate is not a base.
-        prior_window = closes[max(0, seg_start - 60):seg_start + 1]
+        prior_window = closes[max(0, seg_start - PRIOR_UPTREND_WINDOW):seg_start + 1]
         if len(prior_window) < 20:
+            _note("prior_window_too_short")
             continue
         prior_gain = (prior_window[-1] / prior_window.min() - 1) * 100
         if prior_gain < PRIOR_UPTREND_PCT:
+            _note("weak_prior_uptrend")
             continue
 
         third = max(lookback // 3, 3)
@@ -170,7 +188,8 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
             best = candidate
 
     if best is None:
-        raise Rejected("gate4", "no_valid_base")
+        dominant = max(fail_counts, key=fail_counts.get) if fail_counts else "no_windows"
+        raise Rejected("gate4", f"no_base_{dominant}", dict(fail_counts))
     return best
 
 
