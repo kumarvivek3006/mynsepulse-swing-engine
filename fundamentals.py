@@ -92,6 +92,11 @@ def probe(symbol: str = "RELIANCE") -> dict:
             out["shareholding_rows"] = len(sh)
             out["shareholding_keys"] = sorted(sh[0].keys()) if sh else []
             out["shareholding_sample"] = sh[0] if sh else None
+            dates = sorted(str(_parse_date(_first(r, DATE_KEYS))) for r in sh
+                           if _parse_date(_first(r, DATE_KEYS)))
+            out["shareholding_periods"] = dates
+            out["shareholding_latest"] = dates[-1] if dates else None
+            out["shareholding_xbrl_urls"] = sum(1 for r in sh if r.get("xbrl"))
         except Exception as exc:
             out["shareholding_error"] = str(exc)[:300]
 
@@ -103,6 +108,10 @@ def probe(symbol: str = "RELIANCE") -> dict:
             out["results_rows"] = len(rows)
             out["results_keys"] = sorted(rows[0].keys()) if rows else []
             out["results_sample"] = rows[0] if rows else None
+            periods = sorted(str(_parse_date(_first(r, TO_DT_KEYS))) for r in rows
+                             if _parse_date(_first(r, TO_DT_KEYS)))
+            out["results_periods"] = periods
+            out["results_latest"] = periods[-1] if periods else None
         except Exception as exc:
             out["results_error"] = str(exc)[:300]
 
@@ -165,14 +174,18 @@ def sync_shareholding(conn, symbols: list[str] | None = None) -> dict:
                         unknown_shape.append(f"{sym}:{sorted(row.keys())[:8]}")
                     continue
 
+                # The SHP filing URL is the route to pledge data (Column XIV),
+                # which this summary endpoint does not carry. Stored now so a
+                # later parser has it without re-crawling.
                 with conn.cursor() as cur:
                     cur.execute("""
                         insert into shareholding
-                            (symbol, period_end, promoter_pct, fii_pct, dii_pct)
-                        values (%s, %s, %s, null, null)
+                            (symbol, period_end, promoter_pct, fii_pct, dii_pct, xbrl_url)
+                        values (%s, %s, %s, null, null, %s)
                         on conflict (symbol, period_end) do update set
-                            promoter_pct = excluded.promoter_pct
-                    """, (sym, period, promoter))
+                            promoter_pct = excluded.promoter_pct,
+                            xbrl_url = coalesce(excluded.xbrl_url, shareholding.xbrl_url)
+                    """, (sym, period, promoter, row.get("xbrl")))
                     written += cur.rowcount
             conn.commit()
             time.sleep(NSE_THROTTLE_SEC)
@@ -191,10 +204,41 @@ def sync_shareholding(conn, symbols: list[str] | None = None) -> dict:
 # ---------------------------------------------------------------------
 # Quarterly P&L
 # ---------------------------------------------------------------------
-REV_KEYS = ("re_total_inc", "re_net_sale", "reTotalIncome", "income")
-PAT_KEYS = ("re_net_profit", "re_pro_loss_bef_tax", "reNetProfit", "netProfit")
-EPS_KEYS = ("re_basic_eps", "re_eps", "eps")
-TO_DT_KEYS = ("re_to_dt", "to_date", "toDate")
+# re_net_sale is revenue from operations. re_total_inc adds other income,
+# which is lumpy — a one-off asset sale would show as revenue growth and
+# quietly clear the declining-revenue veto. Operations first, always.
+# re_int_earned is the bank/NBFC equivalent, which has no re_net_sale.
+REV_KEYS = ("re_net_sale", "re_int_earned", "re_total_inc")
+PAT_KEYS = ("re_net_profit", "re_proloss_ord_act", "re_con_pro_loss")
+# re_basic_eps comes back null on live filings; the populated field is the
+# continuing-operations one.
+EPS_KEYS = ("re_basic_eps_for_cont_dic_opr", "re_basic_eps", "re_bsc_eps_bfr_exi")
+TO_DT_KEYS = ("re_to_dt",)
+PBT_KEYS = ("re_pro_loss_bef_tax",)
+INTEREST_KEYS = ("re_int_new", "re_int_expd")
+OTHER_INC_KEYS = ("re_oth_inc_new", "re_oth_inc")
+
+
+def _operating_margin(row: dict, revenue_lakhs: float | None) -> float | None:
+    """
+    Operating margin, derived rather than reported.
+
+    NSE publishes no operating-profit line, so it is rebuilt as
+    PBT + interest - other income. Checked against RELIANCE Q3 FY25:
+    this gives 8.4% where the filing's own note states 8.0%.
+
+    An earlier version used PAT / revenue and called it OPM. That is the
+    net profit margin — a different number, and one that moves with tax
+    and one-off items rather than with the business.
+    """
+    if not revenue_lakhs or revenue_lakhs <= 0:
+        return None
+    pbt = _num(_first(row, PBT_KEYS))
+    if pbt is None:
+        return None
+    interest = _num(_first(row, INTEREST_KEYS)) or 0.0
+    other_income = _num(_first(row, OTHER_INC_KEYS)) or 0.0
+    return (pbt + interest - other_income) / revenue_lakhs * 100
 
 
 def sync_quarterly_results(conn, symbols: list[str] | None = None) -> dict:
@@ -241,7 +285,7 @@ def sync_quarterly_results(conn, symbols: list[str] | None = None) -> dict:
 
                 revenue = revenue_lakhs / LAKHS_TO_CRORES if revenue_lakhs is not None else None
                 pat = pat_lakhs / LAKHS_TO_CRORES if pat_lakhs is not None else None
-                opm = (pat / revenue * 100) if revenue and pat is not None and revenue > 0 else None
+                opm = _operating_margin(row, revenue_lakhs)
 
                 with conn.cursor() as cur:
                     cur.execute("""
