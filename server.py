@@ -23,7 +23,7 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from upstox_client import (
@@ -43,6 +43,17 @@ STATE_PATH = Path("/data/oauth_state.json")
 STATE_TTL = timedelta(minutes=10)
 
 store = TokenStore()
+
+
+@app.on_event("startup")
+def _start_scheduler() -> None:
+    try:
+        import scheduler
+        scheduler.start()
+    except Exception:
+        # A broken scheduler must not stop the auth server from serving —
+        # without it you cannot log in to fix anything.
+        log.exception("Scheduler failed to start")
 
 
 def creds() -> UpstoxCredentials:
@@ -198,20 +209,26 @@ def signals(request: Request):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                select s.symbol, y.company_name, y.industry, s.as_of_date,
+                with latest as (
+                    select distinct on (symbol) symbol, adj_close, trade_date
+                    from ohlcv_daily order by symbol, trade_date desc
+                )
+                select s.id, s.symbol, y.company_name, y.industry, s.as_of_date,
                        s.setup_type, s.pattern, s.entry_trigger, s.stop_loss,
                        s.t1, s.t2, s.r_multiple_t1, s.qty_suggested, s.risk_amount,
                        s.score_total, s.score_breakdown, s.regime_state,
                        s.notes, s.status, s.expires_on, s.base_low,
-                       s.base_start_date, s.pivot_bar_date
+                       s.base_start_date, s.pivot_bar_date,
+                       l.adj_close as last_close, l.trade_date as last_bar,
+                       o.entry_date, o.entry_price, o.exit_date, o.exit_price,
+                       o.exit_reason, o.r_realised, o.max_favourable_r, o.max_adverse_r
                 from signals s
                 join symbols y on y.symbol = s.symbol
+                left join latest l on l.symbol = s.symbol
+                left join signal_outcomes o on o.signal_id = s.id
                 where s.status in ('pending','triggered')
                 order by s.score_total desc
             """)
-            cols = [d[0] for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-
             cur.execute("select state, breadth_above_50dma, vix, distribution_days, as_of "
                         "from market_regime order by as_of desc limit 1")
             reg = cur.fetchone()
@@ -237,12 +254,37 @@ def signals(request: Request):
         return "high" if score >= 80 else "medium" if score >= 65 else "low"
 
     for r in rows:
+        r["id"] = str(r["id"])
         r["band"] = band(float(r["score_total"]))
+
+        # Live progress against the levels. Everything here is derived from
+        # prices that exist, not from a projection.
+        lc = float(r["last_close"]) if r.get("last_close") is not None else None
+        entry = float(r["entry_trigger"])
+        stop, t1 = float(r["stop_loss"]), float(r["t1"])
+        risk = entry - stop
+        taken = r.get("entry_price") is not None
+
+        prog = {"last_close": lc, "taken": taken}
+        if lc is not None:
+            prog["pct_to_entry"] = round((entry / lc - 1) * 100, 2)
+            basis = float(r["entry_price"]) if taken else entry
+            prog["r_now"] = round((lc - basis) / risk, 2) if risk > 0 else None
+            if taken:
+                prog["state"] = ("stopped" if lc <= stop else
+                                 "target_hit" if lc >= t1 else "open")
+            else:
+                prog["state"] = ("triggered" if lc >= entry else
+                                 "invalidated" if lc <= stop else "waiting")
+        r["progress"] = prog
         for k in ("entry_trigger", "stop_loss", "t1", "t2", "r_multiple_t1",
-                  "score_total", "risk_amount", "base_low"):
+                  "score_total", "risk_amount", "base_low", "last_close",
+                  "entry_price", "exit_price", "r_realised",
+                  "max_favourable_r", "max_adverse_r"):
             if r.get(k) is not None:
                 r[k] = float(r[k])
-        for k in ("as_of_date", "expires_on", "base_start_date", "pivot_bar_date"):
+        for k in ("as_of_date", "expires_on", "base_start_date", "pivot_bar_date",
+                  "last_bar", "entry_date", "exit_date"):
             if r.get(k) is not None:
                 r[k] = str(r[k])
 
@@ -258,6 +300,90 @@ def signals(request: Request):
     }
 
 
+@app.post("/signals/take")
+def take_signal(request: Request, body: dict = Body(...)):
+    """
+    Mark a recommendation as actually taken.
+
+    Records the fill price the user got, not the trigger price we
+    published. Slippage between the two is the difference between a
+    backtest and a track record, and only the real fill can validate the
+    score bands later.
+    """
+    require_internal_key(request)
+    signal_id = body.get("signal_id")
+    if not signal_id:
+        raise HTTPException(400, "signal_id required")
+
+    from ingest import connect
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select entry_trigger, stop_loss from signals where id = %s",
+                        (signal_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "signal not found")
+
+            entry_price = float(body.get("entry_price") or row[0])
+            cur.execute("update signals set status = 'triggered' where id = %s", (signal_id,))
+            cur.execute("""
+                insert into signal_outcomes (signal_id, entry_date, entry_price)
+                values (%s, current_date, %s)
+                on conflict (signal_id) do update set
+                    entry_date = excluded.entry_date,
+                    entry_price = excluded.entry_price
+            """, (signal_id, entry_price))
+        conn.commit()
+        return {"ok": True, "signal_id": signal_id, "entry_price": entry_price}
+    finally:
+        conn.close()
+
+
+@app.post("/signals/close")
+def close_signal(request: Request, body: dict = Body(...)):
+    """Record the exit and the realised R. This is what calibrates the bands."""
+    require_internal_key(request)
+    signal_id = body.get("signal_id")
+    exit_price = body.get("exit_price")
+    if not signal_id or exit_price is None:
+        raise HTTPException(400, "signal_id and exit_price required")
+
+    from ingest import connect
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                select s.entry_trigger, s.stop_loss, o.entry_price
+                from signals s left join signal_outcomes o on o.signal_id = s.id
+                where s.id = %s
+            """, (signal_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "signal not found")
+
+            entry = float(row[2]) if row[2] is not None else float(row[0])
+            risk = entry - float(row[1])
+            r_realised = round((float(exit_price) - entry) / risk, 3) if risk > 0 else None
+
+            cur.execute("update signals set status = %s where id = %s",
+                        (body.get("exit_reason") or "closed", signal_id))
+            cur.execute("""
+                insert into signal_outcomes
+                    (signal_id, entry_price, exit_date, exit_price, exit_reason, r_realised)
+                values (%s, %s, current_date, %s, %s, %s)
+                on conflict (signal_id) do update set
+                    exit_date = excluded.exit_date,
+                    exit_price = excluded.exit_price,
+                    exit_reason = excluded.exit_reason,
+                    r_realised = excluded.r_realised
+            """, (signal_id, entry, exit_price, body.get("exit_reason"), r_realised))
+        conn.commit()
+        return {"ok": True, "r_realised": r_realised}
+    finally:
+        conn.close()
+
+
 @app.post("/jobs/scan")
 def scan_job(request: Request):
     """
@@ -269,8 +395,9 @@ def scan_job(request: Request):
     """
     require_internal_key(request)
     from scan import run_scan
+    mode = request.query_params.get("mode", "postclose")
     try:
-        return run_scan()
+        return run_scan(mode=mode)
     except Exception as exc:
         log.error("Scan failed: %s", exc)
         raise HTTPException(500, f"Scan failed: {exc}")
@@ -324,6 +451,13 @@ def disconnect(request: Request):
     store.path.unlink(missing_ok=True)
     log.info("Upstox token cleared (was_connected=%s)", was_connected)
     return {"ok": True, "was_connected": was_connected}
+
+
+@app.get("/jobs/schedule")
+def schedule_status(request: Request):
+    require_internal_key(request)
+    import scheduler
+    return scheduler.status()
 
 
 @app.get("/health")

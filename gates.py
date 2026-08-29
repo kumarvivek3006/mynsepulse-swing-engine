@@ -122,17 +122,23 @@ def evaluate_regime(nifty: pd.DataFrame, vix: pd.DataFrame,
     else:
         distribution_days = 0
 
-    score = sum([above20, above50, slope50,
-                 breadth_pct >= 50,
-                 pd.isna(vix_level) or vix_level < 20,
-                 distribution_days <= 4])
+    # Risk-off must mean actual deterioration, not merely a dip below the
+    # 50 DMA. An earlier version made `not above50` sufficient on its own,
+    # which suppressed every setup on a calm tape with VIX at 11, zero
+    # distribution days and 67 stocks in clean Stage 2 uptrends. A single
+    # moving average should not outvote breadth, volatility and supply.
+    above200 = bool(last["close"] > last["sma200"]) if pd.notna(last["sma200"]) else True
+    vix_spike = (not pd.isna(vix_level)) and vix_level > 25 and vix_10d > 0
 
-    if score >= 5 and above50 and breadth_pct >= 45:
-        state = "risk_on"
-    elif score <= 2 or not above50 or breadth_pct < 30:
+    if (breadth_pct < 35) or (not above200) or distribution_days >= 6 or vix_spike:
         state = "risk_off"
+    elif above20 and above50 and slope50 and breadth_pct >= 50 and distribution_days <= 4:
+        state = "risk_on"
     else:
         state = "neutral"
+
+    score = sum([above20, above50, slope50, breadth_pct >= 50,
+                 pd.isna(vix_level) or vix_level < 20, distribution_days <= 4])
 
     return {
         "state": state,
@@ -144,7 +150,8 @@ def evaluate_regime(nifty: pd.DataFrame, vix: pd.DataFrame,
         "vix_10d_change": vix_10d,
         "distribution_days": distribution_days,
         "notes": {"score": score, "above20": above20, "above50": above50,
-                  "slope50": slope50},
+                  "above200": above200, "slope50": slope50,
+                  "vix_spike": bool(vix_spike)},
     }
 
 

@@ -42,13 +42,17 @@ SIGNAL_EXPIRY_SESSIONS = int(os.environ.get("SIGNAL_EXPIRY_SESSIONS", "5"))
 
 def _load_frames(conn) -> dict[str, pd.DataFrame]:
     """One query for the whole universe; split in pandas rather than 500 round trips."""
-    query = """
-        select symbol, trade_date, adj_open, adj_high, adj_low, adj_close, volume
-        from ohlcv_daily
-        order by symbol, trade_date
-    """
-    df = pd.read_sql(query, conn)
-    df.columns = ["symbol", "trade_date", "open", "high", "low", "close", "volume"]
+    # Built from the cursor rather than pd.read_sql: pandas only supports
+    # SQLAlchemy connectables and warns loudly on a raw psycopg connection.
+    with conn.cursor() as cur:
+        cur.execute("""
+            select symbol, trade_date, adj_open, adj_high, adj_low, adj_close, volume
+            from ohlcv_daily
+            order by symbol, trade_date
+        """)
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=["symbol", "trade_date", "open", "high",
+                                     "low", "close", "volume"])
     for c in ("open", "high", "low", "close"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
@@ -69,7 +73,52 @@ def _breadth(frames: dict[str, pd.DataFrame], universe: list[str]) -> float:
     return (above / total * 100) if total else 0.0
 
 
-def run_scan(as_of: date | None = None) -> dict:
+def _forming_bar(client, frames: dict, symbols: list[str]) -> dict[str, pd.DataFrame]:
+    """
+    Append today's in-progress session as a provisional daily bar.
+
+    Only for the intraday slot, and only for symbols that already cleared
+    the structural gates — 67 calls, not 500. The bar is real data, just
+    incomplete: no volume projection is applied anywhere. A breakout whose
+    volume only arrives in the closing surge will not confirm at 15:00,
+    and that is the correct trade-off. Inventing the missing volume would
+    manufacture a confirmation that has not happened.
+    """
+    out = {}
+    today = date.today()
+    for sym in symbols:
+        df = frames.get(sym)
+        if df is None or len(df) == 0:
+            continue
+        key = _instrument_keys.get(sym)
+        if not key:
+            continue
+        try:
+            candles = client.intraday_today(key)
+        except Exception as exc:
+            log.debug("intraday fetch failed for %s: %s", sym, exc)
+            continue
+        if not candles:
+            continue
+
+        o = float(candles[-1][1]); h = max(float(c[2]) for c in candles)
+        l = min(float(c[3]) for c in candles); c_ = float(candles[0][4])
+        v = sum(int(c[5] or 0) for c in candles)
+        # Upstox returns intraday candles newest-first.
+        o = float(candles[-1][1])
+
+        if pd.Timestamp(df["trade_date"].iloc[-1]).date() == today:
+            df = df.iloc[:-1]
+        bar = pd.DataFrame([{"symbol": sym, "trade_date": pd.Timestamp(today),
+                             "open": o, "high": h, "low": l, "close": c_, "volume": v}])
+        out[sym] = pd.concat([df, bar], ignore_index=True)
+    return out
+
+
+_instrument_keys: dict[str, str] = {}
+
+
+def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     as_of = as_of or date.today()
     conn = connect()
@@ -92,6 +141,12 @@ def run_scan(as_of: date | None = None) -> dict:
 
         universe = [r[0] for r in rows]
         flagged = {r[0] for r in rows if r[1]}
+
+        with conn.cursor() as cur:
+            cur.execute("select symbol, upstox_instrument_key from symbols "
+                        "where upstox_instrument_key is not null")
+            _instrument_keys.clear()
+            _instrument_keys.update(dict(cur.fetchall()))
         log.info("Universe: %d symbols, %d under surveillance", len(universe), len(flagged))
 
         frames = _load_frames(conn)
@@ -131,6 +186,22 @@ def run_scan(as_of: date | None = None) -> dict:
         counts: dict[str, int] = {}
         signals: list[dict] = []
         log_rows: list[tuple] = []
+        intraday_frames: dict[str, pd.DataFrame] = {}
+
+        if mode == "intraday":
+            from upstox_client import UpstoxClient
+            structural = []
+            for sym in universe:
+                d = frames.get(sym)
+                if d is None or len(d) < MIN_BARS:
+                    continue
+                d = add_indicators(d)
+                if gate0_tradability(sym, d, sym in flagged).passed and \
+                        gate3_trend_structure(sym, d).passed:
+                    structural.append(sym)
+            log.info("Intraday slot: fetching forming bars for %d candidates",
+                     len(structural))
+            intraday_frames = _forming_bar(UpstoxClient(), frames, structural)
 
         for sym in universe:
             df = frames.get(sym)
@@ -170,6 +241,14 @@ def run_scan(as_of: date | None = None) -> dict:
             if regime["state"] == "risk_off":
                 log_rows.append((as_of, sym, "gate1", "regime_risk_off", "{}"))
                 continue
+
+            if mode == "intraday":
+                live = intraday_frames.get(sym)
+                if live is None:
+                    log_rows.append((as_of, sym, "gate5", "no_intraday_bar", "{}"))
+                    counts["no_intraday_bar"] = counts.get("no_intraday_bar", 0) + 1
+                    continue
+                df = add_indicators(live)
 
             try:
                 setup = build_setup(sym, df, rs63, rs126, FUNDAMENTALS_READY)
@@ -270,9 +349,10 @@ def run_scan(as_of: date | None = None) -> dict:
             "signals": len(signals),
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": FUNDAMENTALS_READY,
+            "mode": mode,
         }
-        log.info("Scan complete: %d signals from %d structural candidates (%s regime)",
-                 len(signals), counts.get("passed_gates_0_3", 0), regime["state"])
+        log.info("Scan complete [%s]: %d signals from %d structural candidates (%s regime)",
+                 mode, len(signals), counts.get("passed_gates_0_3", 0), regime["state"])
         return summary
 
     finally:
