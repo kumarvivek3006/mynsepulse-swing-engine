@@ -44,10 +44,18 @@ def connect() -> psycopg.Connection:
     # Supabase's transaction pooler gives each statement a different backend
     # session, so a SET does not reliably persist — which surfaced as an
     # intermittent 'relation "gate_log" does not exist' on identical code.
+    #
+    # prepare_threshold=None disables psycopg's automatic prepared statements
+    # for the same reason. psycopg promotes a query to a server-side prepared
+    # statement after five executions, but the PREPARE lives in one backend
+    # session while the pooler routes the next EXECUTE to another — giving
+    # 'prepared statement "_pg3_N" does not exist'. It only appears under
+    # loops that repeat one query, such as the 500-symbol price backfill.
     conn = psycopg.connect(
         DATABASE_URL,
         autocommit=False,
         options="-c search_path=swing,public",
+        prepare_threshold=None,
     )
     return conn
 
