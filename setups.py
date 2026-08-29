@@ -23,6 +23,8 @@ import pandas as pd
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
 BASE_MAX_SESSIONS = int(os.environ.get("BASE_MAX_SESSIONS", "120"))
 BREAKOUT_VOL_MULT = float(os.environ.get("BREAKOUT_VOL_MULT", "1.5"))
+# How close to the pivot a stock must sit to be worth arming an order on.
+ARMED_MAX_DISTANCE_PCT = float(os.environ.get("ARMED_MAX_DISTANCE_PCT", "4.0"))
 MIN_RR = float(os.environ.get("MIN_RR", "1.0"))
 MIN_STOP_ATR_MULT = float(os.environ.get("MIN_STOP_ATR_MULT", "0.75"))
 MAX_STOP_PCT = float(os.environ.get("MAX_STOP_PCT", "8"))
@@ -228,7 +230,35 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
         if bullish and (vol50 == 0 or last["volume"] < vol50):
             return "pullback"
 
-    raise Rejected("gate5", "no_trigger")
+    # --- armed: coiling under the pivot, no trigger yet ------------------
+    #
+    # This is the state a swing trader actually acts on. A breakout is only
+    # visible after the close, so acting on a confirmed one means buying the
+    # next open and paying the gap. An armed setup is published BEFORE the
+    # move, with the entry as a resting stop order above the pivot — the
+    # market fills you when it breaks, or it never triggers and the signal
+    # expires. Nothing is missed and no gap is paid.
+    close = float(last["close"])
+    distance_pct = (base.pivot / close - 1) * 100
+
+    if 0 <= distance_pct <= ARMED_MAX_DISTANCE_PCT:
+        # Must still be constructive: sitting in the upper half of the base
+        # and holding the 20 EMA. A stock at the bottom of its base is not
+        # coiling, it is failing.
+        midpoint = (base.pivot + base.base_low) / 2
+        if close < midpoint:
+            raise Rejected("gate5", "lower_half_of_base",
+                           {"close": round(close, 2), "midpoint": round(midpoint, 2)})
+        if pd.notna(last["ema20"]) and close < float(last["ema20"]):
+            raise Rejected("gate5", "below_20ema")
+        # Volume must have dried up in the base — supply leaving, not arriving.
+        if base.volume_dryup > 1.1:
+            raise Rejected("gate5", "no_volume_dryup",
+                           {"dryup": round(base.volume_dryup, 2)})
+        return "armed"
+
+    raise Rejected("gate5", "no_trigger",
+                   {"distance_to_pivot_pct": round(distance_pct, 2)})
 
 
 # ---------------------------------------------------------------------
@@ -238,7 +268,10 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str) -> dict:
     last = df.iloc[-1]
     atr = float(last["atr14"])
 
-    entry = (base.pivot if setup_type == "breakout" else float(last["high"])) * (1 + ENTRY_BUFFER)
+    # Armed and breakout both enter on a stop order above the pivot; only a
+    # pullback entry keys off the confirmation bar's high.
+    anchor = float(last["high"]) if setup_type == "pullback" else base.pivot
+    entry = anchor * (1 + ENTRY_BUFFER)
 
     # --- stop: the tightest structural level that is still real ---------
     candidates: list[tuple[float, str]] = []
@@ -310,8 +343,17 @@ def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
 
     vol_mult = (float(last["volume"]) / vol50) if vol50 else 0.0
     close_pos = ((float(last["close"]) - float(last["low"])) / rng) if rng > 0 else 0.5
-    trigger = (min(vol_mult / 3.0, 1.0) * 0.6 + close_pos * 0.4) if setup_type == "breakout" \
-        else (0.55 + close_pos * 0.25)
+    if setup_type == "breakout":
+        trigger = min(vol_mult / 3.0, 1.0) * 0.6 + close_pos * 0.4
+    elif setup_type == "pullback":
+        trigger = 0.55 + close_pos * 0.25
+    else:
+        # Armed: there is no trigger bar yet, so this block grades readiness
+        # — how tightly it is coiling and how far the volume has dried up —
+        # rather than pretending to grade a breakout that has not occurred.
+        proximity = 1.0 - min(max((base.pivot / float(last["close"]) - 1) * 100, 0)
+                              / ARMED_MAX_DISTANCE_PCT, 1.0)
+        trigger = 0.45 + proximity * 0.30 + max(0.0, 1.0 - base.volume_dryup) * 0.25
 
     base_q = base.quality / 100
 
