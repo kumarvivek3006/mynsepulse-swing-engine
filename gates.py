@@ -130,7 +130,17 @@ def evaluate_regime(nifty: pd.DataFrame, vix: pd.DataFrame,
     above200 = bool(last["close"] > last["sma200"]) if pd.notna(last["sma200"]) else True
     vix_spike = (not pd.isna(vix_level)) and vix_level > 25 and vix_10d > 0
 
-    if (breadth_pct < 35) or (not above200) or distribution_days >= 6 or vix_spike:
+    # Risk-off requires TWO independent confirmations. A single input has
+    # twice now zeroed every signal on its own — first the 50 DMA, then the
+    # 200 DMA while VIX sat at 11 with no distribution. One indicator
+    # should not outvote every other measure of the tape.
+    bearish = [
+        breadth_pct < 35,
+        not above200,
+        distribution_days >= 6,
+        vix_spike,
+    ]
+    if sum(bool(x) for x in bearish) >= 2:
         state = "risk_off"
     elif above20 and above50 and slope50 and breadth_pct >= 50 and distribution_days <= 4:
         state = "risk_on"
@@ -151,7 +161,11 @@ def evaluate_regime(nifty: pd.DataFrame, vix: pd.DataFrame,
         "distribution_days": distribution_days,
         "notes": {"score": score, "above20": above20, "above50": above50,
                   "above200": above200, "slope50": slope50,
-                  "vix_spike": bool(vix_spike)},
+                  "vix_spike": bool(vix_spike),
+                  "bearish_confirmations": int(sum(bool(x) for x in bearish)),
+                  "sma20": None if pd.isna(last["sma20"]) else float(last["sma20"]),
+                  "sma50": None if pd.isna(last["sma50"]) else float(last["sma50"]),
+                  "sma200": None if pd.isna(last["sma200"]) else float(last["sma200"])},
     }
 
 

@@ -38,6 +38,9 @@ FUNDAMENTALS_READY = False   # flip when NSE XBRL ingestion exists
 CAPITAL = float(os.environ.get("SWING_CAPITAL", "0") or 0)
 RISK_PCT = float(os.environ.get("RISK_PCT", "1.0"))
 SIGNAL_EXPIRY_SESSIONS = int(os.environ.get("SIGNAL_EXPIRY_SESSIONS", "5"))
+MIN_SCORE = float(os.environ.get("MIN_SCORE", "65"))
+MIN_SCORE_NEUTRAL = float(os.environ.get("MIN_SCORE_NEUTRAL", "72"))
+MIN_SCORE_RISK_OFF = float(os.environ.get("MIN_SCORE_RISK_OFF", "80"))
 
 
 def _load_frames(conn) -> dict[str, pd.DataFrame]:
@@ -238,10 +241,6 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # Gates 4-7. In a risk-off regime the correct output is nothing,
             # so setups are not even constructed — an empty list is the
             # answer, not a failure.
-            if regime["state"] == "risk_off":
-                log_rows.append((as_of, sym, "gate1", "regime_risk_off", "{}"))
-                continue
-
             if mode == "intraday":
                 live = intraday_frames.get(sym)
                 if live is None:
@@ -256,6 +255,20 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 counts[rej.reason] = counts.get(rej.reason, 0) + 1
                 log_rows.append((as_of, sym, rej.gate, rej.reason,
                                  json.dumps(rej.detail)))
+                continue
+
+            # Only setups worth acting on are published. Everything else is
+            # logged and stays out of the recommendation list — the desk
+            # shows trades, not a research feed.
+            floor = {"risk_on": MIN_SCORE,
+                     "neutral": MIN_SCORE_NEUTRAL,
+                     "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]]
+            if setup.score_total < floor:
+                counts["below_min_score"] = counts.get("below_min_score", 0) + 1
+                log_rows.append((as_of, sym, "score", "below_min_score",
+                                 json.dumps({"score": setup.score_total,
+                                             "floor": floor,
+                                             "regime": regime["state"]})))
                 continue
 
             risk_per_share = setup.entry - setup.stop
@@ -349,6 +362,9 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "signals": len(signals),
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": FUNDAMENTALS_READY,
+            "min_score": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
+                          "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],
+            "regime_detail": regime["notes"],
             "mode": mode,
         }
         log.info("Scan complete [%s]: %d signals from %d structural candidates (%s regime)",

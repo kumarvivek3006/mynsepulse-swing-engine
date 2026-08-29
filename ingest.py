@@ -40,9 +40,15 @@ BACKFILL_YEARS = int(os.environ.get("BACKFILL_YEARS", "3"))
 def connect() -> psycopg.Connection:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
-    conn = psycopg.connect(DATABASE_URL, autocommit=False)
-    with conn.cursor() as cur:
-        cur.execute("set search_path to swing, public")
+    # search_path is passed as a startup option, NOT as a SET statement.
+    # Supabase's transaction pooler gives each statement a different backend
+    # session, so a SET does not reliably persist — which surfaced as an
+    # intermittent 'relation "gate_log" does not exist' on identical code.
+    conn = psycopg.connect(
+        DATABASE_URL,
+        autocommit=False,
+        options="-c search_path=swing,public",
+    )
     return conn
 
 

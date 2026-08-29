@@ -253,6 +253,40 @@ def signals(request: Request):
     finally:
         conn.close()
 
+    # 20 EMA and the latest confirmed swing low, for the symbols on screen
+    # only — a handful of queries, not five hundred.
+    ema20_by_symbol: dict[str, float] = {}
+    trail_by_symbol: dict[str, float] = {}
+    if rows:
+        conn2 = connect()
+        try:
+            with conn2.cursor() as cur:
+                for sym in {r["symbol"] for r in rows}:
+                    cur.execute("""
+                        select adj_close, adj_low from ohlcv_daily
+                        where symbol = %s order by trade_date desc limit 60
+                    """, (sym,))
+                    bars = cur.fetchall()
+                    if len(bars) < 25:
+                        continue
+                    closes = [float(b[0]) for b in reversed(bars)]
+                    lows = [float(b[1]) for b in reversed(bars)]
+
+                    k = 2 / 21
+                    ema = closes[0]
+                    for px in closes[1:]:
+                        ema = px * k + ema * (1 - k)
+                    ema20_by_symbol[sym] = ema
+
+                    # Most recent low with two higher lows either side.
+                    for i in range(len(lows) - 3, 2, -1):
+                        w = lows[i - 2:i + 3]
+                        if lows[i] == min(w):
+                            trail_by_symbol[sym] = lows[i]
+                            break
+        finally:
+            conn2.close()
+
     def band(score):
         return "high" if score >= 80 else "medium" if score >= 65 else "low"
 
@@ -279,6 +313,48 @@ def signals(request: Request):
             else:
                 prog["state"] = ("triggered" if lc >= entry else
                                  "invalidated" if lc <= stop else "waiting")
+        # Advisories. Every one is derived from a price that traded, and
+        # from the levels already published — never a fresh projection.
+        adv = []
+        t2 = float(r["t2"]) if r.get("t2") is not None else None
+        ema20 = ema20_by_symbol.get(r["symbol"])
+        trail = trail_by_symbol.get(r["symbol"])
+
+        if taken and lc is not None:
+            entry_px = float(r["entry_price"])
+            if lc <= stop:
+                adv.append({"kind": "stop_hit", "severity": "high",
+                            "text": "Price closed at or below the stop."})
+            elif lc >= t1:
+                adv.append({"kind": "target_hit", "severity": "good",
+                            "text": f"T1 {t1} reached. Trail rather than hold for T2."})
+                if t2:
+                    adv.append({"kind": "trail_target", "severity": "info",
+                                "text": f"T2 {t2} is the remaining objective."})
+            if prog.get("r_now") is not None and prog["r_now"] >= 1:
+                adv.append({"kind": "trail_breakeven", "severity": "info",
+                            "text": "Beyond 1R — move the stop to breakeven."})
+            if trail and trail > stop:
+                adv.append({"kind": "trail_stop", "severity": "info",
+                            "text": f"Swing-low trail now at {round(trail, 2)}."})
+            if ema20 and lc < ema20 and lc > stop:
+                adv.append({"kind": "early_exit", "severity": "warn",
+                            "text": "Closed below the 20 EMA — momentum failing."})
+            if lc < entry_px and prog.get("r_now", 0) <= -0.5:
+                adv.append({"kind": "early_exit", "severity": "warn",
+                            "text": "Half the risk is gone with no progress."})
+        elif lc is not None:
+            if lc <= stop:
+                adv.append({"kind": "invalidated", "severity": "warn",
+                            "text": "Broke the stop before triggering. Setup is void."})
+            elif lc >= entry:
+                adv.append({"kind": "triggered", "severity": "good",
+                            "text": "Trading through the entry trigger."})
+            elif prog.get("pct_to_entry") is not None and prog["pct_to_entry"] <= 1.0:
+                adv.append({"kind": "approaching", "severity": "info",
+                            "text": f"Within {prog['pct_to_entry']}% of the trigger."})
+
+        r["advisories"] = adv
         r["progress"] = prog
         for k in ("entry_trigger", "stop_loss", "t1", "t2", "r_multiple_t1",
                   "score_total", "risk_amount", "base_low", "last_close",
@@ -301,6 +377,138 @@ def signals(request: Request):
         "counts": {b: sum(1 for r in rows if r["band"] == b)
                    for b in ("high", "medium", "low")},
     }
+
+
+@app.get("/daily-log")
+def daily_log(request: Request, day: str | None = Query(None)):
+    """
+    Everything the engine produced on a date, including setups that were
+    never taken and those that expired. The dashboard shows what to trade;
+    this is the record of what it said, which is what makes the score
+    bands auditable later.
+    """
+    require_internal_key(request)
+    from ingest import connect
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select coalesce(%s::date, max(as_of_date)) from signals", (day,))
+            target = cur.fetchone()[0]
+            if target is None:
+                return {"day": None, "signals": [], "rejections": [], "regime": None}
+
+            cur.execute("""
+                select s.id, s.symbol, y.company_name, s.setup_type, s.pattern,
+                       s.entry_trigger, s.stop_loss, s.t1, s.t2, s.r_multiple_t1,
+                       s.score_total, s.status, s.regime_state,
+                       o.entry_price, o.exit_price, o.exit_reason, o.r_realised
+                from signals s
+                join symbols y on y.symbol = s.symbol
+                left join signal_outcomes o on o.signal_id = s.id
+                where s.as_of_date = %s
+                order by s.score_total desc
+            """, (target,))
+            cols = [d[0] for d in cur.description]
+            sigs = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            cur.execute("""
+                select coalesce(failed_gate, 'passed') as gate, reason_code, count(*)
+                from gate_log where as_of_date = %s
+                group by 1, 2 order by 3 desc
+            """, (target,))
+            rejections = [{"gate": r[0], "reason": r[1], "count": r[2]}
+                          for r in cur.fetchall()]
+
+            cur.execute("select state, breadth_above_50dma, vix, distribution_days "
+                        "from market_regime where as_of = %s", (target,))
+            reg = cur.fetchone()
+
+            cur.execute("select distinct as_of_date from signals order by 1 desc limit 30")
+            days = [str(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    for s_ in sigs:
+        s_["id"] = str(s_["id"])
+        for k in ("entry_trigger", "stop_loss", "t1", "t2", "r_multiple_t1",
+                  "score_total", "entry_price", "exit_price", "r_realised"):
+            if s_.get(k) is not None:
+                s_[k] = float(s_[k])
+
+    return {
+        "day": str(target),
+        "available_days": days,
+        "regime": {"state": reg[0], "breadth_above_50dma": float(reg[1]) if reg and reg[1] is not None else None,
+                   "vix": float(reg[2]) if reg and reg[2] is not None else None,
+                   "distribution_days": reg[3]} if reg else None,
+        "signals": sigs,
+        "rejections": rejections,
+    }
+
+
+@app.get("/my-trades")
+def my_trades(request: Request):
+    """Taken trades, open and closed, with realised R and running stats."""
+    require_internal_key(request)
+    from ingest import connect
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                with latest as (
+                    select distinct on (symbol) symbol, adj_close
+                    from ohlcv_daily order by symbol, trade_date desc
+                )
+                select s.id, s.symbol, y.company_name, s.setup_type, s.pattern,
+                       s.entry_trigger, s.stop_loss, s.t1, s.t2, s.score_total,
+                       s.status, s.as_of_date, l.adj_close as last_close,
+                       o.entry_date, o.entry_price, o.exit_date, o.exit_price,
+                       o.exit_reason, o.r_realised
+                from signals s
+                join symbols y on y.symbol = s.symbol
+                join signal_outcomes o on o.signal_id = s.id
+                left join latest l on l.symbol = s.symbol
+                where o.entry_price is not null
+                order by (o.exit_date is not null), o.entry_date desc
+            """)
+            cols = [d[0] for d in cur.description]
+            trades = [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    open_t, closed = [], []
+    for t in trades:
+        t["id"] = str(t["id"])
+        for k in ("entry_trigger", "stop_loss", "t1", "t2", "score_total",
+                  "last_close", "entry_price", "exit_price", "r_realised"):
+            if t.get(k) is not None:
+                t[k] = float(t[k])
+        for k in ("as_of_date", "entry_date", "exit_date"):
+            if t.get(k) is not None:
+                t[k] = str(t[k])
+
+        risk = t["entry_price"] - t["stop_loss"]
+        if t.get("exit_price") is None:
+            t["r_now"] = round((t["last_close"] - t["entry_price"]) / risk, 2) \
+                if t.get("last_close") and risk > 0 else None
+            open_t.append(t)
+        else:
+            closed.append(t)
+
+    resolved = [t["r_realised"] for t in closed if t.get("r_realised") is not None]
+    stats = {
+        "open": len(open_t),
+        "closed": len(closed),
+        "wins": sum(1 for r in resolved if r > 0),
+        "losses": sum(1 for r in resolved if r <= 0),
+        "hit_rate": round(sum(1 for r in resolved if r > 0) / len(resolved), 3)
+        if resolved else None,
+        "expectancy_r": round(sum(resolved) / len(resolved), 3) if resolved else None,
+        "total_r": round(sum(resolved), 2) if resolved else None,
+    }
+    return {"open": open_t, "closed": closed, "stats": stats}
 
 
 @app.post("/signals/take")
