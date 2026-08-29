@@ -546,6 +546,96 @@ def daily_log(request: Request, day: str | None = Query(None)):
     }
 
 
+def _thesis_health(bars: list, nifty: list, entry_price: float, stop: float,
+                   pivot: float | None, entry_date, atr_hint: float | None) -> dict:
+    """
+    Assess whether the reason for the trade still holds.
+
+    Every check reads bars that printed. None of it forecasts. The output
+    is a list of concrete deteriorations, not a confidence number — "closed
+    back below the pivot" is actionable, "confidence 0.42" is not.
+
+    bars: [(trade_date, close, high, low, volume)] oldest -> newest
+    """
+    if len(bars) < 25:
+        return {"state": "unknown", "reasons": [],
+                "note": "Not enough bars since entry to assess."}
+
+    closes = [float(b[1]) for b in bars]
+    highs = [float(b[2]) for b in bars]
+    lows = [float(b[3]) for b in bars]
+    vols = [float(b[4] or 0) for b in bars]
+    last = closes[-1]
+
+    k = 2 / 21
+    ema20 = closes[0]
+    for px in closes[1:]:
+        ema20 = px * k + ema20 * (1 - k)
+
+    reasons: list[dict] = []
+
+    if last < ema20:
+        reasons.append({"kind": "below_20ema", "weight": 2,
+                        "text": f"Closed below the 20 EMA ({round(ema20, 2)}) — "
+                                "the trend guide it was riding."})
+
+    # A breakout that returns inside its base has failed, whatever the P&L.
+    if pivot and last < pivot:
+        reasons.append({"kind": "back_below_pivot", "weight": 3,
+                        "text": f"Back below the breakout pivot ({round(pivot, 2)}). "
+                                "The breakout has failed."})
+
+    if len(highs) >= 4 and highs[-1] < highs[-2] < highs[-3]:
+        reasons.append({"kind": "lower_highs", "weight": 1,
+                        "text": "Three consecutive lower highs — momentum rolling over."})
+
+    # Distribution: declines carrying more volume than advances.
+    recent = list(zip(closes[-11:], vols[-11:]))
+    # Unchanged closes are neither accumulation nor distribution; counting
+    # them as down days made a flat series look like heavy selling.
+    up_vol = sum(v for i, (c, v) in enumerate(recent[1:], 1) if c > recent[i - 1][0])
+    down_vol = sum(v for i, (c, v) in enumerate(recent[1:], 1) if c < recent[i - 1][0])
+    if down_vol > up_vol * 1.5 and down_vol > 0:
+        reasons.append({"kind": "distribution", "weight": 2,
+                        "text": "Down days are carrying more volume than up days — "
+                                "supply is arriving."})
+
+    # Relative strength since entry. A stock lagging the index it should be
+    # leading has lost the reason it was selected.
+    if nifty and len(nifty) >= len(bars):
+        idx = [float(n) for n in nifty[-len(bars):]]
+        if idx[0] > 0 and closes[0] > 0:
+            stock_move = last / closes[0] - 1
+            index_move = idx[-1] / idx[0] - 1
+            if stock_move < index_move - 0.02:
+                reasons.append({"kind": "rs_lost", "weight": 2,
+                                "text": f"Underperforming the Nifty since entry by "
+                                        f"{round((index_move - stock_move) * 100, 1)}%."})
+
+    risk = entry_price - stop
+    if risk > 0 and last <= stop:
+        reasons.append({"kind": "stop_breached", "weight": 4,
+                        "text": f"Trading at or below the stop ({round(stop, 2)}). "
+                                "The trade is invalidated."})
+    elif risk > 0 and (last - stop) < risk * 0.35:
+        remaining = round((last - stop) / risk * 100)
+        reasons.append({"kind": "near_stop", "weight": 3,
+                        "text": f"Only {remaining}% of the original risk remains "
+                                "before the stop."})
+
+    # Time stop: capital tied up with nothing to show for it.
+    if entry_date:
+        held = (bars[-1][0] - entry_date).days
+        if held >= 15 and risk > 0 and (last - entry_price) / risk < 0.5:
+            reasons.append({"kind": "time_stop", "weight": 1,
+                            "text": f"{held} days held with under 0.5R of progress."})
+
+    severity = sum(r["weight"] for r in reasons)
+    state = "broken" if severity >= 5 else "weakening" if severity >= 2 else "intact"
+    return {"state": state, "severity": severity, "reasons": reasons,
+            "ema20": round(ema20, 2)}
+
+
 @app.get("/my-trades")
 def my_trades(request: Request):
     """Taken trades, open and closed, with realised R and running stats."""
@@ -562,7 +652,8 @@ def my_trades(request: Request):
                 )
                 select s.id, s.symbol, y.company_name, s.setup_type, s.pattern,
                        s.entry_trigger, s.stop_loss, s.t1, s.t2, s.score_total,
-                       s.status, s.as_of_date, l.adj_close as last_close,
+                       s.status, s.as_of_date, s.base_low, s.pivot_bar_date,
+                       s.entry_trigger as pivot, l.adj_close as last_close,
                        o.entry_date, o.entry_price, o.exit_date, o.exit_price,
                        o.exit_reason, o.r_realised
                 from signals s
@@ -577,11 +668,35 @@ def my_trades(request: Request):
     finally:
         conn.close()
 
+    # Bars for the held symbols only, plus the index for the RS check.
+    bars_by_symbol: dict[str, list] = {}
+    nifty_closes: list = []
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            symbols = {t["symbol"] for t in trades if t.get("exit_price") is None}
+            for sym in symbols:
+                cur.execute("""
+                    select trade_date, adj_close, adj_high, adj_low, volume
+                    from ohlcv_daily where symbol = %s
+                    order by trade_date desc limit 60
+                """, (sym,))
+                bars_by_symbol[sym] = list(reversed(cur.fetchall()))
+            if symbols:
+                cur.execute("""
+                    select adj_close from ohlcv_daily where symbol = 'NIFTY50'
+                    order by trade_date desc limit 60
+                """)
+                nifty_closes = [r[0] for r in reversed(cur.fetchall())]
+    finally:
+        conn.close()
+
     open_t, closed = [], []
     for t in trades:
         t["id"] = str(t["id"])
         for k in ("entry_trigger", "stop_loss", "t1", "t2", "score_total",
-                  "last_close", "entry_price", "exit_price", "r_realised"):
+                  "last_close", "entry_price", "exit_price", "r_realised",
+                  "base_low", "pivot"):
             if t.get(k) is not None:
                 t[k] = float(t[k])
         for k in ("as_of_date", "entry_date", "exit_date"):
@@ -592,6 +707,14 @@ def my_trades(request: Request):
         if t.get("exit_price") is None:
             t["r_now"] = round((t["last_close"] - t["entry_price"]) / risk, 2) \
                 if t.get("last_close") and risk > 0 else None
+
+            entry_dt = None
+            if t.get("entry_date"):
+                entry_dt = datetime.strptime(t["entry_date"], "%Y-%m-%d").date()
+            t["thesis"] = _thesis_health(
+                bars_by_symbol.get(t["symbol"], []), nifty_closes,
+                t["entry_price"], t["stop_loss"],
+                t.get("pivot"), entry_dt, None)
             open_t.append(t)
         else:
             closed.append(t)

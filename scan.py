@@ -43,6 +43,15 @@ SIGNAL_EXPIRY_SESSIONS = int(os.environ.get("SIGNAL_EXPIRY_SESSIONS", "5"))
 MIN_SCORE = float(os.environ.get("MIN_SCORE", "65"))
 MIN_SCORE_NEUTRAL = float(os.environ.get("MIN_SCORE_NEUTRAL", "72"))
 MIN_SCORE_RISK_OFF = float(os.environ.get("MIN_SCORE_RISK_OFF", "80"))
+# An intraday run that cannot see the market must not conclude the market
+# is empty. On a holiday, or with a dead token, the forming-bar fetch
+# returns nothing for every symbol — and writing that result would erase
+# the morning's armed watchlist.
+INTRADAY_MIN_COVERAGE = float(os.environ.get("INTRADAY_MIN_COVERAGE", "0.5"))
+
+
+class ScanAborted(RuntimeError):
+    """Refused to write. The inputs were not trustworthy."""
 
 
 def _load_frames(conn) -> dict[str, pd.DataFrame]:
@@ -147,6 +156,19 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
         universe = [r[0] for r in rows]
         flagged = {r[0] for r in rows if r[1]}
 
+        # Symbols already held. A stock you are in should not reappear as a
+        # fresh recommendation — the position is managed on My Trades, and
+        # a duplicate card invites doubling into the same risk.
+        with conn.cursor() as cur:
+            cur.execute("""
+                select distinct s.symbol from signals s
+                join signal_outcomes o on o.signal_id = s.id
+                where o.entry_price is not null and o.exit_price is null
+            """)
+            open_positions = {r[0] for r in cur.fetchall()}
+        if open_positions:
+            log.info("Skipping %d symbols with open positions", len(open_positions))
+
         with conn.cursor() as cur:
             cur.execute("select symbol, upstox_instrument_key from symbols "
                         "where upstox_instrument_key is not null")
@@ -216,6 +238,14 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                      len(structural))
             intraday_frames = _forming_bar(UpstoxClient(), frames, structural)
 
+            coverage = (len(intraday_frames) / len(structural)) if structural else 0.0
+            if coverage < INTRADAY_MIN_COVERAGE:
+                raise ScanAborted(
+                    f"Intraday coverage {coverage:.0%} of {len(structural)} candidates "
+                    f"is below {INTRADAY_MIN_COVERAGE:.0%}. Exchange holiday, stale "
+                    "token, or a broker outage. Existing signals left untouched."
+                )
+
         for sym in universe:
             df = frames.get(sym)
             if df is None or len(df) < MIN_BARS:
@@ -230,6 +260,11 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             if not r0.passed:
                 counts[r0.reason] = counts.get(r0.reason, 0) + 1
                 log_rows.append((as_of, sym, "gate0", r0.reason, json.dumps(r0.detail)))
+                continue
+
+            if sym in open_positions:
+                log_rows.append((as_of, sym, None, "position_already_open", "{}"))
+                counts["position_already_open"] = counts.get("position_already_open", 0) + 1
                 continue
 
             r2 = gate2_fundamentals(sym, snapshots.get(sym))
@@ -347,6 +382,15 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # Supersede today's previous run rather than accumulating
             # duplicates; untriggered signals from earlier days keep running
             # to their own expiry.
+            # Preserve when each setup was FIRST seen today. A card armed
+            # since 10:00 and still armed at 14:00 is a different thing from
+            # one that appeared this hour, and that distinction is lost if
+            # every re-scan resets the timestamp.
+            cur.execute("select symbol, min(generated_at) from signals "
+                        "where as_of_date = %s and status = 'pending' group by symbol",
+                        (as_of,))
+            first_seen = dict(cur.fetchall())
+
             cur.execute("delete from signals where as_of_date = %s and status = 'pending'",
                         (as_of,))
 
@@ -356,9 +400,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                         (symbol, as_of_date, setup_type, pattern, entry_trigger,
                          stop_loss, t1, t2, r_multiple_t1, qty_suggested, risk_amount,
                          score_total, score_breakdown, pivot_bar_date, base_start_date,
-                         base_low, regime_state, notes, status, expires_on)
+                         base_low, regime_state, notes, status, expires_on,
+                         generated_at)
                     values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            'pending', %s)
+                            'pending', %s, coalesce(%s, now()))
                 """, (s_["symbol"], as_of, s_["setup_type"], s_["pattern"],
                       s_["entry_trigger"], s_["stop_loss"], s_["t1"], s_["t2"],
                       s_["r_multiple_t1"], s_["qty_suggested"], s_["risk_amount"],
@@ -370,7 +415,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                                   "rs63": s_["rs63"], "rs126": s_["rs126"],
                                   "close": s_["close"], "atr14": s_["atr14"],
                                   "notes": s_["notes"]}),
-                      as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2)))
+                      as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2),
+                      first_seen.get(s_["symbol"])))
 
             # Age out anything past its window.
             cur.execute("update signals set status = 'expired' "

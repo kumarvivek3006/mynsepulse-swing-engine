@@ -41,7 +41,10 @@ log = logging.getLogger(__name__)
 
 SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() == "true"
 PREMARKET_TIME = os.environ.get("PREMARKET_TIME_IST", "08:15")
-INTRADAY_TIME = os.environ.get("INTRADAY_SCAN_IST", "15:00")
+# Hourly through the session. The first is at 10:00, not 09:15 — a bar
+# forty-five minutes old carries enough volume for the confirmation test
+# to mean something, whereas one five minutes old does not.
+INTRADAY_HOURS = os.environ.get("INTRADAY_SCAN_HOURS", "10,11,12,13,14,15")
 POSTCLOSE_TIME = os.environ.get("POSTCLOSE_SCAN_IST", "15:45")
 
 _scheduler: BackgroundScheduler | None = None
@@ -122,7 +125,6 @@ def _postclose() -> dict:
 
 SLOTS = {
     "premarket": (PREMARKET_TIME, _premarket),
-    "intraday": (INTRADAY_TIME, _intraday),
     "postclose": (POSTCLOSE_TIME, _postclose),
 }
 
@@ -148,6 +150,21 @@ def start() -> BackgroundScheduler | None:
         )
         log.info("Scheduled %s at %s IST (Mon-Fri)", slot, hhmm)
 
+    # Hourly intraday scans. A run that cannot see the market raises
+    # ScanAborted and leaves existing signals alone, so a holiday costs
+    # nothing.
+    hours = [h.strip() for h in INTRADAY_HOURS.split(",") if h.strip()]
+    if hours:
+        _scheduler.add_job(
+            _guarded,
+            CronTrigger(day_of_week="mon-fri", hour=",".join(hours), minute=0,
+                        timezone=IST),
+            args=["intraday", _intraday], id="intraday", replace_existing=True,
+            misfire_grace_time=600, coalesce=True, max_instances=1,
+        )
+        log.info("Scheduled intraday hourly at %s:00 IST (Mon-Fri)",
+                 ", ".join(hours))
+
     _scheduler.start()
     return _scheduler
 
@@ -163,7 +180,8 @@ def status() -> dict:
     return {
         "enabled": SCHEDULER_ENABLED,
         "now_ist": datetime.now(IST).isoformat(),
-        "slots": {k: v[0] for k, v in SLOTS.items()},
+        "slots": {**{k: v[0] for k, v in SLOTS.items()},
+                  "intraday": f"hourly {INTRADAY_HOURS}"},
         "jobs": jobs,
         "last_runs": _last_runs,
     }
