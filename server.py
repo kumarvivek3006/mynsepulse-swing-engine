@@ -195,12 +195,30 @@ def cold_start_job(request: Request):
 # ---------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------
+SETTINGS_DEFAULTS = {"capital": 0.0, "risk_pct": 2.5}
+
+
 def _read_settings(cur) -> dict:
-    cur.execute("select key, value from engine_settings")
-    rows = dict(cur.fetchall())
+    """
+    Settings are a convenience, not a dependency.
+
+    If engine_settings is missing or unreadable, fall back to defaults
+    rather than raising. Position sizing is optional — an unrun migration
+    should not blank every recommendation on the dashboard, which is
+    exactly what it did the first time.
+    """
+    try:
+        cur.execute("select key, value from engine_settings")
+        rows = dict(cur.fetchall())
+    except Exception as exc:
+        cur.connection.rollback()
+        log.warning("engine_settings unreadable (%s); using defaults", exc)
+        return {**SETTINGS_DEFAULTS, "available": False}
+
     return {
         "capital": float(rows.get("capital") or 0),
         "risk_pct": float(rows.get("risk_pct") or 2.5),
+        "available": True,
     }
 
 
@@ -264,6 +282,7 @@ def put_settings(request: Request, body: dict = Body(...)):
         updates["risk_pct"] = risk
     if not updates:
         raise HTTPException(400, "nothing to update")
+
 
     conn = connect()
     try:
@@ -534,19 +553,32 @@ def signals_live(request: Request):
         error = str(exc)[:200]
         log.warning("Live quote fetch failed: %s", error)
 
-    def find(key: str) -> dict:
-        if key in quotes:
-            return quotes[key]
-        for k, v in quotes.items():           # Upstox echoes a different key form
-            if k.endswith(key.split("|")[-1]):
-                return v
-        return {}
+    # Upstox keys the quotes response by "NSE_EQ:RELIANCE" — exchange and
+    # trading symbol — not by the instrument_key that was sent. Each quote
+    # object does carry instrument_token, which IS the instrument_key, so
+    # index on that. Matching on the key's ISIN suffix never worked because
+    # the response keys do not contain the ISIN at all.
+    by_token: dict[str, dict] = {}
+    by_symbol: dict[str, dict] = {}
+    for response_key, value in (quotes or {}).items():
+        if not isinstance(value, dict):
+            continue
+        token = value.get("instrument_token") or value.get("instrument_key")
+        if token:
+            by_token[token] = value
+        name = value.get("symbol") or response_key.split(":")[-1]
+        if name:
+            by_symbol[str(name).upper()] = value
 
-    out = []
+    def find(key: str, symbol: str) -> dict:
+        return by_token.get(key) or by_symbol.get(symbol.upper()) or {}
+
+    out, unmatched = [], []
     for sig_id, symbol, key, entry, stop, t1, entry_price in rows:
-        q = find(key)
+        q = find(key, symbol)
         ltp = q.get("last_price") or q.get("ltp")
         if ltp is None:
+            unmatched.append(symbol)
             continue
         ltp = float(ltp)
         entry, stop, t1 = float(entry), float(stop), float(t1)
@@ -569,11 +601,20 @@ def signals_live(request: Request):
                       "invalidated" if ltp <= stop else "waiting"),
         })
 
+    if unmatched:
+        log.warning("No quote matched for %d/%d symbols: %s",
+                    len(unmatched), len(rows), unmatched[:10])
+
     return {
         "is_live": market_open and not error and bool(out),
         "market_open": market_open,
         "as_of": now.isoformat(),
         "error": error,
+        # Surfaced so a silent matching failure is visible rather than
+        # looking indistinguishable from "the market is closed".
+        "matched": len(out),
+        "requested": len(rows),
+        "unmatched": unmatched[:10],
         "quotes": out,
     }
 
