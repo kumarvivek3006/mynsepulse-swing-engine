@@ -381,6 +381,7 @@ def signals(request: Request):
     ema20_by_symbol: dict[str, float] = {}
     trail_by_symbol: dict[str, float] = {}
     day_change: dict[str, float] = {}
+    delivery: dict[str, dict] = {}
     if rows:
         conn2 = connect()
         try:
@@ -401,6 +402,23 @@ def signals(request: Request):
                     # figure at all and the UI rendered a meaningless 0.00%.
                     if len(closes) >= 2 and closes[-2] > 0:
                         day_change[sym] = round((closes[-1] / closes[-2] - 1) * 100, 2)
+
+                    # Delivery trend. Diagnostic only — no gate reads it.
+                    cur.execute("""
+                        select delivery_pct from delivery_daily
+                        where symbol = %s and delivery_pct is not null
+                        order by trade_date desc limit 40
+                    """, (sym,))
+                    dvals = [float(r[0]) for r in cur.fetchall()]
+                    if len(dvals) >= 20:
+                        recent = sum(dvals[:10]) / 10
+                        prior = sum(dvals[10:]) / len(dvals[10:])
+                        delivery[sym] = {
+                            "latest": round(dvals[0], 2),
+                            "avg_10d": round(recent, 2),
+                            "avg_prior": round(prior, 2),
+                            "expanding": bool(recent > prior * 1.1),
+                        }
 
                     k = 2 / 21
                     ema = closes[0]
@@ -434,6 +452,7 @@ def signals(request: Request):
             except (ValueError, TypeError):
                 _notes = {}
         r["is_add_on"] = bool(_notes.get("is_add_on"))
+        r["is_transition"] = bool(_notes.get("is_transition"))
         r["is_new_opportunity"] = bool(_notes.get("is_new_opportunity"))
 
         # Live progress against the levels. Everything here is derived from

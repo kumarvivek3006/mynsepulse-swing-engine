@@ -107,9 +107,18 @@ def _intraday() -> dict:
 
 
 def _postclose() -> dict:
-    """Fetch the completed session's bars, then run the definitive scan."""
+    """
+    Fetch the completed session's bars and delivery data, then run the
+    definitive scan.
+
+    Delivery is refreshed here rather than as a separate job the user has
+    to remember. A failure is logged and swallowed — delivery feeds a
+    diagnostic and an opt-in path, so it must never stop the scan that
+    produces the actual signals.
+    """
+    from ingest import backfill_prices, connect, sync_delivery, sync_indices
+    from nse_client import NSEClient
     from upstox_client import InstrumentMaster, UpstoxClient
-    from ingest import backfill_prices, connect, sync_indices
     from scan import run_scan
 
     client, master = UpstoxClient(), InstrumentMaster()
@@ -117,6 +126,10 @@ def _postclose() -> dict:
     try:
         sync_indices(conn, client, master)
         backfill_prices(conn, client)
+        try:
+            sync_delivery(conn, NSEClient())
+        except Exception as exc:
+            log.warning("Delivery refresh failed (non-fatal): %s", exc)
     finally:
         conn.close()
 

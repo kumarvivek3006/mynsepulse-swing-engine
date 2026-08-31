@@ -412,6 +412,60 @@ def sync_indices(conn, client: UpstoxClient, master: InstrumentMaster,
 
 
 # ---------------------------------------------------------------------
+# 4c. Delivery percentage
+#
+# Additive only. No gate, score or signal reads this table — it is recorded
+# so the backtest can later ask whether delivery expansion actually preceded
+# the breakouts that worked. If it did, it earns a place in the engine then;
+# until then it earns a chart and nothing more.
+# ---------------------------------------------------------------------
+def sync_delivery(conn, nse, days: int = 30) -> int:
+    """Backfill the last N sessions. Idempotent; safe to re-run."""
+    with conn.cursor() as cur:
+        cur.execute("select symbol from symbols where is_active "
+                    "and coalesce(series,'') <> 'INDEX'")
+        universe = {r[0] for r in cur.fetchall()}
+
+        cur.execute("select max(trade_date) from delivery_daily")
+        latest = cur.fetchone()[0]
+
+    end = date.today()
+    start = (latest + timedelta(days=1)) if latest else end - timedelta(days=days)
+    if start > end:
+        log.info("Delivery already current to %s", latest)
+        return 0
+
+    written = 0
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() >= 5:          # no bhavcopy at the weekend
+            cursor += timedelta(days=1)
+            continue
+
+        rows = [r for r in nse.delivery(cursor) if r.symbol in universe]
+        if rows:
+            with conn.cursor() as cur:
+                cur.executemany("""
+                    insert into delivery_daily
+                        (symbol, trade_date, traded_qty, delivery_qty,
+                         delivery_pct, no_of_trades)
+                    values (%s, %s, %s, %s, %s, %s)
+                    on conflict (symbol, trade_date) do update set
+                        traded_qty   = excluded.traded_qty,
+                        delivery_qty = excluded.delivery_qty,
+                        delivery_pct = excluded.delivery_pct,
+                        no_of_trades = excluded.no_of_trades
+                """, [(r.symbol, r.trade_date, r.traded_qty, r.delivery_qty,
+                       r.delivery_pct, r.no_of_trades) for r in rows])
+                written += cur.rowcount
+            conn.commit()
+        cursor += timedelta(days=1)
+
+    log.info("Delivery rows written: %d", written)
+    return written
+
+
+# ---------------------------------------------------------------------
 # 5. Surveillance
 # ---------------------------------------------------------------------
 def sync_surveillance(conn, nse: NSEClient) -> int:
@@ -454,6 +508,7 @@ def cold_start() -> None:
             ("sync_indices", lambda: sync_indices(conn, client, master)),
             ("verify_adjustments", lambda: apply_adjustments(conn)),
             ("sync_surveillance", lambda: sync_surveillance(conn, nse)),
+            ("sync_delivery", lambda: sync_delivery(conn, nse)),
         ]:
             log.info("=== %s ===", name)
             try:

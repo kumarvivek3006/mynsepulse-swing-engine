@@ -24,6 +24,7 @@ import pandas as pd
 
 from gates import (
     gate2_fundamentals,
+    gate3_stage1_transition,
     add_indicators,
     evaluate_regime,
     gate0_tradability,
@@ -55,6 +56,57 @@ INTRADAY_MIN_COVERAGE = float(os.environ.get("INTRADAY_MIN_COVERAGE", "0.5"))
 # opportunity rather than the same one refreshed. Below this it is the same
 # base being re-measured; above it the engine has found a different pivot.
 MATERIAL_CHANGE_PCT = float(os.environ.get("MATERIAL_CHANGE_PCT", "2.0"))
+# Stage 1 -> 2 transition path.
+#
+# "auto" (the default) means the engine decides for itself: the path stays
+# dormant until enough delivery history exists to support it, then switches
+# on without anyone remembering to do anything. Set "true" or "false" to
+# override, but nothing requires you to.
+STAGE1_TRANSITION_MODE = os.environ.get("STAGE1_TRANSITION", "auto").lower()
+# Delivery history needed before the path is trusted: this many sessions,
+# across this share of the universe.
+TRANSITION_MIN_SESSIONS = int(os.environ.get("TRANSITION_MIN_SESSIONS", "20"))
+TRANSITION_MIN_COVERAGE = float(os.environ.get("TRANSITION_MIN_COVERAGE", "0.4"))
+
+
+def transition_readiness(conn, universe_size: int) -> dict:
+    """
+    Decide whether the transition path has the evidence it needs.
+
+    The path leans on delivery expansion as its confirmation. Running it
+    without delivery history would mean relaxing the trend filter and
+    replacing it with nothing — which is how a second route becomes a back
+    door. So it stays off until the data is actually there, and turns
+    itself on when it is.
+    """
+    if STAGE1_TRANSITION_MODE == "false":
+        return {"enabled": False, "reason": "disabled_by_config"}
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select count(*) from (
+                select symbol from delivery_daily
+                where delivery_pct is not null
+                group by symbol having count(*) >= %s
+            ) t
+        """, (TRANSITION_MIN_SESSIONS,))
+        covered = cur.fetchone()[0]
+
+    coverage = (covered / universe_size) if universe_size else 0.0
+
+    if STAGE1_TRANSITION_MODE == "true":
+        return {"enabled": True, "reason": "forced_on",
+                "delivery_coverage": round(coverage, 3), "symbols": covered}
+
+    ready = coverage >= TRANSITION_MIN_COVERAGE
+    return {
+        "enabled": ready,
+        "reason": "auto_ready" if ready else "auto_waiting_for_delivery_history",
+        "delivery_coverage": round(coverage, 3),
+        "symbols": covered,
+        "needed_sessions": TRANSITION_MIN_SESSIONS,
+        "needed_coverage": TRANSITION_MIN_COVERAGE,
+    }
 
 
 class ScanAborted(RuntimeError):
@@ -294,6 +346,34 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
         # Gate 2 inputs. Absence is recorded per symbol, never assumed to
         # be a pass — a stock we hold no fundamentals for is flagged as
         # unchecked rather than quietly treated as clean.
+        # Delivery expansion, used ONLY by the transition path. The main
+        # pipeline never reads it.
+        transition_state = transition_readiness(conn, len(universe))
+        transition_on = transition_state["enabled"]
+        log.info("Transition path: %s (%s)",
+                 "on" if transition_on else "off", transition_state["reason"])
+
+        delivery_expanding: set[str] = set()
+        if transition_on:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    with recent as (
+                        select symbol, delivery_pct,
+                               row_number() over (partition by symbol
+                                                  order by trade_date desc) as rn
+                        from delivery_daily where delivery_pct is not null
+                    )
+                    select symbol
+                    from recent where rn <= 40
+                    group by symbol
+                    having count(*) >= 20
+                       and avg(delivery_pct) filter (where rn <= 10) >
+                           avg(delivery_pct) filter (where rn > 10) * 1.1
+                """)
+                delivery_expanding = {r[0] for r in cur.fetchall()}
+            log.info("Transition path enabled: %d symbols show delivery expansion",
+                     len(delivery_expanding))
+
         snapshots = load_snapshots(conn)
         fundamentals_ready = len(snapshots) >= len(universe) * 0.5
         log.info("Fundamentals: %d symbols with data (gate 2 %s)",
@@ -389,11 +469,24 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 counts["gate2_no_data"] = counts.get("gate2_no_data", 0) + 1
                 log_rows.append((as_of, sym, None, "gate2_no_data", "{}"))
 
+            transition = False
             r3 = gate3_trend_structure(sym, df)
             if not r3.passed:
-                counts[r3.reason] = counts.get(r3.reason, 0) + 1
-                log_rows.append((as_of, sym, "gate3", r3.reason, json.dumps(r3.detail)))
-                continue
+                # Second path. Only reached by candidates Gate 3 already
+                # rejected, so nothing that passes today can be lost.
+                # Requires delivery evidence — without it, fail closed.
+                if transition_on and sym in delivery_expanding:
+                    r3b = gate3_stage1_transition(sym, df)
+                    if r3b.passed:
+                        transition = True
+                        r3 = r3b
+                        counts["transition_candidate"] = counts.get(
+                            "transition_candidate", 0) + 1
+                if not transition:
+                    counts[r3.reason] = counts.get(r3.reason, 0) + 1
+                    log_rows.append((as_of, sym, "gate3", r3.reason,
+                                     json.dumps(r3.detail)))
+                    continue
 
             rs63 = relative_strength(df, nifty, 63)
             rs126 = relative_strength(df, nifty, 126)
@@ -413,7 +506,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
 
             try:
                 setup = build_setup(sym, df, rs63, rs126,
-                                    snapshots.get(sym) if fundamentals_ready else None)
+                                    snapshots.get(sym) if fundamentals_ready else None,
+                                    transition=transition)
             except Rejected as rej:
                 counts[rej.reason] = counts.get(rej.reason, 0) + 1
                 log_rows.append((as_of, sym, rej.gate, rej.reason,
@@ -452,6 +546,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             signals.append({
                 "symbol": sym,
                 "is_add_on": sym in open_positions,
+                "is_transition": transition,
                 "setup_type": setup.setup_type,
                 "pattern": setup.pattern,
                 "entry_trigger": setup.entry,
@@ -582,6 +677,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                       json.dumps({"stop_basis": s_["stop_basis"],
                                   "t1_basis": s_["t1_basis"],
                                   "is_add_on": s_["is_add_on"],
+                                  "is_transition": s_["is_transition"],
                                   "is_new_opportunity": s_.get("is_new_opportunity", False),
                                   "rs63": s_["rs63"], "rs126": s_["rs126"],
                                   "close": s_["close"], "atr14": s_["atr14"],
@@ -635,6 +731,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "new_opportunities": new_opportunities,
             "suppressed_already_taken": already_taken,
             "add_ons": sum(1 for s_ in signals if s_["is_add_on"]),
+            "transition": transition_state,
+            "transition_signals": sum(1 for s_ in signals if s_["is_transition"]),
             "min_score_pct": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
                               "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],
             "regime_detail": regime["notes"],

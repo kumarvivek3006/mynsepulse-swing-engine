@@ -299,6 +299,79 @@ def gate3_trend_structure(symbol: str, df: pd.DataFrame) -> GateResult:
 
 
 # ---------------------------------------------------------------------
+# Gate 3b — Stage 1 to Stage 2 transition (opt-in, additive)
+#
+# Gate 3 requires a stock to ALREADY be in Stage 2: price above a rising
+# 200 DMA with 50 > 150 > 200. That is correct for continuation setups and
+# it systematically excludes the stock emerging from a long Stage 1 base —
+# the one that produces the longest rides, precisely because nobody is
+# watching it yet.
+#
+# This is a SECOND path, not a relaxation of the first. A candidate must
+# still clear Gate 0, and it must satisfy conditions Gate 3 never asks for:
+# a 50/200 crossover already in place, a 200 DMA that has stopped falling
+# AND is improving, and price holding above both. What it does not demand
+# is that the 200 DMA already be rising over 25 sessions.
+#
+# Anything reaching here failed Gate 3, so nothing that passes today can be
+# lost by enabling it.
+# ---------------------------------------------------------------------
+TRANSITION_MAX_200_DECLINE_PCT = float(
+    os.environ.get("TRANSITION_MAX_200_DECLINE_PCT", "0.5"))
+# Gate 3 requires 30% above the 52-week low. That figure is calibrated for a
+# stock already advancing in Stage 2. A stock completing a Stage 1 base is
+# necessarily still close to its low — the base IS near the low — so applying
+# 30% here would reject almost every genuine transition and make this path
+# decorative. 20% still excludes stocks sitting on their lows.
+TRANSITION_MIN_ABOVE_52W_LOW_PCT = float(
+    os.environ.get("TRANSITION_MIN_ABOVE_52W_LOW_PCT", "20"))
+
+
+def gate3_stage1_transition(symbol: str, df: pd.DataFrame) -> GateResult:
+    last = df.iloc[-1]
+    needed = ["sma50", "sma150", "sma200", "high52", "low52", "sma200_slope25"]
+    if any(pd.isna(last[c]) for c in needed):
+        return GateResult(symbol, False, "gate3b", "indicators_incomplete")
+
+    close = float(last["close"])
+    sma200 = float(last["sma200"])
+
+    # The 200 DMA must have stopped falling meaningfully, and must be
+    # improving — a flat average that is still deteriorating is not a
+    # transition, it is a pause in a downtrend.
+    slope_now = float(last["sma200_slope25"])
+    prior_slope = None
+    if len(df) > 50 and pd.notna(df["sma200"].iloc[-26]) and pd.notna(df["sma200"].iloc[-51]):
+        prior_slope = float(df["sma200"].iloc[-26] - df["sma200"].iloc[-51])
+
+    checks = {
+        "close_above_200": close > sma200,
+        "close_above_50": close > float(last["sma50"]),
+        "50_above_200": float(last["sma50"]) > sma200,       # crossover in place
+        "200_not_falling": slope_now > -(close * TRANSITION_MAX_200_DECLINE_PCT / 100),
+        "200_improving": prior_slope is None or slope_now > prior_slope,
+        "within_25pct_of_52w_high": close >= float(last["high52"]) * 0.75,
+        "above_52w_low": close >= float(last["low52"]) * (
+            1 + TRANSITION_MIN_ABOVE_52W_LOW_PCT / 100),
+    }
+
+    failed = [k for k, v in checks.items() if not v]
+    if failed:
+        return GateResult(symbol, False, "gate3b", failed[0],
+                          {"failed_checks": failed})
+
+    if not weekly_structure_ok(df):
+        return GateResult(symbol, False, "gate3b", "weekly_structure")
+
+    return GateResult(symbol, True, detail={
+        "sma200_slope25": round(slope_now, 2),
+        "prior_slope": round(prior_slope, 2) if prior_slope is not None else None,
+        "pct_above_200dma": round((close / sma200 - 1) * 100, 2),
+        "pct_from_52w_high": round((close / float(last["high52"]) - 1) * 100, 2),
+    })
+
+
+# ---------------------------------------------------------------------
 # Relative strength — used for scoring later, computed here
 # ---------------------------------------------------------------------
 def relative_strength(df: pd.DataFrame, bench: pd.DataFrame,

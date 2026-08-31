@@ -291,7 +291,7 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str) -> dict:
 
     # Armed and breakout both enter on a stop order above the pivot; only a
     # pullback entry keys off the confirmation bar's high.
-    anchor = float(last["high"]) if setup_type == "pullback" else base.pivot
+    anchor = float(last["high"]) if setup_type.startswith("pullback") else base.pivot
     entry = anchor * (1 + ENTRY_BUFFER)
 
     # --- stop: the tightest structural level that is still real ---------
@@ -427,9 +427,9 @@ def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
 
     vol_mult = (float(last["volume"]) / vol50) if vol50 else 0.0
     close_pos = ((float(last["close"]) - float(last["low"])) / rng) if rng > 0 else 0.5
-    if setup_type == "breakout":
+    if setup_type.startswith("breakout"):
         trigger = min(vol_mult / 3.0, 1.0) * 0.6 + close_pos * 0.4
-    elif setup_type == "pullback":
+    elif setup_type.startswith("pullback"):
         trigger = 0.55 + close_pos * 0.25
     else:
         # Armed: there is no trigger bar yet, so this block grades readiness
@@ -475,10 +475,39 @@ def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
 
 
 # ---------------------------------------------------------------------
+TRANSITION_MIN_BASE_SESSIONS = int(
+    os.environ.get("TRANSITION_MIN_BASE_SESSIONS", "60"))
+TRANSITION_VOL_MULT = float(os.environ.get("TRANSITION_VOL_MULT", "2.0"))
+
+
 def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
-                rs126: float | None, snap=None) -> Setup:
+                rs126: float | None, snap=None, transition: bool = False) -> Setup:
+    """
+    transition=True applies the Stage 1->2 profile: a longer base and a
+    heavier volume break. The trend filter is looser on that path, so the
+    price-action evidence has to be stronger to compensate. Loosening one
+    test without tightening another is how a second path becomes a back
+    door.
+    """
     base = detect_base(df)
+
+    if transition:
+        if base.duration < TRANSITION_MIN_BASE_SESSIONS:
+            raise Rejected("gate4", "transition_base_too_short",
+                           {"duration": base.duration,
+                            "required": TRANSITION_MIN_BASE_SESSIONS})
+        last = df.iloc[-1]
+        vol50 = float(last["vol50"]) if pd.notna(last["vol50"]) else 0.0
+        if last["close"] > base.pivot and (
+                vol50 <= 0 or last["volume"] < vol50 * TRANSITION_VOL_MULT):
+            raise Rejected("gate5", "transition_volume_insufficient",
+                           {"required_mult": TRANSITION_VOL_MULT,
+                            "actual": round(float(last["volume"]) / vol50, 2)
+                            if vol50 else None})
+
     setup_type = detect_trigger(df, base)
+    if transition:
+        setup_type = f"{setup_type}_transition"
     levels = derive_levels(df, base, setup_type)
     total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126, snap)
 

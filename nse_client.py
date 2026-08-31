@@ -97,6 +97,16 @@ class CorporateAction:
         return self.ratio_from / (self.ratio_from + self.ratio_to)
 
 
+@dataclass
+class DeliveryRow:
+    symbol: str
+    trade_date: date
+    traded_qty: int | None
+    delivery_qty: int | None
+    delivery_pct: float | None
+    no_of_trades: int | None
+
+
 class NSEClient:
 
     def __init__(self, timeout: int = 30):
@@ -234,6 +244,63 @@ class NSEClient:
             out.append(CorporateAction(symbol, ex, kind, a, b, purpose))
 
         log.info("Corporate actions %s→%s: %d rows", from_date, to_date, len(out))
+        return out
+
+    # -- delivery ------------------------------------------------------
+    def delivery(self, day: date) -> list[DeliveryRow]:
+        """
+        Security-wise delivery for one session, from the full bhavcopy.
+
+        Uses the archive CSV rather than the JSON API — no cookies, no
+        session priming, and it is the same file NSE publishes for
+        settlement. Column names in this file carry LEADING SPACES, which
+        is an NSE quirk that silently breaks naive dict access, so keys are
+        stripped on read.
+
+        Returns [] for a non-trading day rather than raising: a weekend or
+        holiday is an expected absence, not a failure.
+        """
+        url = f"{ARCHIVES}/products/content/sec_bhavdata_full_{day.strftime('%d%m%Y')}.csv"
+        try:
+            rows = self._get_csv(url)
+        except NSEUnavailable:
+            log.debug("No delivery file for %s (holiday or not yet published)", day)
+            return []
+
+        out: list[DeliveryRow] = []
+        for raw in rows:
+            row = {k.strip(): (v.strip() if isinstance(v, str) else v)
+                   for k, v in raw.items() if k}
+            if row.get("SERIES") not in ("EQ", "BE"):
+                continue
+            symbol = (row.get("SYMBOL") or "").upper()
+            if not symbol:
+                continue
+
+            def _int(key):
+                val = row.get(key, "")
+                try:
+                    return int(float(val.replace(",", "")))
+                except (ValueError, AttributeError):
+                    return None
+
+            def _float(key):
+                val = row.get(key, "")
+                try:
+                    return float(val.replace(",", ""))
+                except (ValueError, AttributeError):
+                    return None
+
+            out.append(DeliveryRow(
+                symbol=symbol,
+                trade_date=day,
+                traded_qty=_int("TTL_TRD_QNTY"),
+                delivery_qty=_int("DELIV_QTY"),
+                delivery_pct=_float("DELIV_PER"),
+                no_of_trades=_int("NO_OF_TRADES"),
+            ))
+
+        log.info("Delivery %s: %d rows", day, len(out))
         return out
 
     # -- surveillance -------------------------------------------------
