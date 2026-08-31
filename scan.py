@@ -381,10 +381,16 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # one that appeared this hour, and that distinction is lost if
             # every re-scan resets the timestamp.
             cur.execute("select symbol, min(generated_at) from signals "
-                        "where as_of_date = %s and status = 'pending' group by symbol",
-                        (as_of,))
+                        "where status = 'pending' group by symbol")
             first_seen = dict(cur.fetchall())
 
+            # Clear every pending row for the symbols being written, not just
+            # today's. Expiry is ten days out, so a stock that qualifies on
+            # consecutive days was accumulating one card per day.
+            symbols_now = [s_["symbol"] for s_ in signals]
+            if symbols_now:
+                cur.execute("delete from signals where status = 'pending' "
+                            "and symbol = any(%s)", (symbols_now,))
             cur.execute("delete from signals where as_of_date = %s and status = 'pending'",
                         (as_of,))
 
@@ -413,6 +419,29 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                       as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2),
                       first_seen.get(s_["symbol"])))
 
+            # A pending signal is removed only when it is INVALIDATED: price
+            # closed at or below the stop before ever triggering. The base is
+            # gone and the level no longer means anything.
+            #
+            # Not being regenerated is deliberately NOT a reason to drop it.
+            # An armed setup can fail the score floor or the coiling test on a
+            # single intraday bar while the base and pivot remain perfectly
+            # intact — dropping it there would churn cards off the dashboard
+            # for no real change in the setup.
+            cur.execute("""
+                with latest as (
+                    select distinct on (symbol) symbol, adj_close
+                    from ohlcv_daily order by symbol, trade_date desc
+                )
+                update signals s
+                   set status = 'invalidated'
+                  from latest l
+                 where l.symbol = s.symbol
+                   and s.status = 'pending'
+                   and l.adj_close <= s.stop_loss
+            """)
+            invalidated = cur.rowcount
+
             # Age out anything past its window.
             cur.execute("update signals set status = 'expired' "
                         "where status = 'pending' and expires_on < %s", (as_of,))
@@ -430,6 +459,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": fundamentals_ready,
             "gate2_coverage": len(snapshots),
+            "invalidated": invalidated,
             "min_score_pct": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
                               "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],
             "regime_detail": regime["notes"],
