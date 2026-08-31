@@ -1248,82 +1248,48 @@ def close_signal(request: Request, body: dict = Body(...)):
 @app.post("/jobs/scan")
 def scan_job(request: Request):
     """
-    Runs the gate scan and returns the candidate list synchronously.
+    Start a scan on a background thread and return immediately.
 
-    Unlike the backfill this is seconds, not minutes — one query and some
-    pandas — so there is no reason to hide it behind a background thread
-    and a polling loop.
+    It used to run synchronously, which was fine while it was seconds of
+    pandas. Then the freshness check began fetching missing bars inside the
+    request, and a 500-symbol backfill takes minutes — past the proxy
+    timeout, surfacing as a 524 with no way to tell whether the scan had
+    actually run.
+
+    The summary is written to engine_settings and read back through
+    /jobs/status, so nothing is lost by not returning it here.
     """
     require_internal_key(request)
-    from scan import run_scan
     mode = request.query_params.get("mode", "postclose")
 
-    # No refresh flag here any more. run_scan checks freshness itself with a
-    # single query and refreshes only when bars are actually behind, so the
-    # scan is fast on the common path and never silently analyses yesterday.
-    try:
-        return run_scan(mode=mode)
-    except Exception as exc:
-        log.error("Scan failed: %s", exc)
-        raise HTTPException(500, f"Scan failed: {exc}")
-
-
-@app.post("/jobs/fundamentals")
-def fundamentals_job(request: Request):
-    """
-    Ingest promoter holding and quarterly P&L. Weekly cadence — this data
-    changes once a quarter, and it is ~1000 calls through NSE's fragile
-    path, so there is nothing to gain from running it daily.
-    """
-    require_internal_key(request)
     with _job_lock:
         if _job_state["running"]:
             raise HTTPException(409, f"Job already running: {_job_state['name']}")
-        _job_state.update(name="fundamentals", running=True,
+        _job_state.update(name=f"scan:{mode}", running=True,
                           started_at=datetime.now(IST).isoformat(),
                           finished_at=None, error=None)
 
     def run():
-        # _run_log lives in ingest, not here. Each step is logged separately
-        # and a failure in one is recorded before it propagates — otherwise
-        # a shareholding failure would hide the fact that results succeeded.
-        from fundamentals import sync_quarterly_results, sync_shareholding
-        from ingest import _run_log, connect as _connect
-
+        from ingest import connect as _connect
+        from scan import run_scan
+        summary = run_scan(mode=mode)
         conn = _connect()
         try:
-            for name, fn in (("sync_shareholding", sync_shareholding),
-                             ("sync_quarterly_results", sync_quarterly_results)):
-                try:
-                    result = fn(conn)
-                    _run_log(conn, name, "success", result.get("written", 0))
-                    log.info("%s: %s", name, result)
-                except Exception as exc:
-                    conn.rollback()
-                    _run_log(conn, name, "failed", 0, str(exc)[:500])
-                    raise
+            with conn.cursor() as cur:
+                cur.execute("""
+                    insert into engine_settings (key, value, updated_at)
+                    values ('last_scan_summary', %s::jsonb, now())
+                    on conflict (key) do update set
+                        value = excluded.value, updated_at = now()
+                """, (json.dumps(summary),))
+            conn.commit()
         finally:
             conn.close()
+        return summary
 
-    threading.Thread(target=_run_job, args=("fundamentals", run), daemon=True).start()
-    return {"ok": True, "started": True}
-
-
-@app.get("/jobs/fundamentals/probe")
-def fundamentals_probe(request: Request, symbol: str = Query("RELIANCE")):
-    """
-    Fetch one symbol and report the real response shape.
-
-    Field names on these NSE endpoints are undocumented. Running 500
-    symbols against guessed keys would write hundreds of null rows that
-    look like real data — so confirm the shape on one symbol first.
-    """
-    require_internal_key(request)
-    from fundamentals import probe
-    try:
-        return probe(symbol)
-    except Exception as exc:
-        raise HTTPException(500, f"Probe failed: {exc}")
+    threading.Thread(target=_run_job, args=(f"scan:{mode}", run),
+                     daemon=True).start()
+    return {"ok": True, "started": True, "mode": mode}
 
 
 @app.get("/jobs/status")
@@ -1332,7 +1298,7 @@ def jobs_status(request: Request):
     with _job_lock:
         current = dict(_job_state)
 
-    runs, counts = [], {}
+    runs, counts, last_scan_summary = [], {}, None
     try:
         from ingest import connect
         conn = connect()
@@ -1346,6 +1312,11 @@ def jobs_status(request: Request):
                      "error": (r[5][:300] if r[5] else None)}
                     for r in cur.fetchall()
                 ]
+                cur.execute("select value from engine_settings "
+                            "where key = 'last_scan_summary'")
+                row = cur.fetchone()
+                last_scan_summary = row[0] if row else None
+
                 cur.execute("select (select count(*) from symbols), "
                             "(select count(*) from ohlcv_daily), "
                             "(select count(*) from corporate_actions), "
@@ -1369,7 +1340,8 @@ def jobs_status(request: Request):
     except Exception as exc:
         counts = {"error": str(exc)[:200]}
 
-    return {"current": current, "recent_runs": runs, "row_counts": counts}
+    return {"current": current, "recent_runs": runs, "row_counts": counts,
+            "last_scan_summary": last_scan_summary}
 
 
 @app.post("/auth/upstox/disconnect")
