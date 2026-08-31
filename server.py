@@ -404,6 +404,18 @@ def signals(request: Request):
         r["id"] = str(r["id"])
         r["band"] = band(float(r["score_total"]))
 
+        # Promote the two provenance flags out of notes so the UI does not
+        # have to reach into a jsonb blob. Purely additive — nothing else
+        # reads them and no existing field changes.
+        _notes = r.get("notes") or {}
+        if isinstance(_notes, str):
+            try:
+                _notes = json.loads(_notes)
+            except (ValueError, TypeError):
+                _notes = {}
+        r["is_add_on"] = bool(_notes.get("is_add_on"))
+        r["is_new_opportunity"] = bool(_notes.get("is_new_opportunity"))
+
         # Live progress against the levels. Everything here is derived from
         # prices that exist, not from a projection.
         lc = float(r["last_close"]) if r.get("last_close") is not None else None

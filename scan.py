@@ -18,6 +18,8 @@ import logging
 import os
 from datetime import date, timedelta
 
+import gc
+
 import pandas as pd
 
 from gates import (
@@ -48,46 +50,76 @@ MIN_SCORE_RISK_OFF = float(os.environ.get("MIN_SCORE_RISK_OFF", "80"))
 # returns nothing for every symbol — and writing that result would erase
 # the morning's armed watchlist.
 INTRADAY_MIN_COVERAGE = float(os.environ.get("INTRADAY_MIN_COVERAGE", "0.5"))
+# How far an entry must move before a regenerated setup counts as a NEW
+# opportunity rather than the same one refreshed. Below this it is the same
+# base being re-measured; above it the engine has found a different pivot.
+MATERIAL_CHANGE_PCT = float(os.environ.get("MATERIAL_CHANGE_PCT", "2.0"))
 
 
 class ScanAborted(RuntimeError):
     """Refused to write. The inputs were not trustworthy."""
 
 
-def _load_frames(conn) -> dict[str, pd.DataFrame]:
-    """One query for the whole universe; split in pandas rather than 500 round trips."""
-    # Built from the cursor rather than pd.read_sql: pandas only supports
-    # SQLAlchemy connectables and warns loudly on a raw psycopg connection.
+def _load_symbol(conn, symbol: str, limit: int = 800) -> pd.DataFrame | None:
+    """
+    One symbol's bars.
+
+    Fetched per symbol rather than pulling the whole table. Measuring the
+    old approach showed the cost was not the per-symbol frames — pandas
+    groupby returns cheap views — but materialising 350k rows as Python
+    tuples via fetchall() and copying them into a DataFrame, which cost
+    ~166 MB before any indicator was computed. That is what exhausted the
+    container. 800 bars is well beyond the 250 any gate needs.
+    """
     with conn.cursor() as cur:
         cur.execute("""
-            select symbol, trade_date, adj_open, adj_high, adj_low, adj_close, volume
-            from ohlcv_daily
-            order by symbol, trade_date
-        """)
+            select trade_date, adj_open, adj_high, adj_low, adj_close, volume
+            from ohlcv_daily where symbol = %s
+            order by trade_date desc limit %s
+        """, (symbol, limit))
         rows = cur.fetchall()
-    df = pd.DataFrame(rows, columns=["symbol", "trade_date", "open", "high",
-                                     "low", "close", "volume"])
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows[::-1], columns=["trade_date", "open", "high",
+                                           "low", "close", "volume"])
     for c in ("open", "high", "low", "close"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-    return {sym: g.reset_index(drop=True) for sym, g in df.groupby("symbol")}
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype("int64")
+    return df
 
 
-def _breadth(frames: dict[str, pd.DataFrame], universe: list[str]) -> float:
-    above = total = 0
-    for sym in universe:
-        df = frames.get(sym)
-        if df is None or len(df) < 60:
-            continue
-        sma50 = df["close"].rolling(50).mean().iloc[-1]
-        if pd.isna(sma50):
-            continue
-        total += 1
-        above += int(df["close"].iloc[-1] > sma50)
+def _breadth(conn, universe: list[str]) -> float:
+    """
+    Percentage of the universe above its own 50 DMA, computed in Postgres.
+
+    Doing this in SQL returns one row per symbol instead of shipping every
+    bar to Python for a single boolean per stock.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            with recent as (
+                select symbol, adj_close,
+                       row_number() over (partition by symbol
+                                          order by trade_date desc) as rn
+                from ohlcv_daily
+                where symbol = any(%s)
+            ),
+            agg as (
+                select symbol,
+                       max(adj_close) filter (where rn = 1) as last_close,
+                       avg(adj_close) filter (where rn <= 50) as sma50,
+                       count(*) filter (where rn <= 50) as bars
+                from recent where rn <= 50 group by symbol
+            )
+            select count(*) filter (where last_close > sma50), count(*)
+            from agg where bars = 50
+        """, (universe,))
+        above, total = cur.fetchone()
     return (above / total * 100) if total else 0.0
 
 
-def _forming_bar(client, frames: dict, symbols: list[str]) -> dict[str, pd.DataFrame]:
+def _forming_bar(client, conn, symbols: list[str]) -> dict[str, pd.DataFrame]:
     """
     Append today's in-progress session as a provisional daily bar.
 
@@ -101,7 +133,7 @@ def _forming_bar(client, frames: dict, symbols: list[str]) -> dict[str, pd.DataF
     out = {}
     today = date.today()
     for sym in symbols:
-        df = frames.get(sym)
+        df = _load_symbol(conn, sym)
         if df is None or len(df) == 0:
             continue
         key = _instrument_keys.get(sym)
@@ -123,7 +155,7 @@ def _forming_bar(client, frames: dict, symbols: list[str]) -> dict[str, pd.DataF
 
         if pd.Timestamp(df["trade_date"].iloc[-1]).date() == today:
             df = df.iloc[:-1]
-        bar = pd.DataFrame([{"symbol": sym, "trade_date": pd.Timestamp(today),
+        bar = pd.DataFrame([{"trade_date": pd.Timestamp(today),
                              "open": o, "high": h, "low": l, "close": c_, "volume": v}])
         out[sym] = pd.concat([df, bar], ignore_index=True)
     return out
@@ -167,7 +199,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             """)
             open_positions = {r[0] for r in cur.fetchall()}
         if open_positions:
-            log.info("Skipping %d symbols with open positions", len(open_positions))
+            log.info("%d symbols have open positions; new setups on them will be "
+                     "flagged as add-ons", len(open_positions))
 
         with conn.cursor() as cur:
             cur.execute("select symbol, upstox_instrument_key from symbols "
@@ -175,8 +208,6 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             _instrument_keys.clear()
             _instrument_keys.update(dict(cur.fetchall()))
         log.info("Universe: %d symbols, %d under surveillance", len(universe), len(flagged))
-
-        frames = _load_frames(conn)
 
         # Gate 2 inputs. Absence is recorded per symbol, never assumed to
         # be a pass — a stock we hold no fundamentals for is flagged as
@@ -187,12 +218,12 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                  len(snapshots), "enforced" if fundamentals_ready else "advisory only")
 
         # --- Gate 1: regime, once for the whole run -------------------
-        nifty = frames.get("NIFTY50")
-        vix = frames.get("INDIAVIX")
+        nifty = _load_symbol(conn, "NIFTY50")
+        vix = _load_symbol(conn, "INDIAVIX")
         if nifty is None or len(nifty) < 60:
             raise RuntimeError("NIFTY50 series missing or too short — cannot assess regime")
 
-        breadth = _breadth(frames, universe)
+        breadth = _breadth(conn, universe)
         regime = evaluate_regime(nifty, vix if vix is not None else pd.DataFrame(), breadth)
         log.info("Regime: %s (breadth %.1f%%, vix %s, distribution %d)",
                  regime["state"], breadth, regime["vix"], regime["distribution_days"])
@@ -227,16 +258,19 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             from upstox_client import UpstoxClient
             structural = []
             for sym in universe:
-                d = frames.get(sym)
+                d = _load_symbol(conn, sym)
                 if d is None or len(d) < MIN_BARS:
                     continue
                 d = add_indicators(d)
-                if gate0_tradability(sym, d, sym in flagged).passed and \
-                        gate3_trend_structure(sym, d).passed:
+                passed = (gate0_tradability(sym, d, sym in flagged).passed
+                          and gate3_trend_structure(sym, d).passed)
+                del d                       # one symbol's indicators at a time
+                if passed:
                     structural.append(sym)
+            gc.collect()
             log.info("Intraday slot: fetching forming bars for %d candidates",
                      len(structural))
-            intraday_frames = _forming_bar(UpstoxClient(), frames, structural)
+            intraday_frames = _forming_bar(UpstoxClient(), conn, structural)
 
             coverage = (len(intraday_frames) / len(structural)) if structural else 0.0
             if coverage < INTRADAY_MIN_COVERAGE:
@@ -246,8 +280,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                     "token, or a broker outage. Existing signals left untouched."
                 )
 
-        for sym in universe:
-            df = frames.get(sym)
+        for processed, sym in enumerate(universe, 1):
+            if processed % 100 == 0:
+                gc.collect()
+            df = _load_symbol(conn, sym)
             if df is None or len(df) < MIN_BARS:
                 counts["no_data"] = counts.get("no_data", 0) + 1
                 log_rows.append((as_of, sym, "gate0", "insufficient_history",
@@ -260,11 +296,6 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             if not r0.passed:
                 counts[r0.reason] = counts.get(r0.reason, 0) + 1
                 log_rows.append((as_of, sym, "gate0", r0.reason, json.dumps(r0.detail)))
-                continue
-
-            if sym in open_positions:
-                log_rows.append((as_of, sym, None, "position_already_open", "{}"))
-                counts["position_already_open"] = counts.get("position_already_open", 0) + 1
                 continue
 
             r2 = gate2_fundamentals(sym, snapshots.get(sym))
@@ -338,6 +369,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
 
             signals.append({
                 "symbol": sym,
+                "is_add_on": sym in open_positions,
                 "setup_type": setup.setup_type,
                 "pattern": setup.pattern,
                 "entry_trigger": setup.entry,
@@ -365,6 +397,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             log_rows.append((as_of, sym, None, "signal_generated",
                              json.dumps({"score": setup.score_total,
                                          "rr": setup.r_multiple_t1})))
+            del df
+
+        intraday_frames.clear()
+        gc.collect()
 
         signals.sort(key=lambda s: -s["score_total"])
 
@@ -380,19 +416,49 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # since 10:00 and still armed at 14:00 is a different thing from
             # one that appeared this hour, and that distinction is lost if
             # every re-scan resets the timestamp.
-            cur.execute("select symbol, min(generated_at) from signals "
-                        "where status = 'pending' group by symbol")
-            first_seen = dict(cur.fetchall())
+            # Every pending signal, so a regenerated setup can be matched
+            # against what is already on screen.
+            cur.execute("""
+                select id, symbol, setup_type, entry_trigger, generated_at
+                from signals where status = 'pending'
+            """)
+            existing: dict[str, list] = {}
+            for sig_id, sym_, stype, entry_, gen_at in cur.fetchall():
+                existing.setdefault(sym_, []).append(
+                    {"id": sig_id, "setup_type": stype,
+                     "entry": float(entry_), "generated_at": gen_at})
 
-            # Clear every pending row for the symbols being written, not just
-            # today's. Expiry is ten days out, so a stock that qualifies on
-            # consecutive days was accumulating one card per day.
-            symbols_now = [s_["symbol"] for s_ in signals]
-            if symbols_now:
-                cur.execute("delete from signals where status = 'pending' "
-                            "and symbol = any(%s)", (symbols_now,))
-            cur.execute("delete from signals where as_of_date = %s and status = 'pending'",
-                        (as_of,))
+            # Decide, per setup, whether this is the SAME opportunity being
+            # re-measured or a genuinely different one.
+            #
+            # Same  -> replace in place, keeping the original generated_at so
+            #          persistence is still visible. This is what stops one
+            #          card per day for a stock that keeps qualifying.
+            # New   -> insert alongside. A different pivot, or armed becoming
+            #          a confirmed breakout, is a fresh entry opportunity with
+            #          its own levels, not a duplicate.
+            first_seen: dict = {}
+            superseded: list = []
+            new_opportunities = 0
+
+            for s_ in signals:
+                matches = [
+                    e for e in existing.get(s_["symbol"], [])
+                    if e["setup_type"] == s_["setup_type"]
+                    and e["entry"] > 0
+                    and abs(s_["entry_trigger"] / e["entry"] - 1) * 100 <= MATERIAL_CHANGE_PCT
+                ]
+                if matches:
+                    superseded.extend(m["id"] for m in matches)
+                    first_seen[s_["symbol"]] = min(m["generated_at"] for m in matches)
+                    s_["is_new_opportunity"] = False
+                else:
+                    s_["is_new_opportunity"] = bool(existing.get(s_["symbol"]))
+                    if s_["is_new_opportunity"]:
+                        new_opportunities += 1
+
+            if superseded:
+                cur.execute("delete from signals where id = any(%s)", (superseded,))
 
             for s_ in signals:
                 cur.execute("""
@@ -412,6 +478,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                       regime["state"],
                       json.dumps({"stop_basis": s_["stop_basis"],
                                   "t1_basis": s_["t1_basis"],
+                                  "is_add_on": s_["is_add_on"],
+                                  "is_new_opportunity": s_.get("is_new_opportunity", False),
                                   "rs63": s_["rs63"], "rs126": s_["rs126"],
                                   "close": s_["close"], "atr14": s_["atr14"],
                                   "extension": s_["extension"],
@@ -460,6 +528,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "gate2_enforced": fundamentals_ready,
             "gate2_coverage": len(snapshots),
             "invalidated": invalidated,
+            "new_opportunities": new_opportunities,
+            "add_ons": sum(1 for s_ in signals if s_["is_add_on"]),
             "min_score_pct": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
                               "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],
             "regime_detail": regime["notes"],
