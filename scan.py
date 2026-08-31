@@ -621,6 +621,29 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             superseded: list = []
             new_opportunities = 0
 
+            # Remove pending signals that duplicate a position already open.
+            # The matching logic above stops NEW duplicates being written, but
+            # rows created before that fix are still in the table and no scan
+            # would ever clear them — they are not regenerated, so nothing
+            # touches them. This cleans them up regardless.
+            cur.execute("""
+                delete from signals p
+                 using signals t
+                  join signal_outcomes o on o.signal_id = t.id
+                 where p.status = 'pending'
+                   and t.status = 'triggered'
+                   and o.entry_price is not null
+                   and o.exit_price is null
+                   and p.symbol = t.symbol
+                   and p.setup_type = t.setup_type
+                   and t.entry_trigger > 0
+                   and abs(p.entry_trigger / t.entry_trigger - 1) * 100 <= %s
+            """, (MATERIAL_CHANGE_PCT,))
+            stale_duplicates = cur.rowcount
+            if stale_duplicates:
+                log.info("Cleared %d pending signals duplicating open positions",
+                         stale_duplicates)
+
             to_write, already_taken = [], 0
 
             for s_ in signals:
@@ -730,6 +753,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "invalidated": invalidated,
             "new_opportunities": new_opportunities,
             "suppressed_already_taken": already_taken,
+            "stale_duplicates_cleared": stale_duplicates,
             "add_ons": sum(1 for s_ in signals if s_["is_add_on"]),
             "transition": transition_state,
             "transition_signals": sum(1 for s_ in signals if s_["is_transition"]),
