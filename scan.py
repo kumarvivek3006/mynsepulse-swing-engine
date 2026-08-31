@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import gc
 
@@ -31,6 +31,7 @@ from gates import (
     relative_strength,
 )
 from ingest import connect
+from upstox_client import IST
 from fundamentals import load_snapshots
 from setups import Rejected, build_setup
 
@@ -58,6 +59,82 @@ MATERIAL_CHANGE_PCT = float(os.environ.get("MATERIAL_CHANGE_PCT", "2.0"))
 
 class ScanAborted(RuntimeError):
     """Refused to write. The inputs were not trustworthy."""
+
+
+# Remembers a refresh that fetched nothing, so an exchange holiday does not
+# trigger a fruitless 500-symbol crawl on every scan for the rest of the day.
+_last_refresh_attempt: dict = {"for_session": None, "at": None, "gained": 0}
+
+
+def expected_last_session(now: datetime | None = None) -> date:
+    """
+    The most recent session whose CLOSING bar should exist.
+
+    Today only after the close settles; before that, the previous weekday.
+    Exchange holidays are not enumerated — on a holiday this returns a date
+    with no data, the refresh finds nothing, and _last_refresh_attempt stops
+    it retrying.
+    """
+    now = now or datetime.now(IST)
+    day = now.date()
+    if now.weekday() < 5 and (now.hour * 60 + now.minute) >= 16 * 60:
+        return day
+    while True:
+        day -= timedelta(days=1)
+        if day.weekday() < 5:
+            return day
+
+
+def ensure_bars_current(conn) -> dict:
+    """
+    Refresh prices only when they are actually behind.
+
+    One query decides. If the newest stored bar already covers the expected
+    session, nothing else runs — so this costs nothing on the common path.
+    When bars ARE stale, backfill_prices is itself incremental and only
+    fetches the symbols that are behind.
+
+    This is what stops a manual scan silently analysing yesterday.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            select max(o.trade_date) from ohlcv_daily o
+            join symbols s on s.symbol = o.symbol
+            where coalesce(s.series, '') <> 'INDEX'
+        """)
+        latest = cur.fetchone()[0]
+
+    expected = expected_last_session()
+    if latest is not None and latest >= expected:
+        return {"refreshed": False, "latest_bar": str(latest),
+                "expected": str(expected), "reason": "already_current"}
+
+    # Already tried for this session and got nothing — holiday, or the
+    # broker has not published yet. Do not crawl again.
+    if (_last_refresh_attempt["for_session"] == expected
+            and _last_refresh_attempt["gained"] == 0
+            and _last_refresh_attempt["at"]
+            and (datetime.now(IST) - _last_refresh_attempt["at"]).seconds < 3600):
+        return {"refreshed": False, "latest_bar": str(latest) if latest else None,
+                "expected": str(expected), "reason": "no_data_for_session"}
+
+    from ingest import backfill_prices, sync_indices
+    from upstox_client import InstrumentMaster, UpstoxClient
+
+    log.info("Bars stale (latest %s, expected %s) — refreshing", latest, expected)
+    client, master = UpstoxClient(), InstrumentMaster()
+    gained = 0
+    try:
+        sync_indices(conn, client, master)
+        gained = backfill_prices(conn, client)
+    except Exception as exc:
+        log.warning("Price refresh failed: %s", exc)
+        return {"refreshed": False, "latest_bar": str(latest) if latest else None,
+                "expected": str(expected), "reason": f"failed: {str(exc)[:150]}"}
+
+    _last_refresh_attempt.update(for_session=expected, at=datetime.now(IST),
+                                 gained=gained)
+    return {"refreshed": True, "bars_added": gained, "expected": str(expected)}
 
 
 def _load_symbol(conn, symbol: str, limit: int = 800) -> pd.DataFrame | None:
@@ -170,6 +247,11 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
     conn = connect()
 
     try:
+        # Intraday runs fetch their own forming bars, so they neither need
+        # nor want the end-of-day refresh.
+        freshness = ({"refreshed": False, "reason": "intraday_mode"}
+                     if mode == "intraday" else ensure_bars_current(conn))
+
         with conn.cursor() as cur:
             cur.execute("""
                 select s.symbol,
@@ -416,17 +498,20 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # since 10:00 and still armed at 14:00 is a different thing from
             # one that appeared this hour, and that distinction is lost if
             # every re-scan resets the timestamp.
-            # Every pending signal, so a regenerated setup can be matched
-            # against what is already on screen.
+            # Pending AND triggered. Loading only pending was the bug behind
+            # duplicate cards: once a signal is marked taken it becomes
+            # 'triggered', dropped out of the comparison, and the next scan
+            # re-issued the identical setup as a fresh pending signal beside
+            # the open trade.
             cur.execute("""
-                select id, symbol, setup_type, entry_trigger, generated_at
-                from signals where status = 'pending'
+                select id, symbol, setup_type, entry_trigger, generated_at, status
+                from signals where status in ('pending', 'triggered')
             """)
             existing: dict[str, list] = {}
-            for sig_id, sym_, stype, entry_, gen_at in cur.fetchall():
+            for sig_id, sym_, stype, entry_, gen_at, status_ in cur.fetchall():
                 existing.setdefault(sym_, []).append(
-                    {"id": sig_id, "setup_type": stype,
-                     "entry": float(entry_), "generated_at": gen_at})
+                    {"id": sig_id, "setup_type": stype, "entry": float(entry_),
+                     "generated_at": gen_at, "status": status_})
 
             # Decide, per setup, whether this is the SAME opportunity being
             # re-measured or a genuinely different one.
@@ -441,6 +526,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             superseded: list = []
             new_opportunities = 0
 
+            to_write, already_taken = [], 0
+
             for s_ in signals:
                 matches = [
                     e for e in existing.get(s_["symbol"], [])
@@ -448,15 +535,31 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                     and e["entry"] > 0
                     and abs(s_["entry_trigger"] / e["entry"] - 1) * 100 <= MATERIAL_CHANGE_PCT
                 ]
+
+                # Matches an OPEN trade: this is the position you are already
+                # in, not a re-entry. Issuing it would put an identical card
+                # beside the trade on the dashboard.
+                if any(m["status"] == "triggered" for m in matches):
+                    already_taken += 1
+                    log_rows.append((as_of, s_["symbol"], None,
+                                     "same_setup_already_taken", "{}"))
+                    continue
+
                 if matches:
+                    # Same setup still pending: refresh it in place.
                     superseded.extend(m["id"] for m in matches)
                     first_seen[s_["symbol"]] = min(m["generated_at"] for m in matches)
                     s_["is_new_opportunity"] = False
                 else:
+                    # Nothing comparable. A different pivot, or a different
+                    # trigger type, is a genuine second entry.
                     s_["is_new_opportunity"] = bool(existing.get(s_["symbol"]))
                     if s_["is_new_opportunity"]:
                         new_opportunities += 1
 
+                to_write.append(s_)
+
+            signals = to_write
             if superseded:
                 cur.execute("delete from signals where id = any(%s)", (superseded,))
 
@@ -527,8 +630,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": fundamentals_ready,
             "gate2_coverage": len(snapshots),
+            "freshness": freshness,
             "invalidated": invalidated,
             "new_opportunities": new_opportunities,
+            "suppressed_already_taken": already_taken,
             "add_ons": sum(1 for s_ in signals if s_["is_add_on"]),
             "min_score_pct": {"risk_on": MIN_SCORE, "neutral": MIN_SCORE_NEUTRAL,
                               "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]],

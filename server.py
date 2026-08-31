@@ -1007,6 +1007,10 @@ def scan_job(request: Request):
     require_internal_key(request)
     from scan import run_scan
     mode = request.query_params.get("mode", "postclose")
+
+    # No refresh flag here any more. run_scan checks freshness itself with a
+    # single query and refreshes only when bars are actually behind, so the
+    # scan is fast on the common path and never silently analyses yesterday.
     try:
         return run_scan(mode=mode)
     except Exception as exc:
@@ -1099,13 +1103,17 @@ def jobs_status(request: Request):
                             "(select count(*) from shareholding), "
                             "(select count(*) from fundamentals_quarterly), "
                             "(select count(distinct symbol) from shareholding), "
-                            "(select max(period_end) from fundamentals_quarterly)")
-                s, o, c, v, sh, fq, shs, latest = cur.fetchone()
+                            "(select max(period_end) from fundamentals_quarterly), "
+                            "(select max(trade_date) from ohlcv_daily), "
+                            "(select max(as_of_date) from signals)")
+                s, o, c, v, sh, fq, shs, latest, last_bar, last_scan = cur.fetchone()
                 counts = {"symbols": s, "ohlcv_daily": o,
                           "corporate_actions": c, "surveillance": v,
                           "shareholding": sh, "fundamentals_quarterly": fq,
                           "fundamentals_symbols": shs,
-                          "fundamentals_latest_period": str(latest) if latest else None}
+                          "fundamentals_latest_period": str(latest) if latest else None,
+                          "latest_bar_date": str(last_bar) if last_bar else None,
+                          "last_scan_date": str(last_scan) if last_scan else None}
         finally:
             conn.close()
     except Exception as exc:
