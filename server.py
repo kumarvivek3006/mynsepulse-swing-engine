@@ -195,7 +195,8 @@ def cold_start_job(request: Request):
 # ---------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------
-SETTINGS_DEFAULTS = {"capital": 0.0, "risk_pct": 2.5}
+SETTINGS_DEFAULTS = {"capital": 0.0, "risk_pct": 2.5,
+                     "scale_out_pct": 50.0, "ma_exit_period": 20.0}
 
 
 def _read_settings(cur) -> dict:
@@ -218,6 +219,8 @@ def _read_settings(cur) -> dict:
     return {
         "capital": float(rows.get("capital") or 0),
         "risk_pct": float(rows.get("risk_pct") or 2.5),
+        "scale_out_pct": float(rows.get("scale_out_pct") or 50),
+        "ma_exit_period": float(rows.get("ma_exit_period") or 20),
         "available": True,
     }
 
@@ -280,6 +283,16 @@ def put_settings(request: Request, body: dict = Body(...)):
         if not 0 < risk <= 100:
             raise HTTPException(400, "risk_pct must be between 0 and 100")
         updates["risk_pct"] = risk
+    if "scale_out_pct" in body:
+        pct = float(body["scale_out_pct"] or 0)
+        if not 0 <= pct <= 100:
+            raise HTTPException(400, "scale_out_pct must be between 0 and 100")
+        updates["scale_out_pct"] = pct
+    if "ma_exit_period" in body:
+        period = float(body["ma_exit_period"] or 0)
+        if period not in (10, 20, 50):
+            raise HTTPException(400, "ma_exit_period must be 10, 20 or 50")
+        updates["ma_exit_period"] = period
     if not updates:
         raise HTTPException(400, "nothing to update")
 
@@ -707,87 +720,196 @@ def daily_log(request: Request, day: str | None = Query(None)):
 
 
 def _trail_levels(bars: list, entry_price: float, original_stop: float,
-                  t1: float, t2: float | None) -> dict:
+                  t1: float, t2: float | None, pivot: float | None = None,
+                  atr_floor_mult: float = 0.75) -> dict:
     """
-    Where the stop should sit now, and what target remains.
+    Trail to prices that actually printed. Nothing derived by formula.
 
-    Follows the spec's sequence exactly, and reports which rule is binding
-    rather than just a number — "below the swing low at 1,540" is checkable
-    against the chart; a bare figure is not.
+    The earlier version offered breakeven and a Chandelier ATR stop. Both
+    are manufactured: your entry price is an accounting fact the market has
+    no memory of, and "highest high minus 2.5 ATR" is a number that has
+    never traded. Neither is a level anyone is defending, so neither
+    belongs as a stop.
 
-      1. Below +1R  -> original stop. Nothing is trailed before the trade
-                       has proved anything.
-      2. At/above 1R -> at least breakeven.
-      3. Beyond 1R   -> the most recent CONFIRMED swing low, if it is higher.
-      4. Accelerated -> Chandelier: highest high since entry minus 2.5 ATR,
-                       used only when the move has gone vertical, because a
-                       swing-low trail lags badly in that case.
+    Candidates are structural only, taken from bars since entry:
 
-    Only ever raises the stop. A trail that could lower it is not a trail.
+      * confirmed swing lows        - a low with two higher lows either side
+      * the breakout pivot          - old resistance becomes support once
+                                      price has moved clear of it
+      * low of a high-volume up bar - where buyers demonstrably stepped in
+      * low of an unfilled gap up   - the gap edge is real support until filled
+
+    ATR is used ONLY as a noise filter, never as the level itself: a
+    candidate closer than 0.75 ATR to the current price would be inside
+    daily noise. Same rule the entry stop uses.
+
+    Of the survivors, the HIGHEST is taken - the tightest real level - and
+    it can never sit below the original stop.
 
     bars: [(trade_date, close, high, low, volume)] oldest -> newest
     """
-    if len(bars) < 5:
+    if len(bars) < 6:
         return {"suggested_stop": original_stop, "basis": "original_stop",
-                "raised": False, "r_now": None, "next_target": t1}
+                "raised": False, "gain_vs_original": 0.0, "r_now": None,
+                "r_locked": -1.0, "next_target": t1,
+                "target_stage": "running_to_t1", "atr14": None,
+                "candidates": [], "risk_free_available": False}
 
     closes = [float(b[1]) for b in bars]
     highs = [float(b[2]) for b in bars]
     lows = [float(b[3]) for b in bars]
+    vols = [float(b[4] or 0) for b in bars]
     last = closes[-1]
+
     risk = entry_price - original_stop
-    if risk <= 0:
-        return {"suggested_stop": original_stop, "basis": "original_stop",
-                "raised": False, "r_now": None, "next_target": t1}
+    r_now = ((last - entry_price) / risk) if risk > 0 else None
 
-    r_now = (last - entry_price) / risk
-
-    # ATR(14), Wilder
     atr = None
     if len(bars) >= 15:
-        trs = []
-        for i in range(1, len(bars)):
-            trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
-                           abs(lows[i] - closes[i - 1])))
+        trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                   abs(lows[i] - closes[i - 1])) for i in range(1, len(bars))]
         atr = trs[0]
         for tr in trs[1:]:
             atr = (atr * 13 + tr) / 14
 
-    candidates = [(original_stop, "original_stop")]
+    candidates: list[tuple[float, str, str]] = []
 
-    if r_now >= 1.0:
-        candidates.append((entry_price, "breakeven"))
-
-        for i in range(len(lows) - 3, 1, -1):
-            window = lows[i - 2:i + 3]
-            if len(window) == 5 and lows[i] == min(window):
-                candidates.append((lows[i] * 0.999, "swing_low_trail"))
+    # Confirmed swing lows, most recent first.
+    for i in range(len(lows) - 3, 1, -1):
+        window = lows[i - 2:i + 3]
+        if len(window) == 5 and lows[i] == min(window):
+            candidates.append((lows[i], "swing_low",
+                               f"swing low of {bars[i][0]}"))
+            if len([c for c in candidates if c[1] == "swing_low"]) >= 3:
                 break
 
-    # Accelerated: three closes each gaining more than 1.5 ATR.
-    if atr and len(closes) >= 4:
-        gains = [closes[-i] - closes[-i - 1] for i in (1, 2, 3)]
-        if all(g > 1.5 * atr for g in gains):
-            candidates.append((max(highs[-20:]) - 2.5 * atr, "chandelier_2.5atr"))
+    # The breakout pivot: former resistance, now support.
+    if pivot and last > pivot:
+        candidates.append((pivot, "breakout_pivot",
+                           "the pivot the stock broke out through"))
 
-    suggested, basis = max(candidates, key=lambda c: c[0])
-    # Never below the original stop, and never above the last close.
-    if suggested >= last:
+    # Low of the heaviest up bar since entry - where buyers showed up.
+    up_bars = [(i, vols[i]) for i in range(1, len(bars)) if closes[i] > closes[i - 1]]
+    if up_bars:
+        i = max(up_bars, key=lambda x: x[1])[0]
+        candidates.append((lows[i], "high_volume_bar_low",
+                           f"low of the heaviest up day ({bars[i][0]})"))
+
+    # Unfilled gap up: the gap edge holds until it is filled.
+    for i in range(len(bars) - 1, 0, -1):
+        if lows[i] > highs[i - 1] and min(lows[i:]) > highs[i - 1]:
+            candidates.append((highs[i - 1], "unfilled_gap",
+                               f"top of the unfilled gap from {bars[i][0]}"))
+            break
+
+    # Noise filter, and never below the stop already in force.
+    floor = atr * atr_floor_mult if atr else 0.0
+    viable = [(p, kind, why) for p, kind, why in candidates
+              if p >= original_stop and (last - p) >= floor]
+
+    if viable:
+        price, kind, why = max(viable, key=lambda c: c[0])
+        suggested, basis, rationale = price * 0.999, kind, why
+    else:
         suggested, basis = original_stop, "original_stop"
+        rationale = "no structural level yet clears the noise floor"
 
     next_target = t1 if last < t1 else (t2 if t2 and last < t2 else None)
 
     return {
         "suggested_stop": round(suggested, 2),
         "basis": basis,
+        "rationale": rationale,
         "raised": round(suggested, 2) > round(original_stop, 2),
         "gain_vs_original": round(suggested - original_stop, 2),
-        "r_now": round(r_now, 2),
-        "r_locked": round((suggested - entry_price) / risk, 2),
+        "r_now": round(r_now, 2) if r_now is not None else None,
+        "r_locked": round((suggested - entry_price) / risk, 2) if risk > 0 else 0.0,
         "next_target": next_target,
         "target_stage": ("beyond_t2" if next_target is None else
                          "running_to_t2" if next_target == t2 else "running_to_t1"),
         "atr14": round(atr, 2) if atr else None,
+        # Informational: past 1R the risk COULD be removed. Deliberately not
+        # offered as a stop level, because breakeven is not a real level.
+        "risk_free_available": bool(r_now is not None and r_now >= 1.0),
+        "candidates": [{"price": round(p, 2), "kind": k, "why": w}
+                       for p, k, w in sorted(viable, key=lambda c: -c[0])[:4]],
+    }
+
+
+def _exit_plan(bars: list, trade: dict, settings: dict, trail: dict) -> dict:
+    """
+    The scale-out and moving-average exit that discretionary swing traders
+    actually run, kept honest about which part is a level and which is a
+    signal.
+
+      * Scale out a configurable share at T1. Near-universal practice, and
+        the piece the engine was missing entirely — it treated every trade
+        as all-in until stopped or targeted.
+
+      * Trail the remainder on structural levels (see _trail_levels).
+
+      * Watch for a CLOSE below the moving average. Practitioners do not
+        rest a stop order at a moving average; they exit the next session
+        after a close below it. So this is reported as a signal to act on,
+        never as a stop price — which is why it does not appear in the
+        trail candidates.
+    """
+    period = int(settings.get("ma_exit_period") or 20)
+    scale_pct = float(settings.get("scale_out_pct") or 50)
+
+    closes = [float(b[1]) for b in bars] if bars else []
+    ema = None
+    if len(closes) >= period:
+        k = 2 / (period + 1)
+        ema = closes[0]
+        for px in closes[1:]:
+            ema = px * k + ema * (1 - k)
+
+    last = closes[-1] if closes else None
+    qty = trade.get("sizing", {}).get("qty")
+    t1, entry = trade.get("t1"), trade.get("entry_price")
+    already_scaled = trade.get("scaled_qty") is not None
+
+    scale_qty = int(qty * scale_pct / 100) if qty and scale_pct else None
+    t1_reached = bool(last is not None and t1 and last >= t1)
+
+    stage = ("scaled" if already_scaled else
+             "at_target" if t1_reached else
+             "running")
+
+    ma_break = bool(ema is not None and last is not None and last < ema)
+
+    actions = []
+    if t1_reached and not already_scaled and scale_qty:
+        actions.append({
+            "kind": "scale_out", "severity": "good",
+            "text": f"T1 reached. Practitioner default is to sell {scale_pct:.0f}% "
+                    f"({scale_qty} shares) and trail the rest.",
+        })
+    if ma_break:
+        actions.append({
+            "kind": "ma_exit_signal", "severity": "warn",
+            "text": f"Closed below the {period} EMA ({round(ema, 2)}). "
+                    "The common rule is to exit the remainder next session — "
+                    "this is a signal to act on, not a resting stop.",
+        })
+    if already_scaled:
+        actions.append({
+            "kind": "runner", "severity": "info",
+            "text": f"Runner only. Trailing on {trail.get('basis', 'structure')}.",
+        })
+
+    return {
+        "stage": stage,
+        "scale_out_pct": scale_pct,
+        "scale_out_qty": scale_qty,
+        "t1_reached": t1_reached,
+        "ma_period": period,
+        "ma_value": round(ema, 2) if ema is not None else None,
+        "ma_break": ma_break,
+        "scaled_qty": trade.get("scaled_qty"),
+        "scaled_price": trade.get("scaled_price"),
+        "actions": actions,
     }
 
 
@@ -900,7 +1022,8 @@ def my_trades(request: Request):
                        s.status, s.as_of_date, s.base_low, s.pivot_bar_date,
                        s.entry_trigger as pivot, l.adj_close as last_close,
                        o.entry_date, o.entry_price, o.exit_date, o.exit_price,
-                       o.exit_reason, o.r_realised
+                       o.exit_reason, o.r_realised,
+                       o.scaled_qty, o.scaled_price, o.scaled_date
                 from signals s
                 join symbols y on y.symbol = s.symbol
                 join signal_outcomes o on o.signal_id = s.id
@@ -942,7 +1065,7 @@ def my_trades(request: Request):
         t["id"] = str(t["id"])
         for k in ("entry_trigger", "stop_loss", "t1", "t2", "score_total",
                   "last_close", "entry_price", "exit_price", "r_realised",
-                  "base_low", "pivot"):
+                  "base_low", "pivot", "scaled_price"):
             if t.get(k) is not None:
                 t[k] = float(t[k])
         for k in ("as_of_date", "entry_date", "exit_date"):
@@ -964,7 +1087,11 @@ def my_trades(request: Request):
 
             t["trail"] = _trail_levels(
                 bars_by_symbol.get(t["symbol"], []), t["entry_price"],
-                t["stop_loss"], t["t1"], t.get("t2"))
+                t["stop_loss"], t["t1"], t.get("t2"),
+                pivot=t.get("entry_trigger"))
+
+            t["exit_plan"] = _exit_plan(bars_by_symbol.get(t["symbol"], []),
+                                        t, settings, t["trail"])
 
             t["thesis"] = _thesis_health(
                 bars_by_symbol.get(t["symbol"], []), nifty_closes,
@@ -1043,6 +1170,33 @@ def take_signal(request: Request, body: dict = Body(...)):
             """, (signal_id, entry_price))
         conn.commit()
         return {"ok": True, "signal_id": signal_id, "entry_price": entry_price}
+    finally:
+        conn.close()
+
+
+@app.post("/signals/scale-out")
+def scale_out_signal(request: Request, body: dict = Body(...)):
+    """Record a partial exit. The position stays open on the remainder."""
+    require_internal_key(request)
+    signal_id = body.get("signal_id")
+    qty = body.get("qty")
+    price = body.get("price")
+    if not signal_id or qty is None or price is None:
+        raise HTTPException(400, "signal_id, qty and price required")
+
+    from ingest import connect
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                update signal_outcomes
+                   set scaled_qty = %s, scaled_price = %s, scaled_date = current_date
+                 where signal_id = %s and entry_price is not null
+            """, (int(qty), float(price), signal_id))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "no open trade for that signal")
+        conn.commit()
+        return {"ok": True, "scaled_qty": int(qty), "scaled_price": float(price)}
     finally:
         conn.close()
 
