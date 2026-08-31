@@ -367,13 +367,14 @@ def signals(request: Request):
     # only — a handful of queries, not five hundred.
     ema20_by_symbol: dict[str, float] = {}
     trail_by_symbol: dict[str, float] = {}
+    day_change: dict[str, float] = {}
     if rows:
         conn2 = connect()
         try:
             with conn2.cursor() as cur:
                 for sym in {r["symbol"] for r in rows}:
                     cur.execute("""
-                        select adj_close, adj_low from ohlcv_daily
+                        select adj_close, adj_low, adj_high from ohlcv_daily
                         where symbol = %s order by trade_date desc limit 60
                     """, (sym,))
                     bars = cur.fetchall()
@@ -381,6 +382,12 @@ def signals(request: Request):
                         continue
                     closes = [float(b[0]) for b in reversed(bars)]
                     lows = [float(b[1]) for b in reversed(bars)]
+
+                    # The session's own move, from the two most recent closes.
+                    # Without this a card outside market hours had no change
+                    # figure at all and the UI rendered a meaningless 0.00%.
+                    if len(closes) >= 2 and closes[-2] > 0:
+                        day_change[sym] = round((closes[-1] / closes[-2] - 1) * 100, 2)
 
                     k = 2 / 21
                     ema = closes[0]
@@ -699,6 +706,91 @@ def daily_log(request: Request, day: str | None = Query(None)):
     }
 
 
+def _trail_levels(bars: list, entry_price: float, original_stop: float,
+                  t1: float, t2: float | None) -> dict:
+    """
+    Where the stop should sit now, and what target remains.
+
+    Follows the spec's sequence exactly, and reports which rule is binding
+    rather than just a number — "below the swing low at 1,540" is checkable
+    against the chart; a bare figure is not.
+
+      1. Below +1R  -> original stop. Nothing is trailed before the trade
+                       has proved anything.
+      2. At/above 1R -> at least breakeven.
+      3. Beyond 1R   -> the most recent CONFIRMED swing low, if it is higher.
+      4. Accelerated -> Chandelier: highest high since entry minus 2.5 ATR,
+                       used only when the move has gone vertical, because a
+                       swing-low trail lags badly in that case.
+
+    Only ever raises the stop. A trail that could lower it is not a trail.
+
+    bars: [(trade_date, close, high, low, volume)] oldest -> newest
+    """
+    if len(bars) < 5:
+        return {"suggested_stop": original_stop, "basis": "original_stop",
+                "raised": False, "r_now": None, "next_target": t1}
+
+    closes = [float(b[1]) for b in bars]
+    highs = [float(b[2]) for b in bars]
+    lows = [float(b[3]) for b in bars]
+    last = closes[-1]
+    risk = entry_price - original_stop
+    if risk <= 0:
+        return {"suggested_stop": original_stop, "basis": "original_stop",
+                "raised": False, "r_now": None, "next_target": t1}
+
+    r_now = (last - entry_price) / risk
+
+    # ATR(14), Wilder
+    atr = None
+    if len(bars) >= 15:
+        trs = []
+        for i in range(1, len(bars)):
+            trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                           abs(lows[i] - closes[i - 1])))
+        atr = trs[0]
+        for tr in trs[1:]:
+            atr = (atr * 13 + tr) / 14
+
+    candidates = [(original_stop, "original_stop")]
+
+    if r_now >= 1.0:
+        candidates.append((entry_price, "breakeven"))
+
+        for i in range(len(lows) - 3, 1, -1):
+            window = lows[i - 2:i + 3]
+            if len(window) == 5 and lows[i] == min(window):
+                candidates.append((lows[i] * 0.999, "swing_low_trail"))
+                break
+
+    # Accelerated: three closes each gaining more than 1.5 ATR.
+    if atr and len(closes) >= 4:
+        gains = [closes[-i] - closes[-i - 1] for i in (1, 2, 3)]
+        if all(g > 1.5 * atr for g in gains):
+            candidates.append((max(highs[-20:]) - 2.5 * atr, "chandelier_2.5atr"))
+
+    suggested, basis = max(candidates, key=lambda c: c[0])
+    # Never below the original stop, and never above the last close.
+    if suggested >= last:
+        suggested, basis = original_stop, "original_stop"
+
+    next_target = t1 if last < t1 else (t2 if t2 and last < t2 else None)
+
+    return {
+        "suggested_stop": round(suggested, 2),
+        "basis": basis,
+        "raised": round(suggested, 2) > round(original_stop, 2),
+        "gain_vs_original": round(suggested - original_stop, 2),
+        "r_now": round(r_now, 2),
+        "r_locked": round((suggested - entry_price) / risk, 2),
+        "next_target": next_target,
+        "target_stage": ("beyond_t2" if next_target is None else
+                         "running_to_t2" if next_target == t2 else "running_to_t1"),
+        "atr14": round(atr, 2) if atr else None,
+    }
+
+
 def _thesis_health(bars: list, nifty: list, entry_price: float, stop: float,
                    pivot: float | None, entry_date, atr_hint: float | None) -> dict:
     """
@@ -869,6 +961,10 @@ def my_trades(request: Request):
             # trigger. Display only — it changes nothing about the position.
             t["sizing"] = size_position(settings["capital"], settings["risk_pct"],
                                         t["entry_price"], t["stop_loss"])
+
+            t["trail"] = _trail_levels(
+                bars_by_symbol.get(t["symbol"], []), t["entry_price"],
+                t["stop_loss"], t["t1"], t.get("t2"))
 
             t["thesis"] = _thesis_health(
                 bars_by_symbol.get(t["symbol"], []), nifty_closes,
