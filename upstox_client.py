@@ -50,9 +50,14 @@ INSTRUMENT_MASTER_URL = os.environ.get(
     "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
 )
 
-# Upstox publishes these and has revised them before. Treat as configuration.
-REQ_PER_SEC = int(os.environ.get("UPSTOX_REQ_PER_SEC", "20"))
-REQ_PER_MIN = int(os.environ.get("UPSTOX_REQ_PER_MIN", "250"))
+# Upstox published limits for regular algos (no registration required):
+#   10 per second, 500 per minute, 2000 per 30 minutes.
+# The 30-minute bucket is the binding one for a 500-symbol backfill and was
+# previously not enforced at all. The per-second default was 20 — twice the
+# permitted rate.
+REQ_PER_SEC = int(os.environ.get("UPSTOX_REQ_PER_SEC", "10"))
+REQ_PER_MIN = int(os.environ.get("UPSTOX_REQ_PER_MIN", "500"))
+REQ_PER_30MIN = int(os.environ.get("UPSTOX_REQ_PER_30MIN", "2000"))
 REQ_PER_DAY = int(os.environ.get("UPSTOX_REQ_PER_DAY", "20000"))
 
 
@@ -66,8 +71,10 @@ class TokenExpired(RuntimeError):
 class RateLimiter:
     """Sliding-window limiter across second, minute and day buckets."""
 
-    def __init__(self, per_sec=REQ_PER_SEC, per_min=REQ_PER_MIN, per_day=REQ_PER_DAY):
-        self.per_sec, self.per_min, self.per_day = per_sec, per_min, per_day
+    def __init__(self, per_sec=REQ_PER_SEC, per_min=REQ_PER_MIN,
+                 per_30min=REQ_PER_30MIN, per_day=REQ_PER_DAY):
+        self.per_sec, self.per_min = per_sec, per_min
+        self.per_30min, self.per_day = per_30min, per_day
         self._calls: deque[float] = deque()
         self._day_count = 0
         self._day_stamp = datetime.now(IST).date()
@@ -84,17 +91,28 @@ class RateLimiter:
                 if self._day_count >= self.per_day:
                     raise RuntimeError("Upstox daily request quota exhausted")
 
-                while self._calls and now - self._calls[0] > 60:
+                # Keep a 30-minute window; the shorter buckets are counted
+                # within it rather than kept separately.
+                while self._calls and now - self._calls[0] > 1800:
                     self._calls.popleft()
 
                 in_last_sec = sum(1 for t in self._calls if now - t < 1.0)
-                if in_last_sec < self.per_sec and len(self._calls) < self.per_min:
+                in_last_min = sum(1 for t in self._calls if now - t < 60.0)
+                in_last_30 = len(self._calls)
+
+                if (in_last_sec < self.per_sec and in_last_min < self.per_min
+                        and in_last_30 < self.per_30min):
                     self._calls.append(now)
                     self._day_count += 1
                     return
 
-                wait = (1.05 - (now - self._calls[-1])) if in_last_sec >= self.per_sec \
-                    else (60.5 - (now - self._calls[0]))
+                if in_last_sec >= self.per_sec:
+                    wait = 1.05 - (now - self._calls[-1])
+                elif in_last_min >= self.per_min:
+                    oldest_in_min = next(t for t in self._calls if now - t < 60.0)
+                    wait = 60.5 - (now - oldest_in_min)
+                else:
+                    wait = 1800.5 - (now - self._calls[0])
             time.sleep(max(wait, 0.05))
 
     @property

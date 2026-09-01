@@ -45,7 +45,11 @@ PREMARKET_TIME = os.environ.get("PREMARKET_TIME_IST", "08:15")
 # forty-five minutes old carries enough volume for the confirmation test
 # to mean something, whereas one five minutes old does not.
 INTRADAY_HOURS = os.environ.get("INTRADAY_SCAN_HOURS", "10,11,12,13,14,15")
-POSTCLOSE_TIME = os.environ.get("POSTCLOSE_SCAN_IST", "15:45")
+# Upstox does not publish the completed daily candle at 15:30. It appears a
+# few hours later. Running the definitive scan at 15:45 fetched nothing, so
+# the newest bar stayed a day behind and the scan silently analysed the
+# PREVIOUS session — which is exactly what was observed.
+POSTCLOSE_TIME = os.environ.get("POSTCLOSE_SCAN_IST", "18:30")
 
 _scheduler: BackgroundScheduler | None = None
 _last_runs: dict[str, dict] = {}

@@ -129,7 +129,10 @@ def expected_last_session(now: datetime | None = None) -> date:
     """
     now = now or datetime.now(IST)
     day = now.date()
-    if now.weekday() < 5 and (now.hour * 60 + now.minute) >= 16 * 60:
+    # 18:00, not 16:00. Expecting today's bar before the broker has published
+    # it made the freshness gate conclude the data was current and skip the
+    # refresh — hiding the very staleness it exists to catch.
+    if now.weekday() < 5 and (now.hour * 60 + now.minute) >= 18 * 60:
         return day
     while True:
         day -= timedelta(days=1)
@@ -212,6 +215,12 @@ def _load_symbol(conn, symbol: str, limit: int = 800) -> pd.DataFrame | None:
 
     df = pd.DataFrame(rows[::-1], columns=["trade_date", "open", "high",
                                            "low", "close", "volume"])
+    # Postgres returns datetime.date; the intraday path appends today's
+    # provisional bar as a pandas Timestamp. Mixing the two makes the column
+    # unsortable — "Cannot compare Timestamp with datetime.date" — which
+    # failed every intraday scan. Normalise here, once, at the only place
+    # bars enter the system.
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
     for c in ("open", "high", "low", "close"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype("int64")
@@ -283,7 +292,7 @@ def _forming_bar(client, conn, symbols: list[str]) -> dict[str, pd.DataFrame]:
         o = float(candles[-1][1])
 
         if pd.Timestamp(df["trade_date"].iloc[-1]).date() == today:
-            df = df.iloc[:-1]
+            df = df.iloc[:-1]      # replace a partial bar from an earlier slot
         bar = pd.DataFrame([{"trade_date": pd.Timestamp(today),
                              "open": o, "high": h, "low": l, "close": c_, "volume": v}])
         out[sym] = pd.concat([df, bar], ignore_index=True)
@@ -507,7 +516,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             try:
                 setup = build_setup(sym, df, rs63, rs126,
                                     snapshots.get(sym) if fundamentals_ready else None,
-                                    transition=transition)
+                                    transition=transition,
+                                    last_bar_incomplete=(mode == "intraday"))
             except Rejected as rej:
                 counts[rej.reason] = counts.get(rej.reason, 0) + 1
                 log_rows.append((as_of, sym, rej.gate, rej.reason,
@@ -547,6 +557,11 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "symbol": sym,
                 "is_add_on": sym in open_positions,
                 "is_transition": transition,
+                # True only when the unfinished bar actually contributed to a
+                # level. An armed setup found intraday is NOT provisional: its
+                # pivot, stop and target all come from closed bars, which is
+                # precisely what makes it useful hours before the close.
+                "is_provisional": setup.provisional,
                 "setup_type": setup.setup_type,
                 "pattern": setup.pattern,
                 "entry_trigger": setup.entry,
@@ -644,12 +659,41 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 log.info("Cleared %d pending signals duplicating open positions",
                          stale_duplicates)
 
-            to_write, already_taken = [], 0
+            to_write, already_taken, frozen = [], 0, 0
+
+            # Levels come from COMPLETED daily bars, and exactly one new bar
+            # exists per trading day. So a card's entry, stop and target may
+            # change once a day at most, at the 15:45 post-close run.
+            #
+            # The 08:15 premarket slot sees the same bars the previous
+            # evening's post-close already used — no bar forms overnight — so
+            # recomputing there produces the same answer at best, and a
+            # spurious change at worst. Intraday runs see a forming bar and
+            # must never rewrite a level an order is already resting against.
+            #
+            # The exception is recovery: if this run actually fetched missing
+            # bars, the post-close that should have computed them did not run,
+            # and this slot has to do it instead.
+            may_revise = (mode == "postclose") or bool(freshness.get("refreshed"))
+
+            # Armed and breakout are the SAME opportunity at two moments.
+            # Both anchor entry to pivot x 1.0025 and take the same stop and
+            # targets from the same base — the trigger type changes no level.
+            # So an armed setup breaking out is a status change on the card
+            # you are already watching, not a second trade. Requiring
+            # setup_type equality here created a duplicate card with
+            # identical numbers every time a setup triggered.
+            def _pivot_anchored(kind: str) -> bool:
+                return kind.startswith("armed") or kind.startswith("breakout")
+
+            trigger_transitions = []
 
             for s_ in signals:
                 matches = [
                     e for e in existing.get(s_["symbol"], [])
-                    if e["setup_type"] == s_["setup_type"]
+                    if (e["setup_type"] == s_["setup_type"]
+                        or (_pivot_anchored(e["setup_type"])
+                            and _pivot_anchored(s_["setup_type"])))
                     and e["entry"] > 0
                     and abs(s_["entry_trigger"] / e["entry"] - 1) * 100 <= MATERIAL_CHANGE_PCT
                 ]
@@ -664,7 +708,20 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                     continue
 
                 if matches:
-                    # Same setup still pending: refresh it in place.
+                    if not may_revise:
+                        # Levels stay frozen, but if the trigger has changed
+                        # -- armed becoming a live breakout -- record that on
+                        # the existing card. It is new information about price,
+                        # not a revision of any level.
+                        changed = [m for m in matches
+                                   if m["setup_type"] != s_["setup_type"]
+                                   and m["status"] == "pending"]
+                        if changed:
+                            trigger_transitions.append(
+                                (s_["setup_type"], [m["id"] for m in changed]))
+                        frozen += 1
+                        continue
+
                     superseded.extend(m["id"] for m in matches)
                     first_seen[s_["symbol"]] = min(m["generated_at"] for m in matches)
                     s_["is_new_opportunity"] = False
@@ -678,6 +735,11 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 to_write.append(s_)
 
             signals = to_write
+
+            for new_type, ids in trigger_transitions:
+                cur.execute("update signals set setup_type = %s where id = any(%s)",
+                            (new_type, ids))
+
             if superseded:
                 cur.execute("delete from signals where id = any(%s)", (superseded,))
 
@@ -701,6 +763,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                                   "t1_basis": s_["t1_basis"],
                                   "is_add_on": s_["is_add_on"],
                                   "is_transition": s_["is_transition"],
+                                  "is_provisional": s_["is_provisional"],
                                   "is_new_opportunity": s_.get("is_new_opportunity", False),
                                   "rs63": s_["rs63"], "rs126": s_["rs126"],
                                   "close": s_["close"], "atr14": s_["atr14"],
@@ -754,6 +817,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "new_opportunities": new_opportunities,
             "suppressed_already_taken": already_taken,
             "stale_duplicates_cleared": stale_duplicates,
+            "levels_frozen": frozen,
+            "levels_revisable": may_revise,
+            "provisional_signals": sum(1 for s_ in signals if s_["is_provisional"]),
+            "trigger_transitions": len(trigger_transitions),
             "add_ons": sum(1 for s_ in signals if s_["is_add_on"]),
             "transition": transition_state,
             "transition_signals": sum(1 for s_ in signals if s_["is_transition"]),

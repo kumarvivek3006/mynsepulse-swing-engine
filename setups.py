@@ -70,6 +70,7 @@ class Setup:
     score_breakdown: dict = field(default_factory=dict)
     # Diagnostic only — no gate reads this. See extension_metrics().
     extension: dict = field(default_factory=dict)
+    provisional: bool = False
     notes: list = field(default_factory=list)
 
 
@@ -285,7 +286,18 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
 # ---------------------------------------------------------------------
 # Level derivation — organic only
 # ---------------------------------------------------------------------
-def derive_levels(df: pd.DataFrame, base: Base, setup_type: str) -> dict:
+def derive_levels(df: pd.DataFrame, base: Base, setup_type: str,
+                  last_bar_incomplete: bool = False) -> dict:
+    """
+    last_bar_incomplete=True during an intraday run.
+
+    The base, pivot, base low and overhead supply already come from closed
+    bars — detect_base excludes the final bar. So the only levels that can
+    leak from an unfinished session are a stop taken from the trigger bar's
+    low, or from the 20 EMA, both of which still move. Excluding those two
+    makes an ARMED setup fully derived from completed data, which is what
+    lets it be published mid-session as a real level rather than a guess.
+    """
     last = df.iloc[-1]
     atr = float(last["atr14"])
 
@@ -298,10 +310,22 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str) -> dict:
     candidates: list[tuple[float, str]] = []
     for idx in swing_lows(df.iloc[base.start_idx:], span=3):
         candidates.append((float(df["low"].iloc[base.start_idx + idx]), "base_swing_low"))
-    candidates.append((float(last["low"]), "trigger_bar_low"))
     candidates.append((base.base_low, "base_low"))
-    if pd.notna(last["ema20"]) and float(last["ema20"]) < entry:
-        candidates.append((float(last["ema20"]), "ema20"))
+
+    if last_bar_incomplete:
+        # The forming bar's low and EMA both still move, so use the last
+        # CLOSED bar instead. Same kind of level, equally tight, but fixed.
+        # Falling back only to the base low would widen risk enough to fail
+        # the R:R floor and quietly suppress most intraday setups.
+        if len(df) >= 2:
+            candidates.append((float(df["low"].iloc[-2]), "prev_bar_low"))
+            prev_ema = df["ema20"].iloc[-2]
+            if pd.notna(prev_ema) and float(prev_ema) < entry:
+                candidates.append((float(prev_ema), "ema20_prev_close"))
+    else:
+        candidates.append((float(last["low"]), "trigger_bar_low"))
+        if pd.notna(last["ema20"]) and float(last["ema20"]) < entry:
+            candidates.append((float(last["ema20"]), "ema20"))
 
     # Tightest first; step outward until one clears the ATR noise floor.
     viable = sorted({(round(p, 2), b) for p, b in candidates if p < entry},
@@ -481,7 +505,8 @@ TRANSITION_VOL_MULT = float(os.environ.get("TRANSITION_VOL_MULT", "2.0"))
 
 
 def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
-                rs126: float | None, snap=None, transition: bool = False) -> Setup:
+                rs126: float | None, snap=None, transition: bool = False,
+                last_bar_incomplete: bool = False) -> Setup:
     """
     transition=True applies the Stage 1->2 profile: a longer base and a
     heavier volume break. The trend filter is looser on that path, so the
@@ -508,10 +533,18 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     setup_type = detect_trigger(df, base)
     if transition:
         setup_type = f"{setup_type}_transition"
-    levels = derive_levels(df, base, setup_type)
+    levels = derive_levels(df, base, setup_type, last_bar_incomplete)
     total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126, snap)
 
     extension = extension_metrics(df, levels["entry"])
+
+    # Levels are never provisional intraday: with last_bar_incomplete set,
+    # every one is drawn from a closed bar. What IS unconfirmed is whether
+    # the trigger holds to the close — a breakout can finish in the lower
+    # half of its range, or the volume pace can fade. So this flags an
+    # unconfirmed TRIGGER, not an unreliable level, which is what the
+    # earlier "provisional" naming wrongly implied.
+    provisional = last_bar_incomplete and not setup_type.startswith("armed")
 
     return Setup(
         symbol=symbol, setup_type=setup_type, pattern=base.pattern,
@@ -519,7 +552,7 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
         r_multiple_t1=levels["r_multiple_t1"], base=base,
         stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
         score_total=total, score_breakdown=breakdown,
-        extension=extension,
+        extension=extension, provisional=provisional,
         notes=[f"base {base.duration}d, depth {base.depth_pct:.1f}%",
                f"stop from {levels['stop_basis']}", f"T1 from {levels['t1_basis']}"],
     )

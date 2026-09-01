@@ -453,6 +453,7 @@ def signals(request: Request):
                 _notes = {}
         r["is_add_on"] = bool(_notes.get("is_add_on"))
         r["is_transition"] = bool(_notes.get("is_transition"))
+        r["is_provisional"] = bool(_notes.get("is_provisional"))
         r["is_new_opportunity"] = bool(_notes.get("is_new_opportunity"))
 
         # Live progress against the levels. Everything here is derived from
@@ -1309,6 +1310,91 @@ def scan_job(request: Request):
     threading.Thread(target=_run_job, args=(f"scan:{mode}", run),
                      daemon=True).start()
     return {"ok": True, "started": True, "mode": mode}
+
+
+@app.post("/jobs/fundamentals")
+def fundamentals_job(request: Request):
+    """
+    Ingest promoter holding and quarterly P&L. Weekly cadence — the data
+    changes once a quarter and it is ~1000 calls through NSE's fragile path.
+    """
+    require_internal_key(request)
+    with _job_lock:
+        if _job_state["running"]:
+            raise HTTPException(409, f"Job already running: {_job_state['name']}")
+        _job_state.update(name="fundamentals", running=True,
+                          started_at=datetime.now(IST).isoformat(),
+                          finished_at=None, error=None)
+
+    def run():
+        from fundamentals import sync_quarterly_results, sync_shareholding
+        from ingest import _run_log, connect as _connect
+
+        conn = _connect()
+        try:
+            for name, fn in (("sync_shareholding", sync_shareholding),
+                             ("sync_quarterly_results", sync_quarterly_results)):
+                try:
+                    result = fn(conn)
+                    _run_log(conn, name, "success", result.get("written", 0))
+                    log.info("%s: %s", name, result)
+                except Exception as exc:
+                    conn.rollback()
+                    _run_log(conn, name, "failed", 0, str(exc)[:500])
+                    raise
+        finally:
+            conn.close()
+
+    threading.Thread(target=_run_job, args=("fundamentals", run), daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+@app.get("/jobs/fundamentals/probe")
+def fundamentals_probe(request: Request, symbol: str = Query("RELIANCE")):
+    """
+    Fetch one symbol and report the real response shape.
+
+    Field names on these NSE endpoints are undocumented. Running 500 symbols
+    against guessed keys would write hundreds of null rows that look like
+    real data — so confirm the shape on one symbol first.
+    """
+    require_internal_key(request)
+    from fundamentals import probe
+    try:
+        return probe(symbol)
+    except Exception as exc:
+        raise HTTPException(500, f"Probe failed: {exc}")
+
+
+@app.post("/jobs/delivery")
+def delivery_job(request: Request):
+    """
+    Ingest delivery percentage. Additive — no gate, score or signal reads it.
+
+    Also runs automatically in the post-close slot; this is for backfilling.
+    """
+    require_internal_key(request)
+    days = int(request.query_params.get("days", "30"))
+
+    with _job_lock:
+        if _job_state["running"]:
+            raise HTTPException(409, f"Job already running: {_job_state['name']}")
+        _job_state.update(name="delivery", running=True,
+                          started_at=datetime.now(IST).isoformat(),
+                          finished_at=None, error=None)
+
+    def run():
+        from ingest import _run_log, connect as _connect, sync_delivery
+        from nse_client import NSEClient
+        conn = _connect()
+        try:
+            written = sync_delivery(conn, NSEClient(), days=days)
+            _run_log(conn, "sync_delivery", "success", written)
+        finally:
+            conn.close()
+
+    threading.Thread(target=_run_job, args=("delivery", run), daemon=True).start()
+    return {"ok": True, "started": True, "days": days}
 
 
 @app.get("/jobs/status")
