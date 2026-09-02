@@ -1454,6 +1454,127 @@ def delivery_job(request: Request):
     return {"ok": True, "started": True, "days": days}
 
 
+@app.post("/jobs/backtest")
+def backtest_job(request: Request):
+    """
+    Replay the pipeline over history and score the result.
+
+    Long-running by nature — a few years across 500 symbols — so it runs on
+    a background thread and writes to backtest_runs / backtest_trades.
+    Nothing in the live path reads those tables.
+    """
+    require_internal_key(request)
+    from datetime import date as _date
+
+    years = float(request.query_params.get("years", "2"))
+    step = int(request.query_params.get("step", "1"))
+    to_date = _date.today()
+    from_date = to_date - timedelta(days=int(365 * years))
+
+    with _job_lock:
+        if _job_state["running"]:
+            raise HTTPException(409, f"Job already running: {_job_state['name']}")
+        _job_state.update(name="backtest", running=True,
+                          started_at=datetime.now(IST).isoformat(),
+                          finished_at=None, error=None)
+
+    def run():
+        from backtest import run_backtest, summarise
+        from ingest import connect as _connect
+
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    insert into backtest_runs (from_date, to_date, status, params)
+                    values (%s, %s, 'running', %s) returning id
+                """, (from_date, to_date,
+                      json.dumps({"years": years, "step": step})))
+                run_id = cur.fetchone()[0]
+            conn.commit()
+        finally:
+            conn.close()
+
+        try:
+            result = run_backtest(from_date, to_date, step=step)
+            metrics = summarise(result["trades"])
+
+            conn = _connect()
+            try:
+                with conn.cursor() as cur:
+                    for t in result["trades"]:
+                        cur.execute("""
+                            insert into backtest_trades
+                                (run_id, symbol, signal_date, setup_type, pattern,
+                                 score_total, band, regime, entry_trigger, stop_loss,
+                                 t1, t2, r_planned, entry_date, entry_price,
+                                 exit_date, exit_price, exit_reason, r_realised,
+                                 max_favourable_r, max_adverse_r, bars_held)
+                            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s,%s,%s,%s)
+                        """, (run_id, t["symbol"], t["signal_date"], t["setup_type"],
+                              t["pattern"], t["score_total"], t["band"], t["regime"],
+                              t["entry_trigger"], t["stop_loss"], t["t1"], t.get("t2"),
+                              t["r_planned"], t.get("entry_date"), t.get("entry_price"),
+                              t.get("exit_date"), t.get("exit_price"),
+                              t.get("exit_reason"), t.get("r_realised"),
+                              t.get("max_favourable_r"), t.get("max_adverse_r"),
+                              t.get("bars_held")))
+                    cur.execute("""
+                        update backtest_runs set finished_at = now(), status = 'success',
+                               universe = %s, signals = %s, metrics = %s
+                         where id = %s
+                    """, (result["universe"], len(result["trades"]),
+                          json.dumps(metrics), run_id))
+                conn.commit()
+            finally:
+                conn.close()
+            log.info("Backtest %s complete: %d signals", run_id, len(result["trades"]))
+        except Exception as exc:
+            conn = _connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("update backtest_runs set finished_at = now(), "
+                                "status = 'failed', error = %s where id = %s",
+                                (str(exc)[:500], run_id))
+                conn.commit()
+            finally:
+                conn.close()
+            raise
+
+    threading.Thread(target=_run_job, args=("backtest", run), daemon=True).start()
+    return {"ok": True, "started": True, "from": str(from_date), "to": str(to_date)}
+
+
+@app.get("/jobs/backtest")
+def backtest_results(request: Request):
+    """Latest backtest run with its metrics."""
+    require_internal_key(request)
+    from ingest import connect
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                select id, started_at, finished_at, from_date, to_date,
+                       universe, signals, status, metrics, error
+                from backtest_runs order by id desc limit 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                return {"run": None}
+            cols = ["id","started_at","finished_at","from_date","to_date",
+                    "universe","signals","status","metrics","error"]
+            run = dict(zip(cols, row))
+            for k in ("started_at","finished_at","from_date","to_date"):
+                if run.get(k) is not None:
+                    run[k] = str(run[k])
+            run["id"] = int(run["id"])
+    finally:
+        conn.close()
+    return {"run": run}
+
+
 @app.get("/jobs/status")
 def jobs_status(request: Request):
     require_internal_key(request)
