@@ -120,7 +120,8 @@ def _postclose() -> dict:
     diagnostic and an opt-in path, so it must never stop the scan that
     produces the actual signals.
     """
-    from ingest import backfill_prices, connect, sync_delivery, sync_indices
+    from ingest import (backfill_prices, connect, sync_delivery, sync_indices,
+                        sync_today_from_intraday)
     from nse_client import NSEClient
     from upstox_client import InstrumentMaster, UpstoxClient
     from scan import run_scan
@@ -130,6 +131,12 @@ def _postclose() -> dict:
     try:
         sync_indices(conn, client, master)
         backfill_prices(conn, client)
+        # Today's completed bar comes from the intraday endpoint; the
+        # historical endpoint will not have it until tomorrow.
+        try:
+            sync_today_from_intraday(conn, client)
+        except Exception as exc:
+            log.warning("Today's bar from intraday failed: %s", exc)
         try:
             sync_delivery(conn, NSEClient())
         except Exception as exc:

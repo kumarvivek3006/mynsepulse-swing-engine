@@ -326,6 +326,90 @@ def apply_adjustments(conn) -> int:
     return len(actions)
 
 
+def aggregate_intraday(candles: list) -> dict | None:
+    """
+    Collapse intraday candles into one daily OHLCV bar.
+
+    Upstox returns them newest-first, so the session OPEN is the last element
+    and the latest price is the first. Getting that order wrong silently
+    swaps open and close.
+    """
+    if not candles:
+        return None
+    try:
+        highs = [float(c[2]) for c in candles]
+        lows = [float(c[3]) for c in candles]
+        return {
+            "open": float(candles[-1][1]),
+            "high": max(highs),
+            "low": min(lows),
+            "close": float(candles[0][4]),
+            "volume": sum(int(c[5] or 0) for c in candles),
+        }
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def sync_today_from_intraday(conn, client, only_missing: bool = True) -> int:
+    """
+    Write today's completed bar from the intraday endpoint.
+
+    Upstox's historical-candle endpoint serves sessions up to the PREVIOUS
+    trading day; today's data is only on the intraday endpoint until it rolls
+    into history overnight. So a post-close backfill using history alone
+    fetched nothing however late it ran — the bar was never there. Moving the
+    slot later could not have fixed it.
+
+    The row is upserted, so tomorrow's historical fetch overwrites it with the
+    exchange-settled version. Any small discrepancy self-corrects within a day.
+    """
+    today = date.today()
+    if today.weekday() >= 5:
+        return 0
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select s.symbol, s.upstox_instrument_key, max(o.trade_date)
+            from symbols s
+            left join ohlcv_daily o on o.symbol = s.symbol
+            where s.is_active and s.upstox_instrument_key is not null
+            group by s.symbol, s.upstox_instrument_key
+            order by s.symbol
+        """)
+        targets = cur.fetchall()
+
+    written = 0
+    for symbol, key, latest in targets:
+        if only_missing and latest is not None and latest >= today:
+            continue
+        try:
+            bar = aggregate_intraday(client.intraday_today(key))
+        except Exception as exc:
+            log.debug("intraday fetch failed for %s: %s", symbol, exc)
+            continue
+        if not bar or bar["close"] <= 0:
+            continue
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                insert into ohlcv_daily
+                    (symbol, trade_date, open, high, low, close, volume)
+                values (%s, %s, %s, %s, %s, %s, %s)
+                on conflict (symbol, trade_date) do update set
+                    open = excluded.open, high = excluded.high,
+                    low = excluded.low, close = excluded.close,
+                    volume = excluded.volume
+            """, (symbol, today, bar["open"], bar["high"], bar["low"],
+                  bar["close"], bar["volume"]))
+            written += cur.rowcount
+        if written % 100 == 0:
+            conn.commit()
+
+    conn.commit()
+    log.info("Today's bar from intraday: %d symbols written", written)
+    return written
+
+
 # ---------------------------------------------------------------------
 # 4b. Indices
 #

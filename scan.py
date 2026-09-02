@@ -193,6 +193,12 @@ def ensure_bars_current(conn) -> dict:
     try:
         sync_indices(conn, client, master)
         gained = backfill_prices(conn, client)
+
+        # History does not carry today's candle. If the expected session is
+        # today and history did not supply it, build it from intraday.
+        if expected == date.today():
+            from ingest import sync_today_from_intraday
+            gained += sync_today_from_intraday(conn, client)
     except Exception as exc:
         log.warning("Price refresh failed: %s", exc)
         return {"refreshed": False, "latest_bar": str(latest) if latest else None,
@@ -202,7 +208,23 @@ def ensure_bars_current(conn) -> dict:
     # never reaches this point, so logging in makes the next scan try again.
     _last_refresh_attempt.update(for_session=expected, at=datetime.now(IST),
                                  gained=gained)
-    return {"refreshed": True, "bars_added": gained, "expected": str(expected)}
+
+    # Re-read the newest bar so the caller can see what the refresh achieved.
+    # Omitting this left latest_bar null on a successful refresh, which the UI
+    # rendered as a dash — indistinguishable from having no data at all.
+    with conn.cursor() as cur:
+        cur.execute("""
+            select max(o.trade_date) from ohlcv_daily o
+            join symbols s on s.symbol = o.symbol
+            where coalesce(s.series, '') <> 'INDEX'
+        """)
+        latest_after = cur.fetchone()[0]
+
+    return {"refreshed": True, "bars_added": gained,
+            "latest_bar": str(latest_after) if latest_after else None,
+            "expected": str(expected),
+            "reason": "up_to_date" if latest_after and latest_after >= expected
+                      else "broker_has_no_bar_yet"}
 
 
 def _load_symbol(conn, symbol: str, limit: int = 800) -> pd.DataFrame | None:

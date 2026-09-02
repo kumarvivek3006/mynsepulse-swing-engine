@@ -435,24 +435,6 @@ def signals(request: Request):
         finally:
             conn2.close()
 
-    # A setup whose stop broke before it ever triggered is void: the entry was
-    # never reached and the base that defined the stop has failed. Persisting
-    # that status happens in the scan, so between runs the row stays 'pending'
-    # and the card kept being served as actionable — with a Mark as taken
-    # button on a trade that no longer exists. Drop them here, on read, so a
-    # broken stop removes the card immediately rather than hours later.
-    invalidated_now = []
-    kept = []
-    for r in rows:
-        lc = r.get("last_close")
-        taken = r.get("entry_price") is not None
-        if (not taken and lc is not None
-                and float(lc) <= float(r["stop_loss"])):
-            invalidated_now.append(r["symbol"])
-            continue
-        kept.append(r)
-    rows = kept
-
     def band(score):
         return "high" if score >= 80 else "medium" if score >= 65 else "low"
 
@@ -557,9 +539,6 @@ def signals(request: Request):
 
     return {
         "settings": settings,
-        # Surfaced rather than silently dropped, so a shrinking list is
-        # explainable rather than mysterious.
-        "invalidated_since_scan": invalidated_now,
         "regime": {"state": reg[0], "breadth_above_50dma": float(reg[1]) if reg and reg[1] is not None else None,
                    "vix": float(reg[2]) if reg and reg[2] is not None else None,
                    "distribution_days": reg[3], "as_of": str(reg[4])} if reg else None,
