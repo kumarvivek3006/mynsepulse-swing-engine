@@ -189,6 +189,19 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
         log.info("Backtest %s to %s: %d sessions, %d symbols",
                  from_date, to_date, len(trading_days), len(universe))
 
+        # The index's own trend state per session. Recorded alongside the
+        # regime label because EVERY category flipped sign at the same date in
+        # the split-sample test — which points at the market, not at any
+        # pattern or setup type. A single, unambiguous condition is the way to
+        # test that: was the Nifty above its own 200 DMA?
+        nifty_ind = add_indicators(nifty.copy())
+        index_state: dict[date, str] = {}
+        for _, row in nifty_ind.iterrows():
+            d = row["trade_date"].date()
+            if pd.notna(row["sma200"]):
+                index_state[d] = ("above_200dma" if row["close"] > row["sma200"]
+                                  else "below_200dma")
+
         # Regime per session, from the same function the live engine uses.
         regimes: dict[date, str] = {}
         for d in trading_days:
@@ -259,6 +272,7 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "setup_type": setup.setup_type, "pattern": setup.pattern,
                     "score_total": setup.score_total,
                     "band": _band(setup.score_total), "regime": regime,
+                    "index_state": index_state.get(d, "unknown"),
                     "entry_trigger": setup.entry, "stop_loss": setup.stop,
                     "t1": setup.t1, "t2": setup.t2,
                     "r_planned": setup.r_multiple_t1,
@@ -310,7 +324,7 @@ def split_sample(trades: list[dict]) -> dict:
     }
 
     MIN_N = 25          # below this a half is noise, not evidence
-    for key in ("band", "setup_type", "pattern", "regime"):
+    for key in ("band", "setup_type", "pattern", "regime", "index_state"):
         for name in set(a.get(key, {})) | set(b.get(key, {})):
             sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
             if not sa or not sb:
@@ -331,6 +345,34 @@ def split_sample(trades: list[dict]) -> dict:
 
     positives = {k: v for k, v in out["consistent"].items()
                  if v["first"] > 0 and v["second"] > 0}
+    # Does the engine only work with the index above its own 200 DMA? Tested
+    # in BOTH halves, because a condition that only holds in one is the same
+    # illusion the split test exists to catch.
+    def _state(half, name):
+        st = half.get("index_state", {}).get(name)
+        return (st or {}).get("expectancy_r"), (st or {}).get("filled") or 0
+
+    above_a, n_above_a = _state(a, "above_200dma")
+    above_b, n_above_b = _state(b, "above_200dma")
+    below_a, n_below_a = _state(a, "below_200dma")
+    below_b, n_below_b = _state(b, "below_200dma")
+
+    holds = (above_a is not None and above_b is not None
+             and above_a > 0 and above_b > 0
+             and n_above_a >= MIN_N and n_above_b >= MIN_N)
+
+    out["index_filter"] = {
+        "above_200dma": {"first": above_a, "second": above_b,
+                         "n_first": n_above_a, "n_second": n_above_b},
+        "below_200dma": {"first": below_a, "second": below_b,
+                         "n_first": n_below_a, "n_second": n_below_b},
+        "holds_in_both_halves": holds,
+        "note": ("If trading only above the 200 DMA is positive in BOTH halves "
+                 "with adequate sample, that is the first finding the data "
+                 "actually supports. If not, the engine has no demonstrated "
+                 "edge under any condition tested."),
+    }
+
     out["verdict"] = {
         "overall_sign_stable": (out["first_half"]["expectancy_r"] or 0) > 0
                                == ((out["second_half"]["expectancy_r"] or 0) > 0),
@@ -368,7 +410,7 @@ def summarise(trades: list[dict]) -> dict:
         }
 
     out = {"overall": stats(trades)}
-    for key in ("band", "regime", "setup_type", "pattern"):
+    for key in ("band", "regime", "setup_type", "pattern", "index_state"):
         out[key] = {v: stats([t for t in trades if t.get(key) == v])
                     for v in sorted({t.get(key) for t in trades if t.get(key)})}
 
