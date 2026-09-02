@@ -62,6 +62,103 @@ def _band(score: float) -> str:
     return "high" if score >= 80 else "medium" if score >= 65 else "low"
 
 
+# Exit variants, pre-specified. A small fixed set judged by the split-sample
+# test — not a sweep. Sweeping dozens of combinations across 1,602 trades will
+# always surface something that looks excellent and means nothing.
+#
+# The current live exit (baseline) truncates the right tail three ways: half
+# the position sold at T1, the runner's stop jumped to breakeven, and a hard
+# stop at 40 sessions. Trend systems earn from a few very large winners, and
+# breakouts here show a 40.1% hit rate with only 1.48R average wins — high
+# accuracy, small payoff, which is what cutting winners looks like.
+EXIT_VARIANTS = {
+    "baseline":        {"scale_pct": 50, "breakeven": True,  "trail": False, "max_hold": 40},
+    "no_scale_out":    {"scale_pct": 0,  "breakeven": True,  "trail": False, "max_hold": 40},
+    "no_breakeven":    {"scale_pct": 50, "breakeven": False, "trail": True,  "max_hold": 40},
+    "let_it_run":      {"scale_pct": 0,  "breakeven": False, "trail": True,  "max_hold": 120},
+    "trail_only_long": {"scale_pct": 33, "breakeven": False, "trail": True,  "max_hold": 120},
+}
+
+
+def _swing_low(lows: list, i: int) -> float | None:
+    """Most recent confirmed swing low at or before i: two higher lows each side."""
+    for j in range(i - 2, 1, -1):
+        w = lows[j - 2:j + 3]
+        if len(w) == 5 and lows[j] == min(w):
+            return lows[j]
+    return None
+
+
+def _simulate_variant(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
+                      t2: float | None, cfg: dict) -> dict | None:
+    """One exit policy. Entry logic is identical across variants."""
+    filled_at = entry_idx = None
+    for i in range(min(EXPIRY_SESSIONS, len(fwd))):
+        bar = fwd.iloc[i]
+        if bar["high"] >= entry:
+            filled_at = max(float(entry), float(bar["open"]))
+            entry_idx = i
+            break
+    if filled_at is None:
+        return None
+
+    risk = filled_at - stop
+    if risk <= 0:
+        return None
+
+    max_hold = cfg["max_hold"]
+    scale_pct = cfg["scale_pct"] / 100.0
+    live_stop = stop
+    remaining = 1.0
+    realised = 0.0
+    scaled = False
+    mfe = mae = 0.0
+    lows = [float(x) for x in fwd["low"].tolist()]
+
+    for i in range(entry_idx, min(entry_idx + max_hold, len(fwd))):
+        bar = fwd.iloc[i]
+        high, low = float(bar["high"]), float(bar["low"])
+        mfe = max(mfe, (high - filled_at) / risk)
+        mae = min(mae, (low - filled_at) / risk)
+
+        if low <= live_stop:
+            realised += remaining * (live_stop - filled_at) / risk
+            return _close(fwd, entry_idx, i, filled_at, live_stop, realised,
+                          "stop" if not scaled else "trail_stop", mfe, mae)
+
+        if scale_pct and not scaled and high >= t1:
+            realised += scale_pct * (t1 - filled_at) / risk
+            remaining -= scale_pct
+            scaled = True
+            if remaining <= 0:
+                return _close(fwd, entry_idx, i, filled_at, t1, realised,
+                              "target", mfe, mae)
+
+        # Breakeven only where the variant asks for it.
+        if cfg["breakeven"] and scaled and live_stop < filled_at:
+            live_stop = filled_at
+
+        # Structural trail: ride the most recent confirmed swing low. Only
+        # ever raises the stop.
+        if cfg["trail"] and (high - filled_at) / risk >= 1.0:
+            sl = _swing_low(lows, i)
+            if sl and sl > live_stop:
+                live_stop = sl
+
+        if not cfg["trail"] and not scale_pct and t2 and high >= t2:
+            realised += remaining * (t2 - filled_at) / risk
+            return _close(fwd, entry_idx, i, filled_at, t2, realised,
+                          "target2", mfe, mae)
+
+    last_i = min(entry_idx + max_hold, len(fwd)) - 1
+    if last_i < entry_idx:
+        return None
+    exit_px = float(fwd.iloc[last_i]["close"])
+    realised += remaining * (exit_px - filled_at) / risk
+    return _close(fwd, entry_idx, last_i, filled_at, exit_px, realised,
+                  "time", mfe, mae)
+
+
 def _simulate(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
               t2: float | None) -> dict | None:
     """
@@ -267,6 +364,14 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                 fwd = df.iloc[i + 1:][["trade_date", "open", "high", "low", "close"]]
                 result = _simulate(fwd, setup.entry, setup.stop, setup.t1, setup.t2)
 
+                # Same signal, same entry, different exit policies. Any
+                # difference is attributable to the exit alone.
+                variants = {}
+                for name, cfg in EXIT_VARIANTS.items():
+                    v = _simulate_variant(fwd, setup.entry, setup.stop,
+                                          setup.t1, setup.t2, cfg)
+                    variants[name] = v["r_realised"] if v else None
+
                 record = {
                     "symbol": sym, "signal_date": d,
                     "setup_type": setup.setup_type, "pattern": setup.pattern,
@@ -278,6 +383,7 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "r_planned": setup.r_multiple_t1,
                 }
                 record.update(result or {"exit_reason": "never_triggered"})
+                record["variants"] = variants
                 trades.append(record)
 
             log.debug("%s: %d signals so far", sym, len(trades))
@@ -287,6 +393,57 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
 
     finally:
         conn.close()
+
+
+def compare_exits(trades: list[dict]) -> dict:
+    """
+    Expectancy of each exit policy, on the SAME signals, in BOTH halves.
+
+    Selection is held constant, so any difference is the exit. A variant only
+    counts if it is positive in both halves — the same bar every other finding
+    has had to clear.
+    """
+    dated = sorted([t for t in trades if t.get("signal_date") and t.get("variants")],
+                   key=lambda t: t["signal_date"])
+    if len(dated) < 40:
+        return {"error": "too few signals"}
+    mid = len(dated) // 2
+    halves = {"first": dated[:mid], "second": dated[mid:]}
+
+    out = {}
+    for name in EXIT_VARIANTS:
+        row = {}
+        for half, subset in halves.items():
+            rs = [t["variants"].get(name) for t in subset
+                  if t["variants"].get(name) is not None]
+            row[half] = {
+                "filled": len(rs),
+                "expectancy_r": round(sum(rs) / len(rs), 3) if rs else None,
+                "total_r": round(sum(rs), 1) if rs else None,
+                "hit_rate": round(sum(1 for r in rs if r > 0) / len(rs), 3) if rs else None,
+                "avg_win": round(sum(r for r in rs if r > 0)
+                                 / max(sum(1 for r in rs if r > 0), 1), 2) if rs else None,
+            }
+        allr = [t["variants"].get(name) for t in dated
+                if t["variants"].get(name) is not None]
+        row["full"] = {
+            "filled": len(allr),
+            "expectancy_r": round(sum(allr) / len(allr), 3) if allr else None,
+            "total_r": round(sum(allr), 1) if allr else None,
+        }
+        ef, es = row["first"]["expectancy_r"], row["second"]["expectancy_r"]
+        row["positive_in_both_halves"] = bool(
+            ef is not None and es is not None and ef > 0 and es > 0)
+        out[name] = row
+
+    winners = [k for k, v in out.items() if v["positive_in_both_halves"]]
+    out["verdict"] = {
+        "positive_in_both_halves": winners,
+        "note": ("Selection is identical across variants, so any difference is "
+                 "the exit policy alone. A variant positive in only one half "
+                 "is the same illusion the split test exists to catch."),
+    }
+    return out
 
 
 def split_sample(trades: list[dict]) -> dict:
