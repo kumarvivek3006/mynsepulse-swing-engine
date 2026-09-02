@@ -435,6 +435,24 @@ def signals(request: Request):
         finally:
             conn2.close()
 
+    # A setup whose stop broke before it ever triggered is void: the entry was
+    # never reached and the base that defined the stop has failed. Persisting
+    # that status happens in the scan, so between runs the row stays 'pending'
+    # and the card kept being served as actionable — with a Mark as taken
+    # button on a trade that no longer exists. Drop them here, on read, so a
+    # broken stop removes the card immediately rather than hours later.
+    invalidated_now = []
+    kept = []
+    for r in rows:
+        lc = r.get("last_close")
+        taken = r.get("entry_price") is not None
+        if (not taken and lc is not None
+                and float(lc) <= float(r["stop_loss"])):
+            invalidated_now.append(r["symbol"])
+            continue
+        kept.append(r)
+    rows = kept
+
     def band(score):
         return "high" if score >= 80 else "medium" if score >= 65 else "low"
 
@@ -539,6 +557,9 @@ def signals(request: Request):
 
     return {
         "settings": settings,
+        # Surfaced rather than silently dropped, so a shrinking list is
+        # explainable rather than mysterious.
+        "invalidated_since_scan": invalidated_now,
         "regime": {"state": reg[0], "breadth_above_50dma": float(reg[1]) if reg and reg[1] is not None else None,
                    "vix": float(reg[2]) if reg and reg[2] is not None else None,
                    "distribution_days": reg[3], "as_of": str(reg[4])} if reg else None,
@@ -741,7 +762,8 @@ def daily_log(request: Request, day: str | None = Query(None)):
 
 def _trail_levels(bars: list, entry_price: float, original_stop: float,
                   t1: float, t2: float | None, pivot: float | None = None,
-                  atr_floor_mult: float = 0.75) -> dict:
+                  atr_floor_mult: float = 0.75,
+                  live_price: float | None = None) -> dict:
     """
     Trail to prices that actually printed. Nothing derived by formula.
 
@@ -779,7 +801,10 @@ def _trail_levels(bars: list, entry_price: float, original_stop: float,
     highs = [float(b[2]) for b in bars]
     lows = [float(b[3]) for b in bars]
     vols = [float(b[4] or 0) for b in bars]
-    last = closes[-1]
+    # Levels come from closed bars; only the "where is price now" comparisons
+    # use the live tick. Substituting a live price into the swing-low or
+    # volume logic would corrupt structure that has already formed.
+    last = float(live_price) if live_price is not None else closes[-1]
 
     risk = entry_price - original_stop
     r_now = ((last - entry_price) / risk) if risk > 0 else None
@@ -934,7 +959,8 @@ def _exit_plan(bars: list, trade: dict, settings: dict, trail: dict) -> dict:
 
 
 def _thesis_health(bars: list, nifty: list, entry_price: float, stop: float,
-                   pivot: float | None, entry_date, atr_hint: float | None) -> dict:
+                   pivot: float | None, entry_date, atr_hint: float | None,
+                   live_price: float | None = None) -> dict:
     """
     Assess whether the reason for the trade still holds.
 
@@ -952,7 +978,9 @@ def _thesis_health(bars: list, nifty: list, entry_price: float, stop: float,
     highs = [float(b[2]) for b in bars]
     lows = [float(b[3]) for b in bars]
     vols = [float(b[4] or 0) for b in bars]
-    last = closes[-1]
+    # Live where the question is "where is price now"; closed bars for the
+    # EMA, the volume profile and the high/low sequence, which are history.
+    last = float(live_price) if live_price is not None else closes[-1]
 
     k = 2 / 21
     ema20 = closes[0]
@@ -1080,6 +1108,48 @@ def my_trades(request: Request):
     finally:
         conn.close()
 
+    # Live prices for open positions only — a handful of symbols. Thesis and
+    # trail were computed purely from end-of-day bars, so a position could
+    # break its stop or lose the 20 EMA mid-session and this page would not
+    # know until the next close.
+    live_by_symbol: dict[str, float] = {}
+    live_error = None
+    open_symbols = [t["symbol"] for t in trades if t.get("exit_price") is None]
+    if open_symbols:
+        try:
+            from upstox_client import UpstoxClient
+            conn2 = connect()
+            try:
+                with conn2.cursor() as cur:
+                    cur.execute("select symbol, upstox_instrument_key from symbols "
+                                "where symbol = any(%s) "
+                                "and upstox_instrument_key is not null",
+                                (open_symbols,))
+                    keymap = dict(cur.fetchall())
+            finally:
+                conn2.close()
+
+            if keymap:
+                quotes = UpstoxClient(store=store).quotes(list(keymap.values()))
+                by_token = {}
+                for rk, v in (quotes or {}).items():
+                    if isinstance(v, dict):
+                        tok = v.get("instrument_token") or v.get("instrument_key")
+                        if tok:
+                            by_token[tok] = v
+                        name = v.get("symbol") or rk.split(":")[-1]
+                        by_token.setdefault(str(name).upper(), v)
+                for sym, key in keymap.items():
+                    q = by_token.get(key) or by_token.get(sym.upper()) or {}
+                    ltp = q.get("last_price") or q.get("ltp")
+                    if ltp is not None:
+                        live_by_symbol[sym] = float(ltp)
+        except Exception as exc:
+            # Fall back to stored bars. The levels remain valid; only the
+            # freshness of the comparison is lost.
+            live_error = str(exc)[:200]
+            log.warning("Live prices unavailable for my-trades: %s", live_error)
+
     open_t, closed = [], []
     for t in trades:
         t["id"] = str(t["id"])
@@ -1094,8 +1164,13 @@ def my_trades(request: Request):
 
         risk = t["entry_price"] - t["stop_loss"]
         if t.get("exit_price") is None:
-            t["r_now"] = round((t["last_close"] - t["entry_price"]) / risk, 2) \
-                if t.get("last_close") and risk > 0 else None
+            live = live_by_symbol.get(t["symbol"])
+            t["live_price"] = live
+            t["price_basis"] = "live" if live is not None else "last_close"
+            current = live if live is not None else t.get("last_close")
+
+            t["r_now"] = round((current - t["entry_price"]) / risk, 2) \
+                if current and risk > 0 else None
 
             entry_dt = None
             if t.get("entry_date"):
@@ -1108,7 +1183,7 @@ def my_trades(request: Request):
             t["trail"] = _trail_levels(
                 bars_by_symbol.get(t["symbol"], []), t["entry_price"],
                 t["stop_loss"], t["t1"], t.get("t2"),
-                pivot=t.get("entry_trigger"))
+                pivot=t.get("entry_trigger"), live_price=live)
 
             t["exit_plan"] = _exit_plan(bars_by_symbol.get(t["symbol"], []),
                                         t, settings, t["trail"])
@@ -1116,7 +1191,7 @@ def my_trades(request: Request):
             t["thesis"] = _thesis_health(
                 bars_by_symbol.get(t["symbol"], []), nifty_closes,
                 t["entry_price"], t["stop_loss"],
-                t.get("pivot"), entry_dt, None)
+                t.get("pivot"), entry_dt, None, live_price=live)
             open_t.append(t)
         else:
             closed.append(t)
@@ -1151,7 +1226,10 @@ def my_trades(request: Request):
         "total_r": round(sum(resolved), 2) if resolved else None,
     }
     return {"open": open_t, "closed": closed, "stats": stats,
-            "exposure": exposure, "settings": settings}
+            "exposure": exposure, "settings": settings,
+            "live": {"symbols_priced": len(live_by_symbol),
+                     "symbols_open": len(open_symbols),
+                     "error": live_error}}
 
 
 @app.post("/signals/take")
