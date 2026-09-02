@@ -1497,7 +1497,9 @@ def backtest_job(request: Request):
 
         try:
             result = run_backtest(from_date, to_date, step=step)
+            from backtest import split_sample
             metrics = summarise(result["trades"])
+            metrics["split_sample"] = split_sample(result["trades"])
 
             conn = _connect()
             try:

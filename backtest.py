@@ -275,6 +275,76 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
         conn.close()
 
 
+def split_sample(trades: list[dict]) -> dict:
+    """
+    Does anything hold across BOTH halves of the period?
+
+    The one-year run showed +0.113R; three years showed -0.106R. A result
+    that reverses when the window moves is a property of the sample, not of
+    the system. So every breakdown is recomputed on the first and second
+    halves independently, and only findings with the same SIGN in both are
+    reported as consistent.
+
+    This is the guard against fitting to whichever slice happens to flatter
+    the engine. Anything that fails it should not drive a change.
+    """
+    dated = sorted([t for t in trades if t.get("signal_date")],
+                   key=lambda t: t["signal_date"])
+    if len(dated) < 40:
+        return {"error": "too few signals to split"}
+
+    mid = len(dated) // 2
+    first, second = dated[:mid], dated[mid:]
+    boundary = str(dated[mid]["signal_date"])
+
+    a, b = summarise(first), summarise(second)
+    out = {
+        "boundary_date": boundary,
+        "first_half": {"n": len(first), "period":
+                       f"{first[0]['signal_date']} to {first[-1]['signal_date']}",
+                       "expectancy_r": a["overall"]["expectancy_r"]},
+        "second_half": {"n": len(second), "period":
+                        f"{second[0]['signal_date']} to {second[-1]['signal_date']}",
+                        "expectancy_r": b["overall"]["expectancy_r"]},
+        "consistent": {}, "inconsistent": {},
+    }
+
+    MIN_N = 25          # below this a half is noise, not evidence
+    for key in ("band", "setup_type", "pattern", "regime"):
+        for name in set(a.get(key, {})) | set(b.get(key, {})):
+            sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
+            if not sa or not sb:
+                continue
+            ea, eb = sa.get("expectancy_r"), sb.get("expectancy_r")
+            na, nb = sa.get("filled") or 0, sb.get("filled") or 0
+            if ea is None or eb is None:
+                continue
+
+            entry = {"first": ea, "second": eb, "n_first": na, "n_second": nb,
+                     "underpowered": na < MIN_N or nb < MIN_N}
+            label = f"{key}.{name}"
+            # Same sign in both halves, and enough trades in each to mean it.
+            if (ea > 0) == (eb > 0) and not entry["underpowered"]:
+                out["consistent"][label] = entry
+            else:
+                out["inconsistent"][label] = entry
+
+    positives = {k: v for k, v in out["consistent"].items()
+                 if v["first"] > 0 and v["second"] > 0}
+    out["verdict"] = {
+        "overall_sign_stable": (out["first_half"]["expectancy_r"] or 0) > 0
+                               == ((out["second_half"]["expectancy_r"] or 0) > 0),
+        "consistently_positive": sorted(positives),
+        "consistently_negative": sorted(k for k, v in out["consistent"].items()
+                                        if v["first"] <= 0 and v["second"] <= 0),
+        "note": ("Only findings with the same sign in both halves and at least "
+                 f"{MIN_N} filled trades in each are treated as evidence. "
+                 "Anything listed as inconsistent flipped when the window "
+                 "moved and must not drive a change."),
+    }
+    return out
+
+
 def summarise(trades: list[dict]) -> dict:
     """Metrics that answer the question, split the ways that matter."""
     def stats(subset):
