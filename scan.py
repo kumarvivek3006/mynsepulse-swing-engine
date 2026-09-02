@@ -174,7 +174,18 @@ def ensure_bars_current(conn) -> dict:
                 "expected": str(expected), "reason": "no_data_for_session"}
 
     from ingest import backfill_prices, sync_indices
-    from upstox_client import InstrumentMaster, UpstoxClient
+    from upstox_client import InstrumentMaster, TokenStore, UpstoxClient
+
+    # Check the token BEFORE attempting. backfill_prices catches per-symbol
+    # errors and continues, so an expired token fails all 500 silently and
+    # returns zero bars — which is indistinguishable from a holiday. Reporting
+    # that as "no_data_for_session" hid the real cause, and the hour-long memo
+    # then suppressed retries even after a fresh login.
+    if TokenStore().valid_token() is None:
+        return {"refreshed": False, "latest_bar": str(latest) if latest else None,
+                "expected": str(expected),
+                "reason": "upstox_token_expired",
+                "action": "Log in to Upstox, then re-run the scan."}
 
     log.info("Bars stale (latest %s, expected %s) — refreshing", latest, expected)
     client, master = UpstoxClient(), InstrumentMaster()
@@ -187,6 +198,8 @@ def ensure_bars_current(conn) -> dict:
         return {"refreshed": False, "latest_bar": str(latest) if latest else None,
                 "expected": str(expected), "reason": f"failed: {str(exc)[:150]}"}
 
+    # Only memoise a genuine empty result. An auth failure returns earlier and
+    # never reaches this point, so logging in makes the next scan try again.
     _last_refresh_attempt.update(for_session=expected, at=datetime.now(IST),
                                  gained=gained)
     return {"refreshed": True, "bars_added": gained, "expected": str(expected)}
@@ -655,6 +668,24 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                    and abs(p.entry_trigger / t.entry_trigger - 1) * 100 <= %s
             """, (MATERIAL_CHANGE_PCT,))
             stale_duplicates = cur.rowcount
+
+            # Two pending rows for the same symbol and setup at effectively the
+            # same entry are the same opportunity written twice. Keep the
+            # oldest — it carries the original generated_at, so persistence is
+            # preserved — and drop the rest.
+            cur.execute("""
+                delete from signals p
+                 using signals q
+                 where p.status = 'pending' and q.status = 'pending'
+                   and p.symbol = q.symbol
+                   and p.setup_type = q.setup_type
+                   and q.entry_trigger > 0
+                   and abs(p.entry_trigger / q.entry_trigger - 1) * 100 <= %s
+                   and (p.generated_at > q.generated_at
+                        or (p.generated_at = q.generated_at and p.id > q.id))
+            """, (MATERIAL_CHANGE_PCT,))
+            stale_duplicates += cur.rowcount
+
             if stale_duplicates:
                 log.info("Cleared %d pending signals duplicating open positions",
                          stale_duplicates)
