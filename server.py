@@ -1497,10 +1497,23 @@ def backtest_job(request: Request):
 
         try:
             result = run_backtest(from_date, to_date, step=step)
-            from backtest import compare_exits, split_sample
+            from backtest import compare_exits, simulate_portfolio, split_sample
             metrics = summarise(result["trades"])
             metrics["split_sample"] = split_sample(result["trades"])
             metrics["exit_variants"] = compare_exits(result["trades"])
+
+            # Portfolio construction: concentrated book, strongest first.
+            # Pre-specified combinations only — not a sweep.
+            metrics["portfolio"] = {
+                "all_signals_no_cap": simulate_portfolio(
+                    result["trades"], max_positions=9999, min_rs=0),
+                "top8_any_rs": simulate_portfolio(
+                    result["trades"], max_positions=8, min_rs=0),
+                "top8_rs80plus": simulate_portfolio(
+                    result["trades"], max_positions=8, min_rs=80),
+                "top5_rs80plus": simulate_portfolio(
+                    result["trades"], max_positions=5, min_rs=80),
+            }
 
             conn = _connect()
             try:
