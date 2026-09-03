@@ -51,6 +51,9 @@ class Base:
     contraction_ratio: float     # last contraction / first contraction
     prior_uptrend_pct: float
     quality: float = 0.0
+    # A VCP is a shape PLUS a contraction. Kept separate so the shape label
+    # is never overwritten by the quality.
+    contracting: bool = False
 
 
 @dataclass
@@ -167,15 +170,29 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
             _note("weak_prior_uptrend")
             continue
 
+        # Measuring low-to-end rewards a crash-and-recover exactly as much as
+        # a genuine advance: a stock falling 200 -> 120 then returning to 175
+        # scored a "46% prior uptrend" while sitting 12% BELOW where it began.
+        # A base is only a base if the stock reached NEW ground first, so the
+        # pivot must exceed the highest close of the window's earlier half.
+        earlier_half = prior_window[:max(len(prior_window) // 2, 5)]
+        if len(earlier_half) and pivot <= float(earlier_half.max()):
+            _note("no_new_ground")
+            continue
+
         third = max(lookback // 3, 3)
-        base_vol = volumes[seg_start:].mean()
-        dryup = float(volumes[-third:].mean() / base_vol) if base_vol > 0 else 1.0
+        # Baseline is the earlier two-thirds, not the whole base. Including
+        # the quiet final third in its own denominator diluted the very
+        # comparison the test exists to make.
+        early_vol = volumes[seg_start:-third].mean() if lookback > third else 0.0
+        dryup = float(volumes[-third:].mean() / early_vol) if early_vol > 0 else 1.0
 
         first_range = seg_high[:third].max() - seg_low[:third].min()
         last_range = seg_high[-third:].max() - seg_low[-third:].min()
         contraction = float(last_range / first_range) if first_range > 0 else 1.0
 
         pattern = _classify(seg_high, seg_low, depth, lookback, contraction)
+        contracting = bool(contraction < 0.6 and depth < 25)
 
         quality = (
             (1.0 - min(depth / 35, 1.0)) * 30           # tighter is better
@@ -186,7 +203,8 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
         )
 
         candidate = Base(pattern, seg_start, pivot_idx, pivot, base_low, depth,
-                         lookback, dryup, contraction, prior_gain, quality)
+                         lookback, dryup, contraction, prior_gain, quality,
+                         contracting)
         if best is None or candidate.quality > best.quality:
             best = candidate
 
@@ -206,13 +224,18 @@ def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
     flat_resistance = abs(highs_last - highs_first) / highs_first < 0.03 if highs_first else False
     rising_lows = lows_last > lows_first * 1.02
 
-    if contraction < 0.6 and depth < 25:
-        return "vcp"
+    # Shape is decided by geometry alone. Contraction is a separate quality,
+    # reported alongside rather than overriding the shape.
+    #
+    # Testing contraction FIRST meant any tight base was labelled "vcp"
+    # regardless of form — a 10%-deep flat base never reached the flat_base
+    # branch. Every pattern statistic read so far was distorted by that
+    # precedence, which is why flat_base looked rare.
     if flat_resistance and rising_lows:
         return "asc_triangle"
     if depth <= 15:
         return "flat_base"
-    if depth > 15 and lows_last > lows_first:
+    if lows_last > lows_first:
         return "cup_handle"
     return "consolidation"
 
@@ -301,9 +324,23 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str,
     last = df.iloc[-1]
     atr = float(last["atr14"])
 
-    # Armed and breakout both enter on a stop order above the pivot; only a
-    # pullback entry keys off the confirmation bar's high.
-    anchor = float(last["high"]) if setup_type.startswith("pullback") else base.pivot
+    # Entry must be a level the market has NOT already left behind.
+    #
+    # Anchoring every breakout to the pivot produced triggers below the
+    # current price: a bar gapping 6% through the pivot gave an entry 5%
+    # under the close. Live that fills at the open as a chase, and the R:R
+    # shown was computed from a price you could not get. Worse, risk was
+    # measured entry-to-stop while the real fill sat far higher — 4.7x the
+    # planned risk in testing, which position sizing then treated as small.
+    #
+    # The honest anchor is the higher of the pivot and the trigger bar's
+    # high. Both are prices that printed. Nothing is manufactured, and an
+    # extended breakout now fails the R:R floor and stop-width limit on its
+    # own arithmetic rather than needing a new threshold.
+    if setup_type.startswith("pullback"):
+        anchor = float(last["high"])
+    else:
+        anchor = max(base.pivot, float(last["high"]))
     entry = anchor * (1 + ENTRY_BUFFER)
 
     # --- stop: the tightest structural level that is still real ---------
@@ -553,6 +590,7 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
         stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
         score_total=total, score_breakdown=breakdown,
         extension=extension, provisional=provisional,
-        notes=[f"base {base.duration}d, depth {base.depth_pct:.1f}%",
+        notes=[f"base {base.duration}d, depth {base.depth_pct:.1f}%"
+               + (", contracting" if base.contracting else ""),
                f"stop from {levels['stop_basis']}", f"T1 from {levels['t1_basis']}"],
     )

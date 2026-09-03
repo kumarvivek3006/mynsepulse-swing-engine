@@ -599,6 +599,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "is_provisional": setup.provisional,
                 "setup_type": setup.setup_type,
                 "pattern": setup.pattern,
+                "contracting": setup.base.contracting,
                 "entry_trigger": setup.entry,
                 "stop_loss": setup.stop,
                 "t1": setup.t1,
@@ -821,6 +822,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                                   "rs63": s_["rs63"], "rs126": s_["rs126"],
                                   "close": s_["close"], "atr14": s_["atr14"],
                                   "extension": s_["extension"],
+                                  "contracting": s_["contracting"],
                                   "notes": s_["notes"]}),
                       as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2),
                       first_seen.get(s_["symbol"])))

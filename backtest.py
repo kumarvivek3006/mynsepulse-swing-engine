@@ -560,6 +560,8 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                 record = {
                     "symbol": sym, "signal_date": d,
                     "setup_type": setup.setup_type, "pattern": setup.pattern,
+                    "contracting": "contracting" if setup.base.contracting
+                                   else "not_contracting",
                     "score_total": setup.score_total,
                     "band": _band(setup.score_total), "regime": regime,
                     "index_state": index_state.get(d, "unknown"),
@@ -673,7 +675,7 @@ def split_sample(trades: list[dict]) -> dict:
 
     MIN_N = 25          # below this a half is noise, not evidence
     for key in ("band", "setup_type", "pattern", "regime", "index_state",
-                "rsi_zone", "rs_quintile", "group_quintile"):
+                "rsi_zone", "rs_quintile", "group_quintile", "contracting"):
         for name in set(a.get(key, {})) | set(b.get(key, {})):
             sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
             if not sa or not sb:
@@ -760,7 +762,7 @@ def summarise(trades: list[dict]) -> dict:
 
     out = {"overall": stats(trades)}
     for key in ("band", "regime", "setup_type", "pattern", "index_state",
-                "rsi_zone", "rs_quintile", "group_quintile"):
+                "rsi_zone", "rs_quintile", "group_quintile", "contracting"):
         out[key] = {v: stats([t for t in trades if t.get(key) == v])
                     for v in sorted({t.get(key) for t in trades if t.get(key)})}
 
