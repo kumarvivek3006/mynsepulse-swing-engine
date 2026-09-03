@@ -299,6 +299,140 @@ def _close(fwd, entry_idx, exit_idx, filled_at, exit_px, realised_r,
     }
 
 
+def _build_cross_section(conn, universe: list[str]) -> dict:
+    """
+    Cross-sectional rankings per session.
+
+    The engine asks "is this chart good?" — an ABSOLUTE judgement on each
+    stock in isolation. O'Neil, and the entire momentum literature, asks
+    "is this stock stronger than the other 499?" — a RELATIVE one. Only the
+    relative question has decades of out-of-sample evidence behind it.
+
+    Builds, for every trading day:
+      * each symbol's 126-day return percentile across the universe
+      * each industry group's average return percentile
+
+    RS is already computed on every signal and then ignored. This is what
+    makes it usable as a filter rather than a decoration.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            select symbol, trade_date, adj_close
+            from ohlcv_daily
+            where symbol = any(%s)
+            order by trade_date, symbol
+        """, (universe,))
+        rows = cur.fetchall()
+
+        cur.execute("select symbol, industry from symbols "
+                    "where industry is not null and symbol = any(%s)", (universe,))
+        industry = dict(cur.fetchall())
+
+    prices: dict[str, dict] = {}
+    for sym, d, px in rows:
+        prices.setdefault(sym, {})[d] = float(px)
+    del rows
+
+    all_dates = sorted({d for series in prices.values() for d in series})
+    date_idx = {d: i for i, d in enumerate(all_dates)}
+
+    LOOKBACK = 126
+    rs_pct: dict[tuple, float] = {}
+    grp_pct: dict[tuple, float] = {}
+
+    for i in range(LOOKBACK, len(all_dates)):
+        d, d_prev = all_dates[i], all_dates[i - LOOKBACK]
+        returns = {}
+        for sym, series in prices.items():
+            now, then = series.get(d), series.get(d_prev)
+            if now and then and then > 0:
+                returns[sym] = now / then - 1
+        if len(returns) < 50:
+            continue
+
+        ordered = sorted(returns.items(), key=lambda kv: kv[1])
+        n = len(ordered)
+        for rank, (sym, _) in enumerate(ordered):
+            rs_pct[(sym, d)] = round(rank / (n - 1) * 100, 1)
+
+        # Industry groups, ranked by their members' average return. Leaders
+        # emerge from leading groups; `industry` was populated and never read.
+        groups: dict[str, list] = {}
+        for sym, r in returns.items():
+            g = industry.get(sym)
+            if g:
+                groups.setdefault(g, []).append(r)
+        if len(groups) >= 5:
+            gavg = sorted(((g, sum(v) / len(v)) for g, v in groups.items()),
+                          key=lambda kv: kv[1])
+            gn = len(gavg)
+            gmap = {g: round(rank / (gn - 1) * 100, 1)
+                    for rank, (g, _) in enumerate(gavg)}
+            for sym in returns:
+                g = industry.get(sym)
+                if g in gmap:
+                    grp_pct[(sym, d)] = gmap[g]
+
+    log.info("Cross-section built: %d sessions, %d industry groups",
+             len(all_dates) - LOOKBACK, len({v for v in industry.values()}))
+    return {"rs_pct": rs_pct, "group_pct": grp_pct, "industry": industry}
+
+
+def _quintile(pct: float | None) -> str:
+    if pct is None:
+        return "unknown"
+    if pct >= 80:
+        return "q5_strongest"
+    if pct >= 60:
+        return "q4"
+    if pct >= 40:
+        return "q3"
+    if pct >= 20:
+        return "q2"
+    return "q1_weakest"
+
+
+def simulate_portfolio(trades: list[dict], max_positions: int = 8,
+                       rank_by: str = "rs_pct", min_rs: float = 0.0) -> dict:
+    """
+    A portfolio, not a list of independent trades.
+
+    The engine evaluates every setup in isolation and would have you holding
+    all of them. Professional books are concentrated: a capped number of
+    positions, the strongest candidates taken first, the rest declined.
+    That changes results even with identical signals, because capacity
+    forces selection.
+    """
+    dated = sorted([t for t in trades if t.get("entry_date") and t.get("exit_date")
+                    and t.get("r_realised") is not None],
+                   key=lambda t: (t["entry_date"], -(t.get(rank_by) or 0)))
+    if not dated:
+        return {"error": "no completed trades"}
+
+    open_until: list = []
+    taken, declined = [], 0
+
+    for t in dated:
+        if (t.get(rank_by) or 0) < min_rs:
+            continue
+        open_until = [d for d in open_until if d > t["entry_date"]]
+        if len(open_until) >= max_positions:
+            declined += 1
+            continue
+        open_until.append(t["exit_date"])
+        taken.append(t)
+
+    rs = [t["r_realised"] for t in taken]
+    wins = [r for r in rs if r > 0]
+    return {
+        "max_positions": max_positions, "min_rs_percentile": min_rs,
+        "taken": len(taken), "declined_no_capacity": declined,
+        "hit_rate": round(len(wins) / len(rs), 3) if rs else None,
+        "expectancy_r": round(sum(rs) / len(rs), 3) if rs else None,
+        "total_r": round(sum(rs), 1) if rs else None,
+    }
+
+
 def run_backtest(from_date: date, to_date: date, step: int = 1,
                  min_score_pct: float | None = None) -> dict:
     """
@@ -357,6 +491,9 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
             # driven mainly by trend and volatility, so it is approximated
             # here from the index alone. Flagged in the metrics as such.
             regimes[d] = evaluate_regime(idx.copy(), pd.DataFrame(), 50.0)["state"]
+
+        cross = _build_cross_section(conn, universe)
+        rs_pct, grp_pct = cross["rs_pct"], cross["group_pct"]
 
         trades: list[dict] = []
         day_set = set(trading_days)
@@ -426,6 +563,10 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "score_total": setup.score_total,
                     "band": _band(setup.score_total), "regime": regime,
                     "index_state": index_state.get(d, "unknown"),
+                    "rs_pct": rs_pct.get((sym, d)),
+                    "rs_quintile": _quintile(rs_pct.get((sym, d))),
+                    "group_pct": grp_pct.get((sym, d)),
+                    "group_quintile": _quintile(grp_pct.get((sym, d))),
                     "rsi": _rsi(window["close"].tolist()[-60:]),
                     "rsi_zone": _rsi_zone(_rsi(window["close"].tolist()[-60:])),
                     "entry_trigger": setup.entry, "stop_loss": setup.stop,
@@ -532,7 +673,7 @@ def split_sample(trades: list[dict]) -> dict:
 
     MIN_N = 25          # below this a half is noise, not evidence
     for key in ("band", "setup_type", "pattern", "regime", "index_state",
-                "rsi_zone"):
+                "rsi_zone", "rs_quintile", "group_quintile"):
         for name in set(a.get(key, {})) | set(b.get(key, {})):
             sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
             if not sa or not sb:
@@ -619,7 +760,7 @@ def summarise(trades: list[dict]) -> dict:
 
     out = {"overall": stats(trades)}
     for key in ("band", "regime", "setup_type", "pattern", "index_state",
-                "rsi_zone"):
+                "rsi_zone", "rs_quintile", "group_quintile"):
         out[key] = {v: stats([t for t in trades if t.get(key) == v])
                     for v in sorted({t.get(key) for t in trades if t.get(key)})}
 
