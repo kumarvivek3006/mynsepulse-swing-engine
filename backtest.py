@@ -58,6 +58,54 @@ COST_PCT = float(os.environ.get("BACKTEST_COST_PCT", "0.25"))
 SCALE_OUT_PCT = float(os.environ.get("SCALE_OUT_PCT", "50"))
 
 
+def _rsi(closes, period: int = 14) -> float | None:
+    """
+    Wilder's RSI at the last bar. Computed here rather than in gates.py so
+    nothing in the live engine changes.
+    """
+    if len(closes) < period + 1:
+        return None
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    avg_g, avg_l = gains / period, losses / period
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        avg_g = (avg_g * (period - 1) + max(d, 0.0)) / period
+        avg_l = (avg_l * (period - 1) + max(-d, 0.0)) / period
+    if avg_l == 0:
+        # No losses AND no gains is a dormant series, not maximum strength.
+        # Returning 100 there would classify every flat stock as extreme
+        # overbought and poison the whole comparison.
+        return 100.0 if avg_g > 0 else 50.0
+    rs = avg_g / avg_l
+    return round(100 - 100 / (1 + rs), 1)
+
+
+def _rsi_zone(rsi: float | None) -> str:
+    """
+    Buckets chosen before looking at any result.
+
+    I argued earlier that an RSI ceiling would reject the best setups,
+    because strong stocks stay overbought for months. That was judgement,
+    not evidence. These buckets let the data settle it: if 70+ genuinely
+    underperforms in BOTH halves, I was wrong and a ceiling is justified.
+    """
+    if rsi is None:
+        return "unknown"
+    if rsi < 40:
+        return "weak_under_40"
+    if rsi < 55:
+        return "neutral_40_55"
+    if rsi < 70:
+        return "healthy_55_70"
+    if rsi < 80:
+        return "overbought_70_80"
+    return "extreme_80_plus"
+
+
 def _band(score: float) -> str:
     return "high" if score >= 80 else "medium" if score >= 65 else "low"
 
@@ -378,6 +426,8 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "score_total": setup.score_total,
                     "band": _band(setup.score_total), "regime": regime,
                     "index_state": index_state.get(d, "unknown"),
+                    "rsi": _rsi(window["close"].tolist()[-60:]),
+                    "rsi_zone": _rsi_zone(_rsi(window["close"].tolist()[-60:])),
                     "entry_trigger": setup.entry, "stop_loss": setup.stop,
                     "t1": setup.t1, "t2": setup.t2,
                     "r_planned": setup.r_multiple_t1,
@@ -481,7 +531,8 @@ def split_sample(trades: list[dict]) -> dict:
     }
 
     MIN_N = 25          # below this a half is noise, not evidence
-    for key in ("band", "setup_type", "pattern", "regime", "index_state"):
+    for key in ("band", "setup_type", "pattern", "regime", "index_state",
+                "rsi_zone"):
         for name in set(a.get(key, {})) | set(b.get(key, {})):
             sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
             if not sa or not sb:
@@ -567,7 +618,8 @@ def summarise(trades: list[dict]) -> dict:
         }
 
     out = {"overall": stats(trades)}
-    for key in ("band", "regime", "setup_type", "pattern", "index_state"):
+    for key in ("band", "regime", "setup_type", "pattern", "index_state",
+                "rsi_zone"):
         out[key] = {v: stats([t for t in trades if t.get(key) == v])
                     for v in sorted({t.get(key) for t in trades if t.get(key)})}
 
