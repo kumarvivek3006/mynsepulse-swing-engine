@@ -569,6 +569,18 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "rs_quintile": _quintile(rs_pct.get((sym, d))),
                     "group_pct": grp_pct.get((sym, d)),
                     "group_quintile": _quintile(grp_pct.get((sym, d))),
+                    # Pre-specified intersection, not a general cross-tab.
+                    # Crossing every setup type against every RSI zone would
+                    # create 15 cells on 1,602 trades; something would look
+                    # significant by chance alone. One named hypothesis only.
+                    "breakout_rsi": (
+                        "breakout_rsi_70_80"
+                        if setup.setup_type.startswith("breakout")
+                        and _rsi_zone(_rsi(window["close"].tolist()[-60:]))
+                            == "overbought_70_80"
+                        else "breakout_other_rsi"
+                        if setup.setup_type.startswith("breakout")
+                        else "not_breakout"),
                     "rsi": _rsi(window["close"].tolist()[-60:]),
                     "rsi_zone": _rsi_zone(_rsi(window["close"].tolist()[-60:])),
                     "entry_trigger": setup.entry, "stop_loss": setup.stop,
@@ -675,7 +687,8 @@ def split_sample(trades: list[dict]) -> dict:
 
     MIN_N = 25          # below this a half is noise, not evidence
     for key in ("band", "setup_type", "pattern", "regime", "index_state",
-                "rsi_zone", "rs_quintile", "group_quintile", "contracting"):
+                "rsi_zone", "rs_quintile", "group_quintile", "contracting",
+                "breakout_rsi"):
         for name in set(a.get(key, {})) | set(b.get(key, {})):
             sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
             if not sa or not sb:
@@ -762,7 +775,8 @@ def summarise(trades: list[dict]) -> dict:
 
     out = {"overall": stats(trades)}
     for key in ("band", "regime", "setup_type", "pattern", "index_state",
-                "rsi_zone", "rs_quintile", "group_quintile", "contracting"):
+                "rsi_zone", "rs_quintile", "group_quintile", "contracting",
+                "breakout_rsi"):
         out[key] = {v: stats([t for t in trades if t.get(key) == v])
                     for v in sorted({t.get(key) for t in trades if t.get(key)})}
 
