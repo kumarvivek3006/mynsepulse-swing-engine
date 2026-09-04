@@ -626,6 +626,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "extension": setup.extension,
                 "stop_basis": setup.stop_basis,
                 "t1_basis": setup.t1_basis,
+                "t2_basis": setup.t2_basis,
                 "notes": setup.notes,
             })
             counts["signal"] = counts.get("signal", 0) + 1
@@ -822,6 +823,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                       regime["state"],
                       json.dumps({"stop_basis": s_["stop_basis"],
                                   "t1_basis": s_["t1_basis"],
+                                  "t2_basis": s_.get("t2_basis"),
                                   "is_add_on": s_["is_add_on"],
                                   "is_transition": s_["is_transition"],
                                   "is_provisional": s_["is_provisional"],

@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
+MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "4"))
 BASE_MAX_SESSIONS = int(os.environ.get("BASE_MAX_SESSIONS", "120"))
 BREAKOUT_VOL_MULT = float(os.environ.get("BREAKOUT_VOL_MULT", "1.5"))
 # How close to the pivot a stock must sit to be worth arming an order on.
@@ -64,11 +65,12 @@ class Setup:
     entry: float
     stop: float
     t1: float
-    t2: float
+    t2: float | None
     r_multiple_t1: float
     base: Base
     stop_basis: str
     t1_basis: str
+    t2_basis: str | None = None
     score_total: float = 0.0
     score_breakdown: dict = field(default_factory=dict)
     # Diagnostic only — no gate reads this. See extension_metrics().
@@ -158,6 +160,15 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
         depth = (pivot - base_low) / pivot * 100
         if depth > 35:
             _note("base_too_deep")
+            continue
+        if depth < MIN_BASE_DEPTH_PCT:
+            # A 1% range over 15 sessions is not a base, it is noise. This
+            # is a setup-quality question, separate from position sizing:
+            # the ATR floor downstream already protects sizing by rejecting
+            # a stop too tight to clear normal daily range, but that leaves
+            # the SETUP itself validated as if the noise were a real base.
+            # It was not — there was no genuine contraction to measure.
+            _note("base_too_shallow")
             continue
 
         # Prior uptrend: a base with nothing to consolidate is not a base.
@@ -263,17 +274,39 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
                 raise Rejected("gate5", "exhaustion_candle")
         return "breakout"
 
-    # Pullback into the 20 EMA while still inside the base
+    # Pullback into the 20 EMA while still inside the base.
+    #
+    # The prior test only checked distance from the average — abs(close -
+    # ema)/ema < 3% — which fires whether price is above or below it, and
+    # never checks the pullback against the base at all. A stock sliding
+    # DOWN through its base on the way to breaking it prints the same
+    # bullish reversal bar as one holding support 3% above the average.
+    #
+    # Three real conditions now gate it, all read from price that printed:
+    #   1. Close sits AT or just ABOVE the average (0% to +3%), not below —
+    #      a pullback that has broken the average is not "into" it.
+    #   2. The average itself is rising over the last 10 sessions — the
+    #      trend the pullback is buying into must still be intact.
+    #   3. The bar's low held above the base low — a pullback that breaks
+    #      the floor of its own base has invalidated the base, not paused.
     ema20 = float(last["ema20"]) if pd.notna(last["ema20"]) else None
-    if ema20 and abs(float(last["close"]) - ema20) / ema20 < 0.03:
-        prev = df.iloc[-2]
-        bullish = (
-            last["close"] > last["open"]
-            and last["close"] > (prev["high"] + prev["low"]) / 2
-            and last["low"] <= prev["low"]
-        )
-        if bullish and (vol50 == 0 or last["volume"] < vol50):
-            return "pullback"
+    ema20_prior = (float(df["ema20"].iloc[-11])
+                  if len(df) > 10 and pd.notna(df["ema20"].iloc[-11]) else None)
+
+    if ema20:
+        near_ema = ema20 <= float(last["close"]) <= ema20 * 1.03
+        ema_rising = ema20_prior is not None and ema20 > ema20_prior
+        held_base = float(last["low"]) >= base.base_low
+
+        if near_ema and ema_rising and held_base:
+            prev = df.iloc[-2]
+            bullish = (
+                last["close"] > last["open"]
+                and last["close"] > (prev["high"] + prev["low"]) / 2
+                and last["low"] <= prev["low"]
+            )
+            if bullish and (vol50 == 0 or last["volume"] < vol50):
+                return "pullback"
 
     # --- armed: coiling under the pivot, no trigger yet ------------------
     #
@@ -300,6 +333,24 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
         if base.volume_dryup > 1.1:
             raise Rejected("gate5", "no_volume_dryup",
                            {"dryup": round(base.volume_dryup, 2)})
+
+        # A single-bar close-vs-midpoint test can pass a stock that spent
+        # its recent sessions trading in the LOWER half before one bar
+        # recovered. Tested: a base dipping to its low, sitting there for a
+        # week, then rallying to close above the midpoint passed the
+        # existing check, because that check only looks at the last bar.
+        # This looks at the PRICE RANGE of the same final third of the base
+        # the volume dry-up is measured over — if that whole window traded
+        # in the lower half, the "dry-up" is a stock going quiet on the way
+        # down, not a stock coiling near resistance.
+        third = max(base.duration // 3, 3)
+        recent_bars = df.iloc[-third:]
+        recent_mid = float((recent_bars["high"].max() + recent_bars["low"].min()) / 2)
+        base_mid = (base.pivot + base.base_low) / 2
+        if recent_mid < base_mid:
+            raise Rejected("gate5", "dryup_in_lower_half",
+                           {"recent_mid": round(recent_mid, 2),
+                            "base_mid": round(base_mid, 2)})
         return "armed"
 
     raise Rejected("gate5", "no_trigger",
@@ -383,6 +434,16 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str,
                        {"stop_pct": round(risk / entry * 100, 2)})
 
     # --- targets: measured move vs the nearest real overhead supply ------
+    #
+    # T1 uses the measuring principle — base height projected from the
+    # pivot — which is standard technical analysis, not an invented number.
+    # T2 previously padded to "measured + (measured-pivot)*0.5" whenever no
+    # second level existed above the measured move. That 0.5 multiplier
+    # never traded; it is exactly the kind of manufactured level removed
+    # from the trail (breakeven, ATR chandelier) and it does not belong
+    # here either. A stock breaking to new highs — often the strongest
+    # setups, since nothing overhead has ever stopped it — now gets T1
+    # only. No second target is invented in its place.
     measured = base.pivot + (base.pivot - base.base_low)
 
     supply = None
@@ -392,10 +453,14 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str,
             supply = high if supply is None else min(supply, high)
 
     if supply is not None and supply < measured:
-        t1, t1_basis, t2 = supply, "overhead_supply", measured
+        t1, t1_basis = supply, "overhead_supply"
+        t2, t2_basis = measured, "measured_move"
+    elif supply is not None and supply > measured:
+        t1, t1_basis = measured, "measured_move"
+        t2, t2_basis = supply, "overhead_supply"
     else:
         t1, t1_basis = measured, "measured_move"
-        t2 = supply if supply and supply > measured else measured + (measured - base.pivot) * 0.5
+        t2, t2_basis = None, None
 
     r_multiple = (t1 - entry) / risk
     if r_multiple < MIN_RR:
@@ -404,9 +469,9 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str,
                         "t1_basis": t1_basis})
 
     return {"entry": round(entry, 2), "stop": round(stop, 2),
-            "t1": round(t1, 2), "t2": round(t2, 2),
+            "t1": round(t1, 2), "t2": round(t2, 2) if t2 is not None else None,
             "r_multiple_t1": round(r_multiple, 2),
-            "stop_basis": stop_basis, "t1_basis": t1_basis}
+            "stop_basis": stop_basis, "t1_basis": t1_basis, "t2_basis": t2_basis}
 
 
 def extension_metrics(df: pd.DataFrame, entry: float) -> dict:
@@ -588,9 +653,12 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
         entry=levels["entry"], stop=levels["stop"], t1=levels["t1"], t2=levels["t2"],
         r_multiple_t1=levels["r_multiple_t1"], base=base,
         stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
+        t2_basis=levels.get("t2_basis"),
         score_total=total, score_breakdown=breakdown,
         extension=extension, provisional=provisional,
         notes=[f"base {base.duration}d, depth {base.depth_pct:.1f}%"
                + (", contracting" if base.contracting else ""),
-               f"stop from {levels['stop_basis']}", f"T1 from {levels['t1_basis']}"],
+               f"stop from {levels['stop_basis']}", f"T1 from {levels['t1_basis']}"]
+              + ([f"T2 from {levels['t2_basis']}"] if levels.get('t2_basis') else
+                 ["no second target — no overhead level beyond the measured move"]),
     )

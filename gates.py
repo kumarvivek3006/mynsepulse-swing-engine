@@ -72,22 +72,57 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def weekly_structure_ok(df: pd.DataFrame, weeks: int = 12) -> bool:
     """
-    Higher highs and higher lows on the weekly chart.
+    Weekly trend confirmation, Weinstein Stage 2.
 
-    Resampled from daily rather than read from a weekly table so there is
-    one source of truth for price. Requires the most recent swing to be
-    above the prior one on both highs and lows — a stock making higher
-    highs on lower lows is broadening, not trending.
+    The previous test required the last 6 weeks to exceed the prior 6 on BOTH
+    highs and lows. That rejects a stock for the pullbacks a base is made of:
+    one lower weekly low anywhere in six weeks failed it. Measured on live
+    data it removed 10-17 candidates a day — about 13% of everything clearing
+    the moving-average tests — including stocks that then broke out days
+    later, by which time the entry had gone.
+
+    A six-week window is short enough that noise dominates. The canonical
+    weekly test is Weinstein's: price above a RISING 30-week moving average.
+    That is what defines Stage 2, and it tolerates the pullbacks within a
+    base while still excluding stocks in downtrends.
+
+    Three requirements, all trend properties rather than window comparisons:
+
+      1. Weekly close above the 30-week moving average
+      2. That average rising over the last 8 weeks
+      3. Higher highs over a 13-week span, so the stock is making new ground
+
+    Higher LOWS are deliberately not required over a short window. A base is
+    a pullback; demanding it never makes one is demanding it never bases.
     """
     w = (df.set_index(pd.to_datetime(df["trade_date"]))
            .resample("W")
            .agg({"high": "max", "low": "min", "close": "last"})
            .dropna())
-    if len(w) < weeks:
+    if len(w) < 32:
         return False
-    recent, prior = w.iloc[-weeks // 2:], w.iloc[-weeks:-weeks // 2]
-    return (recent["high"].max() > prior["high"].max()
-            and recent["low"].min() > prior["low"].min())
+
+    ma30 = w["close"].rolling(30).mean()
+    if pd.isna(ma30.iloc[-1]) or pd.isna(ma30.iloc[-9]):
+        return False
+
+    above_ma = float(w["close"].iloc[-1]) > float(ma30.iloc[-1])
+    ma_rising = float(ma30.iloc[-1]) > float(ma30.iloc[-9])
+
+    span = min(13, len(w) // 2)
+    recent_high = float(w["high"].iloc[-span:].max())
+    prior_high = float(w["high"].iloc[-2 * span:-span].max())
+    higher_highs = recent_high > prior_high
+
+    # A guard against a stock that has broken down badly: the most recent
+    # 13-week low must hold above the low of the period before it. This is
+    # the same intent as the old higher-lows rule, measured over a span long
+    # enough that a base pullback does not fail it.
+    recent_low = float(w["low"].iloc[-span:].min())
+    prior_low = float(w["low"].iloc[-2 * span:-span].min())
+    not_broken = recent_low > prior_low * 0.90
+
+    return bool(above_ma and ma_rising and higher_highs and not_broken)
 
 
 # ---------------------------------------------------------------------

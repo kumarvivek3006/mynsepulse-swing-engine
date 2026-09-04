@@ -454,6 +454,10 @@ def signals(request: Request):
         r["is_add_on"] = bool(_notes.get("is_add_on"))
         r["is_transition"] = bool(_notes.get("is_transition"))
         r["is_provisional"] = bool(_notes.get("is_provisional"))
+        # t2 can be genuinely absent now (no manufactured pad). t2_basis lets
+        # the UI say "no second target — new-high breakout" rather than
+        # rendering an empty field that looks like missing data.
+        r["t2_basis"] = _notes.get("t2_basis")
         r["is_new_opportunity"] = bool(_notes.get("is_new_opportunity"))
 
         # Live progress against the levels. Everything here is derived from
