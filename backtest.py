@@ -495,6 +495,43 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
         cross = _build_cross_section(conn, universe)
         rs_pct, grp_pct = cross["rs_pct"], cross["group_pct"]
 
+        # Delivery-expansion state per (symbol, date), for the armed-quality
+        # test below. Armed is 85% of every signal produced and the worst
+        # performer in every run so far (-0.15R to -0.20R, three years
+        # running) — it is the one setup type that asserts nothing has
+        # happened yet, rather than reacting to a confirmed bar. Delivery
+        # expansion is the one confirming signal the engine already computes
+        # (for the Stage 1 transition path) but does not apply to ordinary
+        # armed setups. This tests whether it should, WITHOUT changing what
+        # the live engine gates on — measured first, same as everything else.
+        with conn.cursor() as cur:
+            cur.execute("""
+                select symbol, trade_date, delivery_pct
+                from delivery_daily
+                where symbol = any(%s) and delivery_pct is not null
+                order by symbol, trade_date
+            """, (universe,))
+            drows = cur.fetchall()
+        delivery_by_symbol: dict[str, list] = {}
+        for sym_, dd, pct in drows:
+            delivery_by_symbol.setdefault(sym_, []).append((dd, float(pct)))
+        del drows
+
+        def _delivery_expanding(sym_: str, as_of: date) -> str:
+            """'confirmed', 'not_confirmed', or 'unknown' (insufficient history)."""
+            series = delivery_by_symbol.get(sym_)
+            if not series:
+                return "unknown"
+            recent = [p for dd, p in series if dd <= as_of][-40:]
+            if len(recent) < 20:
+                return "unknown"
+            last10 = sum(recent[-10:]) / min(10, len(recent[-10:]))
+            prior = recent[:-10]
+            if not prior:
+                return "unknown"
+            prior_avg = sum(prior) / len(prior)
+            return "confirmed" if last10 > prior_avg * 1.1 else "not_confirmed"
+
         trades: list[dict] = []
         day_set = set(trading_days)
 
@@ -569,6 +606,28 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "rs_quintile": _quintile(rs_pct.get((sym, d))),
                     "group_pct": grp_pct.get((sym, d)),
                     "group_quintile": _quintile(grp_pct.get((sym, d))),
+                    # Base-quality quartile: the INTERNAL formula detect_base
+                    # uses to pick which of ~20 candidate lookback windows to
+                    # keep (tightness, dry-up, contraction, duration, prior
+                    # gain) has never itself been checked against outcomes —
+                    # only the downstream trade score has. If quality does
+                    # not separate results either, the window-selection
+                    # formula is picking noise that merely looks tidy.
+                    "base_quality_quartile": _quintile(
+                        min(setup.base.quality, 100)) if setup.base.quality is not None
+                        else "unknown",
+
+                    # Armed-specific tests. Both null for breakout/pullback —
+                    # only meaningful where the setup type has no confirmed
+                    # trigger bar of its own.
+                    "armed_delivery": (
+                        _delivery_expanding(sym, d)
+                        if setup.setup_type.startswith("armed") else "n/a"),
+                    "armed_distance_band": (
+                        ("tight_0_2pct" if (setup.base.pivot / float(window["close"].iloc[-1]) - 1) * 100 <= 2
+                         else "wide_2_4pct")
+                        if setup.setup_type.startswith("armed") else "n/a"),
+
                     # Pre-specified intersection, not a general cross-tab.
                     # Crossing every setup type against every RSI zone would
                     # create 15 cells on 1,602 trades; something would look
@@ -688,7 +747,8 @@ def split_sample(trades: list[dict]) -> dict:
     MIN_N = 25          # below this a half is noise, not evidence
     for key in ("band", "setup_type", "pattern", "regime", "index_state",
                 "rsi_zone", "rs_quintile", "group_quintile", "contracting",
-                "breakout_rsi"):
+                "breakout_rsi", "base_quality_quartile", "armed_delivery",
+                "armed_distance_band"):
         for name in set(a.get(key, {})) | set(b.get(key, {})):
             sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
             if not sa or not sb:
@@ -776,7 +836,8 @@ def summarise(trades: list[dict]) -> dict:
     out = {"overall": stats(trades)}
     for key in ("band", "regime", "setup_type", "pattern", "index_state",
                 "rsi_zone", "rs_quintile", "group_quintile", "contracting",
-                "breakout_rsi"):
+                "breakout_rsi", "base_quality_quartile", "armed_delivery",
+                "armed_distance_band"):
         out[key] = {v: stats([t for t in trades if t.get(key) == v])
                     for v in sorted({t.get(key) for t in trades if t.get(key)})}
 
