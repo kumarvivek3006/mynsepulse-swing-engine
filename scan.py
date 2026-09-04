@@ -536,6 +536,13 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             rs126 = relative_strength(df, nifty, 126)
             last = df.iloc[-1]
             counts["passed_gates_0_3"] = counts.get("passed_gates_0_3", 0) + 1
+            # Recorded, not just counted. gate_log held rejections and final
+            # signals but no intermediate pass, so the funnel could not be
+            # reconstructed for any past day — only for whatever scan summary
+            # happened to be the most recent. Without this, "why so few
+            # signals" is unanswerable historically.
+            log_rows.append((as_of, sym, None, "passed_gates_0_3",
+                             json.dumps({"rs63": rs63, "rs126": rs126})))
 
             # Gates 4-7. In a risk-off regime the correct output is nothing,
             # so setups are not even constructed — an empty list is the
