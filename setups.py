@@ -22,6 +22,17 @@ import pandas as pd
 
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
 MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "4"))
+
+# Flag/pennant: a genuinely different animal from the 15-120 session bases
+# above. A short, tight consolidation (1-3 weeks) immediately after a
+# STEEP, RECENT advance — the flagpole. Below BASE_MIN_SESSIONS, so it
+# cannot be found by widening the existing search; it needs its own path.
+FLAG_MIN_SESSIONS = int(os.environ.get("FLAG_MIN_SESSIONS", "5"))
+FLAG_MAX_SESSIONS = int(os.environ.get("FLAG_MAX_SESSIONS", "15"))
+FLAGPOLE_LOOKBACK = int(os.environ.get("FLAGPOLE_LOOKBACK", "20"))
+FLAGPOLE_MIN_GAIN_PCT = float(os.environ.get("FLAGPOLE_MIN_GAIN_PCT", "20"))
+FLAG_MIN_DEPTH_PCT = float(os.environ.get("FLAG_MIN_DEPTH_PCT", "2"))
+FLAG_MAX_DEPTH_PCT = float(os.environ.get("FLAG_MAX_DEPTH_PCT", "15"))
 BASE_MAX_SESSIONS = int(os.environ.get("BASE_MAX_SESSIONS", "120"))
 BREAKOUT_VOL_MULT = float(os.environ.get("BREAKOUT_VOL_MULT", "1.5"))
 # How close to the pivot a stock must sit to be worth arming an order on.
@@ -55,6 +66,10 @@ class Base:
     # A VCP is a shape PLUS a contraction. Kept separate so the shape label
     # is never overwritten by the quality.
     contracting: bool = False
+    # OBV rising while price is flat/consolidating — the textbook Wyckoff
+    # accumulation signature. Real evidence a base is being bought into,
+    # distinct from a stock that is merely quiet because nobody wants it.
+    obv_rising: bool = False
 
 
 @dataclass
@@ -97,6 +112,75 @@ def swing_lows(df: pd.DataFrame, span: int = 3) -> list[int]:
         if lows[i] == window.min() and (window > lows[i]).sum() >= span:
             out.append(i)
     return out
+
+
+def _find_local_minima(low_arr, span: int) -> list[int]:
+    """Same test as swing_lows(), on a raw array — a low with `span` higher
+    lows either side. Used for shoulder/head detection below."""
+    out = []
+    n = len(low_arr)
+    for i in range(span, n - span):
+        window = low_arr[i - span:i + span + 1]
+        if low_arr[i] == window.min() and (window > low_arr[i]).sum() >= span:
+            out.append(i)
+    return out
+
+
+def _is_inverse_head_shoulders(seg_high, seg_low, duration: int) -> bool:
+    """
+    Three troughs, not one: left shoulder, head, right shoulder — the head
+    the deepest of the three, both shoulders comparable to each other, the
+    head clearly separated in time from both.
+
+    The pivot detect_base already computes (highest high in the older 70%
+    of the window) needs no special handling for this pattern: in a
+    well-formed inverse H&S the neckline peak between the head and right
+    shoulder IS that highest high, since it sits later than the left
+    shoulder's peak and before the final 30% cutoff. So this only refines
+    the LABEL — entry, stop and target are computed identically to every
+    other pattern, from the same pivot and base low.
+    """
+    span = max(2, duration // 15)
+    raw_troughs = _find_local_minima(seg_low, span)
+    if len(raw_troughs) < 3:
+        return False
+
+    # Adjacent indices commonly both register as "local minima" either side
+    # of a discretized trough's true bottom — tested directly: a smooth
+    # parabolic dip produced two adjacent trough indices, and without this
+    # merge step the triple-matching below paired both points from the SAME
+    # dip as if they were separate shoulders, never reaching the real head.
+    troughs = [raw_troughs[0]]
+    for idx in raw_troughs[1:]:
+        if idx - troughs[-1] <= span:
+            if seg_low[idx] < seg_low[troughs[-1]]:
+                troughs[-1] = idx
+        else:
+            troughs.append(idx)
+    if len(troughs) < 3:
+        return False
+
+    for i in range(len(troughs) - 2):
+        left, head, right = troughs[i], troughs[i + 1], troughs[i + 2]
+        left_low, head_low, right_low = seg_low[left], seg_low[head], seg_low[right]
+
+        if not (head_low < left_low and head_low < right_low):
+            continue                                    # head must be deepest
+
+        left_depth = left_low - head_low
+        right_depth = right_low - head_low
+        if left_depth <= 0 or right_depth <= 0:
+            continue
+        if min(left_depth, right_depth) / max(left_depth, right_depth) < 0.5:
+            continue                                    # shoulders too dissimilar
+
+        if (head - left) < 3 or (right - head) < 3:
+            continue                                    # not enough separation
+        if right > duration - 3:
+            continue                                    # need room after the pattern completes
+
+        return True
+    return False
 
 
 def swing_highs(df: pd.DataFrame, span: int = 3) -> list[int]:
@@ -155,6 +239,7 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
     n = len(df)
     highs, lows, closes = df["high"].values, df["low"].values, df["close"].values
     volumes = df["volume"].values
+    obv = df["obv"].values if "obv" in df.columns else None
 
     best: Base | None = None
 
@@ -239,6 +324,17 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         pattern = _classify(seg_high, seg_low, depth, lookback, contraction)
         contracting = bool(contraction < 0.6 and depth < 25)
 
+        # Deliberately NOT added into the quality score below. That formula
+        # is the one measured to be inverted — its own top-rated quartile
+        # was the worst performer in the backtest — and mixing a genuine
+        # signal into an already-unreliable one risks diluting the signal
+        # rather than fixing the formula. This is surfaced as a visible,
+        # separate fact instead: did cumulative buying pressure actually
+        # rise over the life of this base, real accumulation, versus a
+        # stock that is merely flat because nobody is trading it.
+        obv_rising = bool(
+            obv is not None and obv[-1] > obv[seg_start]) if obv is not None else False
+
         quality = (
             (1.0 - min(depth / 35, 1.0)) * 30           # tighter is better
             + max(0.0, 1.0 - dryup) * 25               # volume drying up
@@ -249,7 +345,7 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
 
         candidate = Base(pattern, seg_start, pivot_idx, pivot, base_low, depth,
                          lookback, dryup, contraction, prior_gain, quality,
-                         contracting)
+                         contracting, obv_rising)
 
         if strategy == "first_valid":
             # Stop at the first legitimate window — no ranking against the
@@ -265,6 +361,72 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
     return best
 
 
+def _is_cup_and_handle(seg_high, seg_low, duration: int,
+                       highs_first: float, highs_last: float) -> bool:
+    """
+    Real O'Neil criteria — this is the fix, not the proxy it replaces.
+
+    The previous test was `lows_last > lows_first`: any base deeper than
+    15% whose ending low sat above its starting low. That has no shape
+    requirement at all and labels a wide range of non-cup structures —
+    ascending bases, partial recoveries, plain consolidations — as
+    "cup-and-handle". The pattern backtested at -0.36R because the SAMPLE
+    was wrong, not because cup-and-handle itself is weak; O'Neil's own
+    research treats it as one of the four reliable base types.
+
+    Four real checks, each against a documented criterion:
+
+      1. Right side reaches back near the left side (within ~15%) — a base
+         recovering to well below its own starting high is a partial
+         recovery, not a cup.
+      2. The base's deepest point sits in the cup, not the handle — a
+         genuine handle never makes a new low.
+      3. The handle stays in the UPPER HALF of the cup's full range.
+      4. The handle is shallower than half the cup's own depth — O'Neil:
+         typically 10-15%, never approaching the cup's depth.
+    """
+    handle_len = max(5, min(duration // 4, 15))
+    if duration - handle_len < 10:
+        return False        # not enough cup left once the handle is set aside
+
+    cup_portion = seg_low[:-handle_len]
+    cup_low_idx = int(np.argmin(cup_portion))
+    cup_low = float(cup_portion[cup_low_idx])
+    cup_high = float(seg_high[:-handle_len].max())
+    handle_low = float(seg_low[-handle_len:].min())
+    handle_high = float(seg_high[-handle_len:].max())
+    if cup_high <= 0 or cup_low <= 0 or handle_high <= 0:
+        return False
+
+    # A genuine cup DECLINES first, then recovers. A monotonically rising
+    # series — a plain ascending base or triangle — has its minimum at the
+    # very start almost by definition, and would otherwise pass every check
+    # below with no cup shape at all: tested directly against a real
+    # ascending triangle (flat top, steadily rising lows, no dip), it was
+    # wrongly accepted as a cup until this check was added. Requiring the
+    # low to sit meaningfully inside the window, not at the edge, is what
+    # actually enforces "declined, then recovered" rather than "rose".
+    if cup_low_idx < len(cup_portion) * 0.10:
+        return False
+
+    if highs_first <= 0 or highs_last < highs_first * 0.85:
+        return False                                    # check 1
+
+    if handle_low < cup_low:
+        return False                                    # check 2
+
+    cup_mid = cup_low + 0.5 * (cup_high - cup_low)
+    if handle_low < cup_mid:
+        return False                                    # check 3
+
+    cup_depth = (cup_high - cup_low) / cup_high
+    handle_depth = (handle_high - handle_low) / handle_high
+    if handle_depth > cup_depth * 0.5:
+        return False                                    # check 4
+
+    return True
+
+
 def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
     third = max(duration // 3, 3)
     lows_first = seg_low[:third].min()
@@ -278,16 +440,29 @@ def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
     # Shape is decided by geometry alone. Contraction is a separate quality,
     # reported alongside rather than overriding the shape.
     #
-    # Testing contraction FIRST meant any tight base was labelled "vcp"
-    # regardless of form — a 10%-deep flat base never reached the flat_base
-    # branch. Every pattern statistic read so far was distorted by that
-    # precedence, which is why flat_base looked rare.
-    if flat_resistance and rising_lows:
-        return "asc_triangle"
+    # cup_and_handle is checked before asc_triangle deliberately: it is the
+    # more specific, harder-to-satisfy claim (four real geometric checks
+    # against one loose pair). A genuine cup can incidentally also satisfy
+    # the flat-resistance-plus-rising-lows test — tested directly, a
+    # constructed textbook cup was swallowed by asc_triangle when that ran
+    # first, and the specific test never got a chance to fire.
     if depth <= 15:
         return "flat_base"
-    if lows_last > lows_first:
+    if _is_inverse_head_shoulders(seg_high, seg_low, duration):
+        # Tried before cup_and_handle: three well-formed troughs is a more
+        # specific, harder-to-satisfy claim than a single dip, so it gets
+        # first refusal the same way cup_and_handle gets first refusal over
+        # the looser asc_triangle test below.
+        return "inverse_head_shoulders"
+    if _is_cup_and_handle(seg_high, seg_low, duration, highs_first, highs_last):
         return "cup_handle"
+    if flat_resistance and rising_lows:
+        return "asc_triangle"
+    if lows_last > lows_first:
+        # A genuine staircase of higher lows that fails the cup criteria
+        # above — O'Neil's fourth classic base type, previously folded
+        # into the cup_handle mislabel with no distinct identity of its own.
+        return "ascending_base"
     return "consolidation"
 
 
@@ -640,6 +815,100 @@ def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
     return round(sum(breakdown[k] for k in parts), 1), breakdown
 
 
+def detect_flag_pennant(df: pd.DataFrame, exclude_last: int = 1) -> Base:
+    """
+    A short, tight consolidation immediately after a steep, recent advance.
+
+    Structurally different from detect_base's 15-120 session search, which
+    is tuned for genuine bases — flags typically run 1-3 weeks, below
+    BASE_MIN_SESSIONS entirely, and what defines one is not the
+    consolidation's own shape but the sharp move that PRECEDES it. Two
+    requirements neither detect_base nor any of its pattern labels check:
+    a flagpole (a steep, recent advance immediately before the
+    consolidation) and volume that contracts inside the flag relative to
+    the pole that formed it.
+
+    Called only as a fallback in build_setup, when the standard base search
+    finds nothing — this can only ADD coverage for a structurally distinct,
+    shorter-timeframe setup, never override or compete with an
+    already-valid longer base.
+    """
+    df = df.iloc[:-exclude_last] if exclude_last else df
+    n = len(df)
+    highs, lows, closes = df["high"].values, df["low"].values, df["close"].values
+    volumes = df["volume"].values
+
+    fail_counts: dict[str, int] = {}
+
+    def _note(reason: str) -> None:
+        fail_counts[reason] = fail_counts.get(reason, 0) + 1
+
+    best: Base | None = None
+
+    for flag_len in range(FLAG_MIN_SESSIONS, FLAG_MAX_SESSIONS + 1):
+        if n - flag_len < FLAGPOLE_LOOKBACK + 5:
+            _note("insufficient_history")
+            continue
+
+        flag_start = n - flag_len
+        flag_high, flag_low = highs[flag_start:], lows[flag_start:]
+
+        pivot = float(flag_high.max())
+        pivot_idx = flag_start + int(np.argmax(flag_high))
+        base_low = float(flag_low.min())
+        if base_low <= 0 or pivot <= 0:
+            _note("bad_low")
+            continue
+
+        depth = (pivot - base_low) / pivot * 100
+        if depth > FLAG_MAX_DEPTH_PCT:
+            _note("flag_too_deep")
+            continue
+        if depth < FLAG_MIN_DEPTH_PCT:
+            _note("flag_too_shallow")
+            continue
+
+        # The flagpole: a steep, RECENT advance immediately before the flag,
+        # not merely "some advance sometime in the last 120 sessions" — the
+        # generic prior-uptrend check used elsewhere is too loose for what
+        # specifically defines this pattern.
+        pole_start = max(0, flag_start - FLAGPOLE_LOOKBACK)
+        pole_window = closes[pole_start:flag_start + 1]
+        if len(pole_window) < 5:
+            _note("no_flagpole_room")
+            continue
+        pole_gain = (pole_window[-1] / pole_window.min() - 1) * 100
+        if pole_gain < FLAGPOLE_MIN_GAIN_PCT:
+            _note("weak_flagpole")
+            continue
+
+        # Volume should contract inside the flag relative to the pole that
+        # formed it — the pole runs on demand, the flag on its absence.
+        pole_vol = volumes[pole_start:flag_start].mean() if flag_start > pole_start else 0.0
+        flag_vol = volumes[flag_start:].mean()
+        dryup = float(flag_vol / pole_vol) if pole_vol > 0 else 1.0
+        if dryup > 1.0:
+            _note("no_volume_dryup")
+            continue
+
+        quality = (
+            (1.0 - min(depth / FLAG_MAX_DEPTH_PCT, 1.0)) * 40
+            + max(0.0, 1.0 - dryup) * 30
+            + min(pole_gain / 60, 1.0) * 30
+        )
+
+        candidate = Base("flag_pennant", flag_start, pivot_idx, pivot, base_low,
+                         depth, flag_len, dryup, dryup, pole_gain, quality,
+                         True, False)
+        if best is None or candidate.quality > best.quality:
+            best = candidate
+
+    if best is None:
+        dominant = max(fail_counts, key=fail_counts.get) if fail_counts else "no_windows"
+        raise Rejected("gate4", f"no_flag_{dominant}", dict(fail_counts))
+    return best
+
+
 # ---------------------------------------------------------------------
 TRANSITION_MIN_BASE_SESSIONS = int(
     os.environ.get("TRANSITION_MIN_BASE_SESSIONS", "60"))
@@ -660,7 +929,18 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     base_strategy is measurement-only — see detect_base. The live engine
     never passes anything but the default.
     """
-    base = detect_base(df, strategy=base_strategy)
+    try:
+        base = detect_base(df, strategy=base_strategy)
+    except Rejected as base_rej:
+        # Fallback only on the live path. The alternate strategies
+        # (first_valid, fixed_window) exist purely to compare window
+        # SELECTION within detect_base's own search — letting a flag
+        # fallback fire underneath them would let identical flag signals
+        # leak into all three, diluting exactly the comparison that
+        # backtest is measuring.
+        if base_strategy != "best_quality":
+            raise
+        base = detect_flag_pennant(df)
 
     if transition:
         if base.duration < TRANSITION_MIN_BASE_SESSIONS:

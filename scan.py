@@ -47,6 +47,13 @@ SIGNAL_EXPIRY_SESSIONS = int(os.environ.get("SIGNAL_EXPIRY_SESSIONS", "5"))
 MIN_SCORE = float(os.environ.get("MIN_SCORE", "65"))
 MIN_SCORE_NEUTRAL = float(os.environ.get("MIN_SCORE_NEUTRAL", "72"))
 MIN_SCORE_RISK_OFF = float(os.environ.get("MIN_SCORE_RISK_OFF", "80"))
+# Trailing-performance throttle. No predictive signal tested distinguished
+# the market conditions that hurt this system from the ones that don't, so
+# this reacts to realised results instead of trying to predict them.
+DRAWDOWN_LOOKBACK = int(os.environ.get("DRAWDOWN_LOOKBACK", "20"))
+DRAWDOWN_MIN_TRADES = int(os.environ.get("DRAWDOWN_MIN_TRADES", "10"))
+DRAWDOWN_THRESHOLD_R = float(os.environ.get("DRAWDOWN_THRESHOLD_R", "-0.15"))
+COOLDOWN_FLOOR_BOOST = float(os.environ.get("COOLDOWN_FLOOR_BOOST", "10"))
 # An intraday run that cannot see the market must not conclude the market
 # is empty. On a holiday, or with a dead token, the forming-bar fetch
 # returns nothing for every symbol — and writing that result would erase
@@ -419,9 +426,26 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                      len(delivery_expanding))
 
         snapshots = load_snapshots(conn)
-        fundamentals_ready = len(snapshots) >= len(universe) * 0.5
-        log.info("Fundamentals: %d symbols with data (gate 2 %s)",
-                 len(snapshots), "enforced" if fundamentals_ready else "advisory only")
+
+        # Coverage alone was the enforcement condition, and it silently kept
+        # vetoing on financials that stopped being current. Confirmed on
+        # this exact database: fundamentals_latest_period sat at 2024-12-31
+        # while the engine used it in September 2026 — 21 months old. A
+        # veto built on 21-month-old accounts is not a partial check, it is
+        # a wrong one, and it looked identical to a healthy check from the
+        # outside. Enforcement now also requires the newest filing to be
+        # within 6 months, not just present for most of the universe.
+        with conn.cursor() as cur:
+            cur.execute("select max(period_end) from fundamentals_quarterly")
+            latest_period = cur.fetchone()[0]
+        fundamentals_fresh = (latest_period is not None
+                              and (as_of - latest_period).days <= 183)
+        fundamentals_ready = (len(snapshots) >= len(universe) * 0.5
+                              and fundamentals_fresh)
+        log.info("Fundamentals: %d symbols with data, latest period %s (gate 2 %s)",
+                 len(snapshots), latest_period,
+                 "enforced" if fundamentals_ready else
+                 "advisory only" + ("" if fundamentals_fresh else " — data stale"))
 
         # --- Gate 1: regime, once for the whole run -------------------
         nifty = _load_symbol(conn, "NIFTY50")
@@ -433,6 +457,38 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
         regime = evaluate_regime(nifty, vix if vix is not None else pd.DataFrame(), breadth)
         log.info("Regime: %s (breadth %.1f%%, vix %s, distribution %d)",
                  regime["state"], breadth, regime["vix"], regime["distribution_days"])
+
+        # Trailing-performance throttle.
+        #
+        # The three-year backtest showed every stock-level and setup-level
+        # filter tested — score, RS, index trend, base quality, liquidity,
+        # volume behaviour — flip from strongly negative to mildly positive
+        # at the same calendar boundary, regardless of which candidates it
+        # was applied to. That means a market-wide condition drives most of
+        # the result, and none of our regime signals (this one included)
+        # were shown to predict it in advance.
+        #
+        # This does not try to predict it either. It reacts to it: if the
+        # engine's own last DRAWDOWN_LOOKBACK closed trades have gone badly,
+        # the score floor rises until performance recovers. Honest response
+        # to an unpredicted regime — tighten up when it's actually hurting,
+        # rather than trying to guess when that will be.
+        with conn.cursor() as cur:
+            cur.execute("""
+                select o.r_realised from signal_outcomes o
+                where o.r_realised is not null
+                order by o.exit_date desc nulls last limit %s
+            """, (DRAWDOWN_LOOKBACK,))
+            recent_r = [float(r[0]) for r in cur.fetchall()]
+        trailing_expectancy = (sum(recent_r) / len(recent_r)
+                               if len(recent_r) >= DRAWDOWN_MIN_TRADES else None)
+        cooldown_active = (trailing_expectancy is not None
+                          and trailing_expectancy < DRAWDOWN_THRESHOLD_R)
+        if cooldown_active:
+            log.warning("Cooldown active: trailing %d trades averaging %.3fR "
+                       "(threshold %.2fR) — score floor raised %d points",
+                       len(recent_r), trailing_expectancy, DRAWDOWN_THRESHOLD_R,
+                       COOLDOWN_FLOOR_BOOST)
 
         with conn.cursor() as cur:
             cur.execute("""
@@ -579,6 +635,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             floor_pct = {"risk_on": MIN_SCORE,
                          "neutral": MIN_SCORE_NEUTRAL,
                          "risk_off": MIN_SCORE_RISK_OFF}[regime["state"]]
+            if cooldown_active:
+                floor_pct += COOLDOWN_FLOOR_BOOST
             floor = round(floor_pct * max_possible / 100.0, 1)
             if setup.score_total < floor:
                 counts["below_min_score"] = counts.get("below_min_score", 0) + 1
@@ -607,6 +665,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "setup_type": setup.setup_type,
                 "pattern": setup.pattern,
                 "contracting": setup.base.contracting,
+                "obv_rising": setup.base.obv_rising,
                 "entry_trigger": setup.entry,
                 "stop_loss": setup.stop,
                 "t1": setup.t1,
@@ -637,6 +696,23 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
 
         intraday_frames.clear()
         gc.collect()
+
+        # Same-day RS percentile, not a historical one.
+        #
+        # The score has been measured and shown to carry no information —
+        # bands_separate came back false on every three-year backtest run,
+        # and the high band has never once been reached. RS is the only
+        # ranking signal that showed any structure in the portfolio
+        # construction tests. This does not replace the score or gate
+        # anything; it is a second, better-evidenced number for prioritising
+        # when several signals compete for capital on the same day.
+        rs_values = sorted(s_["rs63"] for s_ in signals if s_.get("rs63") is not None)
+        for s_ in signals:
+            if s_.get("rs63") is not None and rs_values:
+                rank = sum(1 for v in rs_values if v <= s_["rs63"])
+                s_["rs_rank_pct"] = round(rank / len(rs_values) * 100, 1)
+            else:
+                s_["rs_rank_pct"] = None
 
         signals.sort(key=lambda s: -s["score_total"])
 
@@ -824,6 +900,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                       json.dumps({"stop_basis": s_["stop_basis"],
                                   "t1_basis": s_["t1_basis"],
                                   "t2_basis": s_.get("t2_basis"),
+                                  "rs_rank_pct": s_.get("rs_rank_pct"),
                                   "is_add_on": s_["is_add_on"],
                                   "is_transition": s_["is_transition"],
                                   "is_provisional": s_["is_provisional"],
@@ -832,6 +909,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                                   "close": s_["close"], "atr14": s_["atr14"],
                                   "extension": s_["extension"],
                                   "contracting": s_["contracting"],
+                                  "obv_rising": s_["obv_rising"],
                                   "notes": s_["notes"]}),
                       as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2),
                       first_seen.get(s_["symbol"])))
@@ -876,6 +954,15 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": fundamentals_ready,
             "gate2_coverage": len(snapshots),
+            "gate2_fundamentals_fresh": fundamentals_fresh,
+            "cooldown": {
+                "active": cooldown_active,
+                "trailing_trades": len(recent_r),
+                "trailing_expectancy_r": round(trailing_expectancy, 3)
+                if trailing_expectancy is not None else None,
+                "threshold_r": DRAWDOWN_THRESHOLD_R,
+                "floor_boost_pct": COOLDOWN_FLOOR_BOOST if cooldown_active else 0,
+            },
             "freshness": freshness,
             "invalidated": invalidated,
             "new_opportunities": new_opportunities,

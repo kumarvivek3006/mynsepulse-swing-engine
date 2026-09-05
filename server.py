@@ -458,6 +458,8 @@ def signals(request: Request):
         # the UI say "no second target — new-high breakout" rather than
         # rendering an empty field that looks like missing data.
         r["t2_basis"] = _notes.get("t2_basis")
+        r["rs_rank_pct"] = _notes.get("rs_rank_pct")
+        r["obv_rising"] = bool(_notes.get("obv_rising"))
         r["is_new_opportunity"] = bool(_notes.get("is_new_opportunity"))
 
         # Live progress against the levels. Everything here is derived from

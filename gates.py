@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import pandas as pd
+import numpy as np
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,43 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vol50"] = df["volume"].rolling(50).mean()
     df["turnover_cr"] = (c * df["volume"]) / 1e7
     df["turnover20_cr"] = df["turnover_cr"].rolling(20).median()
+
+    # RSI(14), Wilder smoothing. Added specifically to enforce the one
+    # momentum-based finding that held sign in both halves of the backtest:
+    # setups firing while RSI sits in 40-55 lose money consistently.
+    # Overbought (70+) was the BEST zone measured, so this is not a general
+    # RSI filter — it excludes only the weak middle, not high momentum.
+    delta = c.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi14"] = 100 - 100 / (1 + rs)
+    # avg_loss == 0 with real gains is genuine strength (100). avg_loss == 0
+    # with NO gains either is a dormant, flat series — neutral 50, not 100.
+    # Missed this the first time; caught by the same flat-series check that
+    # caught the identical bug in the backtest's copy of this calculation.
+    dormant = (avg_loss == 0) & (avg_gain == 0)
+    df["rsi14"] = df["rsi14"].where(avg_loss != 0, 100.0)
+    df["rsi14"] = df["rsi14"].where(~dormant, 50.0)
+
+    # On-Balance Volume — standard definition, no variation. Added to give
+    # the engine a genuine way to tell "quiet because being accumulated"
+    # from "quiet because abandoned", which an RSI level alone cannot do: a
+    # stock can sit at RSI 45 either because smart money is patiently
+    # buying into weakness, or because nobody is trading it at all. OBV
+    # rising while price is flat is the textbook accumulation signature;
+    # OBV flat or falling while price is flat is not.
+    price_change = c.diff()
+    obv_step = df["volume"].where(price_change > 0, 0.0)
+    obv_step = obv_step.where(price_change >= 0, -df["volume"])
+    # The first bar has no prior close, so price_change is NaN there. NaN
+    # comparisons are False, which fell through to the "down day" branch and
+    # subtracted volume from a bar that had no direction at all — caught by
+    # checking the actual sequence against a hand-computed one.
+    obv_step = obv_step.where(price_change.notna(), 0.0)
+    df["obv"] = obv_step.cumsum()
 
     window52 = 250
     df["high52"] = h.rolling(window52, min_periods=100).max()
