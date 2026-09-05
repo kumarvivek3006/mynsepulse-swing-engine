@@ -514,13 +514,40 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
         held_base = float(last["low"]) >= base.base_low
 
         if near_ema and ema_rising and held_base:
+            # Testing a REAL level, not an arbitrary one-day comparison.
+            #
+            # The prior test was `last.low <= prev.low` — comparing only to
+            # yesterday. A multi-day pullback's actual low often printed
+            # several sessions earlier; a single-day comparison can pass on
+            # a random daily wiggle that never tested any real support, or
+            # miss the genuine reversal because it happened before "prev".
+            # The confirmed-swing-low finder already used for stop
+            # selection gives a real reference: today's low should sit at
+            # or just above the most recent one, showing an actual retest,
+            # not an arbitrary undercut of one prior close.
+            recent_lows = swing_lows(df.iloc[base.start_idx:], span=2)
+            reference_low = (float(df["low"].iloc[base.start_idx + recent_lows[-1]])
+                             if recent_lows else None)
+
             prev = df.iloc[-2]
+            testing_real_level = (
+                reference_low is not None and float(last["low"]) <= reference_low * 1.02
+                if reference_low is not None
+                else float(last["low"]) <= float(prev["low"])   # no confirmed low yet — fall back
+            )
+
             bullish = (
                 last["close"] > last["open"]
                 and last["close"] > (prev["high"] + prev["low"]) / 2
-                and last["low"] <= prev["low"]
+                and testing_real_level
             )
-            if bullish and (vol50 == 0 or last["volume"] < vol50):
+            # Requiring volume BELOW average on the reversal bar was
+            # backward: light volume during the drift down is constructive,
+            # but on the actual reversal day, renewed demand showing up as
+            # volume is a BETTER signal than a quiet bounce, not a worse
+            # one. That requirement previously excluded exactly the
+            # stronger pullbacks — reversals confirmed by real buying.
+            if bullish:
                 return "pullback"
 
     # --- armed: coiling under the pivot, no trigger yet ------------------
@@ -566,6 +593,22 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
             raise Rejected("gate5", "dryup_in_lower_half",
                            {"recent_mid": round(recent_mid, 2),
                             "base_mid": round(base_mid, 2)})
+
+        # Today's OWN candle shape — position checks above establish WHERE
+        # the close sits; this checks what happened DURING the day to get
+        # there. Tested directly: a day that rallied 3% intraday toward the
+        # pivot and gave nearly all of it back, closing red, still cleared
+        # every position check above and was armed with no warning. The
+        # breakout branch already screens its trigger bar this way
+        # (weak_close_in_range, exhaustion_candle); the armed branch never
+        # examines its own bar at all.
+        if atr > 0 and rng > 0.5 * atr:
+            upper_wick_pct = (float(last["high"]) - close) / rng if rng > 0 else 0.0
+            closed_red = close < float(last["open"])
+            if upper_wick_pct > 0.5 and closed_red:
+                raise Rejected("gate5", "distribution_candle",
+                               {"upper_wick_pct": round(upper_wick_pct * 100, 1)})
+
         return "armed"
 
     raise Rejected("gate5", "no_trigger",
