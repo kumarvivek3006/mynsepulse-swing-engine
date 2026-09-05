@@ -378,6 +378,43 @@ def _build_cross_section(conn, universe: list[str]) -> dict:
     return {"rs_pct": rs_pct, "group_pct": grp_pct, "industry": industry}
 
 
+def _volume_asymmetry(window: pd.DataFrame, start_idx: int) -> float | None:
+    """
+    Buying pressure versus selling pressure WITHIN the base, as a ratio in
+    [-1, 1]: (up-day volume - down-day volume) / total volume.
+
+    The dry-up term in detect_base's quality formula only asks "how much
+    total volume", never "on which days". A stock going quiet because
+    smart money is patiently absorbing supply typically still shows more
+    volume on its up days than its down days. A stock going quiet because
+    nobody is interested shows no such asymmetry — volume is just uniformly
+    thin. The formula currently scores both as identically "dried up",
+    which is the leading hypothesis for why its top-rated quartile is the
+    worst performer measured so far.
+    """
+    base_bars = window.iloc[start_idx:]
+    if len(base_bars) < 5:
+        return None
+    closes = base_bars["close"].to_numpy()
+    vols = base_bars["volume"].to_numpy()
+    up_vol = float(vols[1:][closes[1:] > closes[:-1]].sum())
+    down_vol = float(vols[1:][closes[1:] < closes[:-1]].sum())
+    total = up_vol + down_vol
+    if total <= 0:
+        return None
+    return (up_vol - down_vol) / total
+
+
+def _asymmetry_band(a: float | None) -> str:
+    if a is None:
+        return "unknown"
+    if a > 0.1:
+        return "buying_pressure"
+    if a < -0.1:
+        return "selling_pressure"
+    return "balanced"
+
+
 def _quintile(pct: float | None) -> str:
     if pct is None:
         return "unknown"
@@ -642,6 +679,8 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                         "near_floor_25_35pct" if setup.base.prior_uptrend_pct < 35 else
                         "35_to_60pct" if setup.base.prior_uptrend_pct < 60 else
                         "over_60pct"),
+                    "volume_asymmetry_band": _asymmetry_band(
+                        _volume_asymmetry(window, setup.base.start_idx)),
 
                     # Armed-specific tests. Both null for breakout/pullback —
                     # only meaningful where the setup type has no confirmed
@@ -765,7 +804,8 @@ def diagnose_quality_quartile(trades: list[dict], quartile: str = "q4") -> dict:
     out = {"quartile": quartile, "cohort_size": len(cohort),
           "overall": stats(cohort)}
 
-    for dim in ("base_depth_band", "liquidity_band", "prior_move_band"):
+    for dim in ("base_depth_band", "liquidity_band", "prior_move_band",
+                       "volume_asymmetry_band"):
         out[dim] = {}
         for val in sorted({t.get(dim) for t in cohort if t.get(dim)}):
             sub = [t for t in cohort if t.get(dim) == val]
