@@ -46,7 +46,7 @@ from gates import (
     relative_strength,
 )
 from ingest import connect
-from setups import Rejected, build_setup
+from setups import BASE_SELECTION_STRATEGIES, Rejected, build_setup
 
 log = logging.getLogger(__name__)
 
@@ -570,6 +570,15 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
             return "confirmed" if last10 > prior_avg * 1.1 else "not_confirmed"
 
         trades: list[dict] = []
+        # One trade list per alternative base-selection strategy, built in
+        # the SAME pass as the main loop below — gate0/gate3 filtering and
+        # window slicing are identical regardless of how the base itself
+        # gets chosen, so there is no reason to re-read OHLCV or re-run the
+        # cheap gates three times. Only base selection and everything
+        # downstream of it (trigger, levels, score, simulation) runs once
+        # per strategy.
+        base_strategy_trades: dict[str, list[dict]] = {
+            s: [] for s in BASE_SELECTION_STRATEGIES if s != "best_quality"}
         day_set = set(trading_days)
 
         for sym in universe:
@@ -622,6 +631,39 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
 
                 fwd = df.iloc[i + 1:][["trade_date", "open", "high", "low", "close"]]
                 result = _simulate(fwd, setup.entry, setup.stop, setup.t1, setup.t2)
+
+                # Alternative base-selection strategies, same window, same
+                # regime/RS/score-floor logic — isolating base selection as
+                # the only variable. A strategy may produce no setup at all
+                # where the default did (different pivot, different trigger
+                # outcome, different R:R) — that is itself part of what is
+                # being measured, not an error.
+                for strat_name in base_strategy_trades:
+                    try:
+                        alt_setup = build_setup(
+                            sym, window,
+                            relative_strength(window, nifty[nifty["trade_date"]
+                                                            <= df["trade_date"].iloc[i]], 63),
+                            relative_strength(window, nifty[nifty["trade_date"]
+                                                            <= df["trade_date"].iloc[i]], 126),
+                            None, base_strategy=strat_name)
+                    except Rejected:
+                        continue
+
+                    alt_ceiling = float(alt_setup.score_breakdown.get(
+                        "max_possible", 100)) or 100
+                    if alt_setup.score_total < floor_pct * alt_ceiling / 100.0:
+                        continue
+
+                    alt_result = _simulate(fwd, alt_setup.entry, alt_setup.stop,
+                                           alt_setup.t1, alt_setup.t2)
+                    base_strategy_trades[strat_name].append({
+                        "symbol": sym, "signal_date": d,
+                        "setup_type": alt_setup.setup_type,
+                        "score_total": alt_setup.score_total,
+                        "band": _band(alt_setup.score_total), "regime": regime,
+                        **(alt_result or {"exit_reason": "never_triggered"}),
+                    })
 
                 # Same signal, same entry, different exit policies. Any
                 # difference is attributable to the exit alone.
@@ -718,7 +760,8 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
             log.debug("%s: %d signals so far", sym, len(trades))
 
         return {"trades": trades, "sessions": len(trading_days),
-                "universe": len(universe)}
+                "universe": len(universe),
+                "base_strategy_trades": base_strategy_trades}
 
     finally:
         conn.close()
@@ -814,6 +857,81 @@ def diagnose_quality_quartile(trades: list[dict], quartile: str = "q4") -> dict:
                 row[half_name] = stats([t for t in half_trades if t.get(dim) == val])
             out[dim][val] = row
 
+    return out
+
+
+def compare_base_strategies(main_trades: list[dict],
+                            base_strategy_trades: dict[str, list[dict]]) -> dict:
+    """
+    Does an alternative base-selection rule beat the current one?
+
+    base_quality_quartile.q4 — the live formula's own TOP-rated bucket — was
+    the worst performer in the backtest, stable across both halves, and four
+    separate follow-up checks (liquidity, depth, prior-move strength, volume
+    asymmetry) each found the badness spread uniformly rather than
+    concentrated in an identifiable confound. That points at the SELECTION
+    MECHANISM — best of ~20 scored candidate windows — rather than any one
+    input to the score.
+
+    "best_quality" here is the CURRENT LIVE approach, included as the
+    baseline so the comparison is apples-to-apples rather than trusting a
+    number computed at a different time. A strategy is only worth adopting
+    if it beats best_quality in BOTH halves — the same bar every other
+    finding in this backtest has had to clear.
+    """
+    all_strategies = {"best_quality": main_trades, **base_strategy_trades}
+
+    def stats(subset):
+        rs = [t["r_realised"] for t in subset if t.get("r_realised") is not None]
+        wins = [r for r in rs if r > 0]
+        return {
+            "signals": len(subset), "filled": len(rs),
+            "hit_rate": round(len(wins) / len(rs), 3) if rs else None,
+            "expectancy_r": round(sum(rs) / len(rs), 3) if rs else None,
+            "total_r": round(sum(rs), 1) if rs else None,
+        }
+
+    out = {}
+    for name, trs in all_strategies.items():
+        dated = sorted([t for t in trs if t.get("signal_date")],
+                       key=lambda t: t["signal_date"])
+        if len(dated) < 40:
+            out[name] = {"error": "too few signals", "n": len(dated)}
+            continue
+        mid = len(dated) // 2
+        first, second = stats(dated[:mid]), stats(dated[mid:])
+        out[name] = {
+            "full": stats(dated),
+            "first_half": first, "second_half": second,
+            "positive_in_both_halves": bool(
+                first["expectancy_r"] is not None and second["expectancy_r"] is not None
+                and first["expectancy_r"] > 0 and second["expectancy_r"] > 0),
+            "beats_best_quality_both_halves": None,   # filled in below
+        }
+
+    baseline = out.get("best_quality", {})
+    for name, row in out.items():
+        if name == "best_quality" or "error" in row:
+            continue
+        bf, bs = baseline.get("first_half", {}), baseline.get("second_half", {})
+        if (row["first_half"].get("expectancy_r") is not None
+                and bf.get("expectancy_r") is not None
+                and row["second_half"].get("expectancy_r") is not None
+                and bs.get("expectancy_r") is not None):
+            row["beats_best_quality_both_halves"] = bool(
+                row["first_half"]["expectancy_r"] > bf["expectancy_r"]
+                and row["second_half"]["expectancy_r"] > bs["expectancy_r"])
+
+    winners = [n for n, r in out.items()
+              if n != "best_quality" and r.get("beats_best_quality_both_halves")]
+    out["verdict"] = {
+        "adopt_candidate": winners[0] if len(winners) == 1 else None,
+        "beats_baseline_both_halves": winners,
+        "note": ("A strategy must beat the current best_quality approach in "
+                 "BOTH halves to be a candidate for live code. Beating it only "
+                 "in the full-period average, or in one half, is the same "
+                 "illusion the split test exists to catch."),
+    }
     return out
 
 

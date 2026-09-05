@@ -112,7 +112,25 @@ def swing_highs(df: pd.DataFrame, span: int = 3) -> list[int]:
 # ---------------------------------------------------------------------
 # Gate 4 — base detection
 # ---------------------------------------------------------------------
-def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
+# Measurement-only alternatives to the live "best_quality" search, added to
+# test whether the composite scoring formula itself is the problem. detect_base
+# was measured against outcomes for the first time via base_quality_quartile:
+# its own TOP-rated bucket (q4) was the WORST performer in the backtest,
+# consistently across both halves (-0.761R, -0.407R), and four separate
+# follow-up checks (liquidity, depth, prior-move strength, volume asymmetry)
+# each found the badness uniform across every sub-slice rather than
+# concentrated in one — meaning no single ingredient explains it, which
+# points at the SELECTION MECHANISM (best-of-~20-windows) rather than any one
+# factor in the formula.
+#
+# "best_quality" (default) is BYTE-IDENTICAL to the original function and is
+# what the live engine calls. The other two only run inside the backtest.
+BASE_SELECTION_STRATEGIES = ("best_quality", "first_valid", "fixed_window")
+FIXED_BASE_WINDOW = int(os.environ.get("FIXED_BASE_WINDOW", "45"))
+
+
+def detect_base(df: pd.DataFrame, exclude_last: int = 1,
+                strategy: str = "best_quality") -> Base:
     """
     The base is formed by the bars BEFORE the trigger.
 
@@ -121,6 +139,17 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
     and the "pivot must sit in the older part of the base" rule would
     reject every setup we actually want. The trigger bar is excluded here
     and evaluated separately in detect_trigger().
+
+    strategy:
+      "best_quality" (live default) — scan every window, keep the one
+        scoring highest on the composite formula. Unchanged from before.
+      "first_valid" — scan windows shortest-to-longest (most recent base
+        first) and take the FIRST one clearing every validity check, no
+        quality ranking at all. Mirrors a trader taking the most recent
+        legitimate base rather than grading twenty of them against a
+        formula.
+      "fixed_window" — try exactly ONE lookback (FIXED_BASE_WINDOW
+        sessions). No search at all.
     """
     df = df.iloc[:-exclude_last] if exclude_last else df
     n = len(df)
@@ -137,8 +166,13 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
     def _note(reason: str) -> None:
         fail_counts[reason] = fail_counts.get(reason, 0) + 1
 
-    for lookback in range(BASE_MIN_SESSIONS,
-                          min(BASE_MAX_SESSIONS, n - PRIOR_UPTREND_WINDOW // 2) + 1, 5):
+    max_lookback = min(BASE_MAX_SESSIONS, n - PRIOR_UPTREND_WINDOW // 2)
+    if strategy == "fixed_window":
+        lookback_values = [FIXED_BASE_WINDOW] if FIXED_BASE_WINDOW <= max_lookback else []
+    else:
+        lookback_values = range(BASE_MIN_SESSIONS, max_lookback + 1, 5)
+
+    for lookback in lookback_values:
         seg_start = n - lookback
         seg_high, seg_low = highs[seg_start:], lows[seg_start:]
 
@@ -216,6 +250,12 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1) -> Base:
         candidate = Base(pattern, seg_start, pivot_idx, pivot, base_low, depth,
                          lookback, dryup, contraction, prior_gain, quality,
                          contracting)
+
+        if strategy == "first_valid":
+            # Stop at the first legitimate window — no ranking against the
+            # (now suspect) composite score.
+            best = candidate
+            break
         if best is None or candidate.quality > best.quality:
             best = candidate
 
@@ -608,15 +648,19 @@ TRANSITION_VOL_MULT = float(os.environ.get("TRANSITION_VOL_MULT", "2.0"))
 
 def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
                 rs126: float | None, snap=None, transition: bool = False,
-                last_bar_incomplete: bool = False) -> Setup:
+                last_bar_incomplete: bool = False,
+                base_strategy: str = "best_quality") -> Setup:
     """
     transition=True applies the Stage 1->2 profile: a longer base and a
     heavier volume break. The trend filter is looser on that path, so the
     price-action evidence has to be stronger to compensate. Loosening one
     test without tightening another is how a second path becomes a back
     door.
+
+    base_strategy is measurement-only — see detect_base. The live engine
+    never passes anything but the default.
     """
-    base = detect_base(df)
+    base = detect_base(df, strategy=base_strategy)
 
     if transition:
         if base.duration < TRANSITION_MIN_BASE_SESSIONS:

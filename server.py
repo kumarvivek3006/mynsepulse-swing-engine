@@ -1510,12 +1510,15 @@ def backtest_job(request: Request):
 
         try:
             result = run_backtest(from_date, to_date, step=step)
-            from backtest import (compare_exits, diagnose_quality_quartile,
-                                 simulate_portfolio, split_sample)
+            from backtest import (compare_base_strategies, compare_exits,
+                                 diagnose_quality_quartile, simulate_portfolio,
+                                 split_sample)
             metrics = summarise(result["trades"])
             metrics["split_sample"] = split_sample(result["trades"])
             metrics["quality_diagnosis_q4"] = diagnose_quality_quartile(
                 result["trades"], "q4")
+            metrics["base_strategy_comparison"] = compare_base_strategies(
+                result["trades"], result.get("base_strategy_trades", {}))
             metrics["exit_variants"] = compare_exits(result["trades"])
 
             # Portfolio construction: concentrated book, strongest first.
