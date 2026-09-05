@@ -617,6 +617,32 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                         min(setup.base.quality, 100)) if setup.base.quality is not None
                         else "unknown",
 
+                    # Diagnostic-only, testing a specific hypothesis: the
+                    # quality formula scored q4 as its BEST bucket and it is
+                    # measurably the WORST performer (-0.568R, stable across
+                    # both halves). One plausible mechanism — the formula
+                    # rewards tightness and low volume heavily, and a stock
+                    # nobody trades will score as "tight and quiet" exactly
+                    # like one genuinely under accumulation. These three
+                    # fields let that be checked directly rather than
+                    # guessed at: is q4's failure concentrated in the
+                    # shallowest, thinnest-liquidity, weakest-prior-move
+                    # sub-segment?
+                    "base_depth_band": (
+                        "under_6pct" if setup.base.depth_pct < 6 else
+                        "6_to_15pct" if setup.base.depth_pct < 15 else
+                        "15_to_25pct" if setup.base.depth_pct < 25 else
+                        "over_25pct"),
+                    "liquidity_band": (
+                        "under_10cr" if pd.isna(window["turnover20_cr"].iloc[-1])
+                        or float(window["turnover20_cr"].iloc[-1]) < 10 else
+                        "10_to_30cr" if float(window["turnover20_cr"].iloc[-1]) < 30 else
+                        "over_30cr"),
+                    "prior_move_band": (
+                        "near_floor_25_35pct" if setup.base.prior_uptrend_pct < 35 else
+                        "35_to_60pct" if setup.base.prior_uptrend_pct < 60 else
+                        "over_60pct"),
+
                     # Armed-specific tests. Both null for breakout/pullback —
                     # only meaningful where the setup type has no confirmed
                     # trigger bar of its own.
@@ -710,6 +736,47 @@ def compare_exits(trades: list[dict]) -> dict:
     return out
 
 
+def diagnose_quality_quartile(trades: list[dict], quartile: str = "q4") -> dict:
+    """
+    Why does the quality formula's OWN top-rated bucket underperform?
+
+    Filters to one quartile and breaks it down by three dimensions the
+    formula does not see: base depth, 20-day liquidity, and the strength of
+    the prior advance. This is a targeted follow-up on ONE specific finding
+    (q4 at -0.568R, stable across both halves) — not a general sweep, and
+    each sub-cut still needs the same split-sample discipline before being
+    treated as an answer rather than a lead.
+    """
+    cohort = [t for t in trades if t.get("base_quality_quartile") == quartile]
+    dated = sorted([t for t in cohort if t.get("signal_date")],
+                   key=lambda t: t["signal_date"])
+    if len(dated) < 20:
+        return {"error": f"too few {quartile} signals to diagnose", "n": len(dated)}
+
+    mid = len(dated) // 2
+    halves = {"first": dated[:mid], "second": dated[mid:]}
+
+    def stats(subset):
+        rs = [t["r_realised"] for t in subset if t.get("r_realised") is not None]
+        return {"n": len(subset), "filled": len(rs),
+                "expectancy_r": round(sum(rs) / len(rs), 3) if rs else None,
+                "hit_rate": round(sum(1 for r in rs if r > 0) / len(rs), 3) if rs else None}
+
+    out = {"quartile": quartile, "cohort_size": len(cohort),
+          "overall": stats(cohort)}
+
+    for dim in ("base_depth_band", "liquidity_band", "prior_move_band"):
+        out[dim] = {}
+        for val in sorted({t.get(dim) for t in cohort if t.get(dim)}):
+            sub = [t for t in cohort if t.get(dim) == val]
+            row = {"full": stats(sub)}
+            for half_name, half_trades in halves.items():
+                row[half_name] = stats([t for t in half_trades if t.get(dim) == val])
+            out[dim][val] = row
+
+    return out
+
+
 def split_sample(trades: list[dict]) -> dict:
     """
     Does anything hold across BOTH halves of the period?
@@ -748,7 +815,8 @@ def split_sample(trades: list[dict]) -> dict:
     for key in ("band", "setup_type", "pattern", "regime", "index_state",
                 "rsi_zone", "rs_quintile", "group_quintile", "contracting",
                 "breakout_rsi", "base_quality_quartile", "armed_delivery",
-                "armed_distance_band"):
+                "armed_distance_band", "base_depth_band", "liquidity_band",
+                "prior_move_band"):
         for name in set(a.get(key, {})) | set(b.get(key, {})):
             sa, sb = a.get(key, {}).get(name), b.get(key, {}).get(name)
             if not sa or not sb:
@@ -837,7 +905,8 @@ def summarise(trades: list[dict]) -> dict:
     for key in ("band", "regime", "setup_type", "pattern", "index_state",
                 "rsi_zone", "rs_quintile", "group_quintile", "contracting",
                 "breakout_rsi", "base_quality_quartile", "armed_delivery",
-                "armed_distance_band"):
+                "armed_distance_band", "base_depth_band", "liquidity_band",
+                "prior_move_band"):
         out[key] = {v: stats([t for t in trades if t.get(key) == v])
                     for v in sorted({t.get(key) for t in trades if t.get(key)})}
 

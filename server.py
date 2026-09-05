@@ -1436,6 +1436,13 @@ def delivery_job(request: Request):
     """
     require_internal_key(request)
     days = int(request.query_params.get("days", "30"))
+    # Explicit range for a genuine historical backfill — see sync_delivery's
+    # docstring for why a bare `days` bump cannot do this once any delivery
+    # data already exists.
+    start_str = request.query_params.get("start")
+    end_str = request.query_params.get("end")
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
+    end_dt = datetime.strptime(end_str, "%Y-%m-%d").date() if end_str else None
 
     with _job_lock:
         if _job_state["running"]:
@@ -1449,13 +1456,15 @@ def delivery_job(request: Request):
         from nse_client import NSEClient
         conn = _connect()
         try:
-            written = sync_delivery(conn, NSEClient(), days=days)
+            written = sync_delivery(conn, NSEClient(), days=days,
+                                    start_date=start_dt, end_date=end_dt)
             _run_log(conn, "sync_delivery", "success", written)
         finally:
             conn.close()
 
     threading.Thread(target=_run_job, args=("delivery", run), daemon=True).start()
-    return {"ok": True, "started": True, "days": days}
+    return {"ok": True, "started": True, "days": days,
+            "start": start_str, "end": end_str}
 
 
 @app.post("/jobs/backtest")
@@ -1501,9 +1510,12 @@ def backtest_job(request: Request):
 
         try:
             result = run_backtest(from_date, to_date, step=step)
-            from backtest import compare_exits, simulate_portfolio, split_sample
+            from backtest import (compare_exits, diagnose_quality_quartile,
+                                 simulate_portfolio, split_sample)
             metrics = summarise(result["trades"])
             metrics["split_sample"] = split_sample(result["trades"])
+            metrics["quality_diagnosis_q4"] = diagnose_quality_quartile(
+                result["trades"], "q4")
             metrics["exit_variants"] = compare_exits(result["trades"])
 
             # Portfolio construction: concentrated book, strongest first.

@@ -503,8 +503,24 @@ def sync_indices(conn, client: UpstoxClient, master: InstrumentMaster,
 # the breakouts that worked. If it did, it earns a place in the engine then;
 # until then it earns a chart and nothing more.
 # ---------------------------------------------------------------------
-def sync_delivery(conn, nse, days: int = 30) -> int:
-    """Backfill the last N sessions. Idempotent; safe to re-run."""
+def sync_delivery(conn, nse, days: int = 30,
+                  start_date: date | None = None,
+                  end_date: date | None = None) -> int:
+    """
+    Backfill delivery percentage.
+
+    Default behaviour (start_date/end_date both None) fills FORWARD from
+    whatever is already stored — this is what the daily post-close job
+    calls, and it must stay cheap: one day's gap, one day's fetch.
+
+    That default is also why a plain re-run with a bigger `days` value
+    never reaches further back: `latest + 1 day` is already almost today,
+    so `days` is silently ignored once any data exists. Passing explicit
+    start_date/end_date bypasses the "since latest" logic entirely, for a
+    genuine historical backfill — e.g. the 3 years the backtest's
+    armed-delivery test needs, which the initial 30-day pull could not
+    supply and therefore left every historical trade as 'unknown'.
+    """
     with conn.cursor() as cur:
         cur.execute("select symbol from symbols where is_active "
                     "and coalesce(series,'') <> 'INDEX'")
@@ -513,8 +529,11 @@ def sync_delivery(conn, nse, days: int = 30) -> int:
         cur.execute("select max(trade_date) from delivery_daily")
         latest = cur.fetchone()[0]
 
-    end = date.today()
-    start = (latest + timedelta(days=1)) if latest else end - timedelta(days=days)
+    end = end_date or date.today()
+    if start_date is not None:
+        start = start_date
+    else:
+        start = (latest + timedelta(days=1)) if latest else end - timedelta(days=days)
     if start > end:
         log.info("Delivery already current to %s", latest)
         return 0
