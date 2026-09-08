@@ -734,14 +734,16 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # re-issued the identical setup as a fresh pending signal beside
             # the open trade.
             cur.execute("""
-                select id, symbol, setup_type, entry_trigger, generated_at, status
+                select id, symbol, setup_type, entry_trigger, generated_at,
+                       status, pivot_bar_date
                 from signals where status in ('pending', 'triggered')
             """)
             existing: dict[str, list] = {}
-            for sig_id, sym_, stype, entry_, gen_at, status_ in cur.fetchall():
+            for sig_id, sym_, stype, entry_, gen_at, status_, pbd_ in cur.fetchall():
                 existing.setdefault(sym_, []).append(
                     {"id": sig_id, "setup_type": stype, "entry": float(entry_),
-                     "generated_at": gen_at, "status": status_})
+                     "generated_at": gen_at, "status": status_,
+                     "pivot_bar_date": pbd_})
 
             # Decide, per setup, whether this is the SAME opportunity being
             # re-measured or a genuinely different one.
@@ -827,14 +829,40 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             trigger_transitions = []
 
             for s_ in signals:
-                matches = [
+                same_bar = [
                     e for e in existing.get(s_["symbol"], [])
                     if (e["setup_type"] == s_["setup_type"]
                         or (_pivot_anchored(e["setup_type"])
                             and _pivot_anchored(s_["setup_type"])))
-                    and e["entry"] > 0
-                    and abs(s_["entry_trigger"] / e["entry"] - 1) * 100 <= MATERIAL_CHANGE_PCT
+                    and e.get("pivot_bar_date") == s_.get("pivot_bar_date")
+                    and s_.get("pivot_bar_date") is not None
                 ]
+                # Same confirmation bar always wins outright: it is the SAME
+                # setup being re-read, however far the intraday-computed
+                # entry has drifted from watching a still-forming session.
+                #
+                # Traced directly on BOSCHLTD: one 31-Aug pivot bar produced
+                # FIVE pending rows across a single day as its entry moved
+                # 47,308 -> 48,646 -> 48,671, purely from where price sat
+                # each time the scan ran — the underlying bar never changed.
+                # Three of the five happened to land within the 2% window
+                # below and merged; two did not, and spawned duplicate
+                # cards. The distance threshold was never the right test
+                # for "is this still the same setup" — the confirmation
+                # bar's date is, since a stock only trades one session a
+                # day and a pullback/breakout is anchored to that one bar.
+                if same_bar:
+                    matches = same_bar
+                else:
+                    matches = [
+                        e for e in existing.get(s_["symbol"], [])
+                        if (e["setup_type"] == s_["setup_type"]
+                            or (_pivot_anchored(e["setup_type"])
+                                and _pivot_anchored(s_["setup_type"])))
+                        and e["entry"] > 0
+                        and abs(s_["entry_trigger"] / e["entry"] - 1) * 100
+                            <= MATERIAL_CHANGE_PCT
+                    ]
 
                 # Matches an OPEN trade: this is the position you are already
                 # in, not a re-entry. Issuing it would put an identical card
