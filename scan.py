@@ -824,6 +824,17 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             # setup_type equality here created a duplicate card with
             # identical numbers every time a setup triggered.
             def _pivot_anchored(kind: str) -> bool:
+                # breakout_retest is deliberately excluded even though it
+                # shares the "breakout" prefix. Armed and breakout (and
+                # their _transition variants) all anchor entry to
+                # pivot x 1.0025 — the same level, so one becoming another
+                # is a status change, not a new setup. breakout_retest
+                # anchors to the RETEST bar's own high instead, which can
+                # sit well below the original pivot; grouping it here would
+                # let it silently overwrite an armed/breakout card's entry
+                # with an unrelated price.
+                if kind == "breakout_retest":
+                    return False
                 return kind.startswith("armed") or kind.startswith("breakout")
 
             trigger_transitions = []

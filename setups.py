@@ -646,7 +646,7 @@ def derive_levels(df: pd.DataFrame, base: Base, setup_type: str,
     # high. Both are prices that printed. Nothing is manufactured, and an
     # extended breakout now fails the R:R floor and stop-width limit on its
     # own arithmetic rather than needing a new threshold.
-    if setup_type.startswith("pullback"):
+    if setup_type.startswith("pullback") or setup_type == "breakout_retest":
         anchor = float(last["high"])
     else:
         anchor = max(base.pivot, float(last["high"]))
@@ -813,7 +813,7 @@ def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
     close_pos = ((float(last["close"]) - float(last["low"])) / rng) if rng > 0 else 0.5
     if setup_type.startswith("breakout"):
         trigger = min(vol_mult / 3.0, 1.0) * 0.6 + close_pos * 0.4
-    elif setup_type.startswith("pullback"):
+    elif setup_type.startswith("pullback") or setup_type == "breakout_retest":
         trigger = 0.55 + close_pos * 0.25
     else:
         # Armed: there is no trigger bar yet, so this block grades readiness
@@ -856,6 +856,75 @@ def score_setup(df: pd.DataFrame, base: Base, setup_type: str, levels: dict,
                                     if v is not None)
     breakdown["blocks_unscored"] = [k for k, v in parts.items() if v is None]
     return round(sum(breakdown[k] for k in parts), 1), breakdown
+
+
+RETEST_LOOKBACK_SESSIONS = int(os.environ.get("RETEST_LOOKBACK_SESSIONS", "15"))
+RETEST_MAX_UNDERCUT_PCT = float(os.environ.get("RETEST_MAX_UNDERCUT_PCT", "3.0"))
+
+
+def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1) -> Base:
+    """
+    Base -> genuine breakout above the pivot -> controlled pullback BACK
+    down to that same level -> reversal today. Anchored to the pivot
+    itself, not a moving average — a level that has already proven itself
+    as resistance and is now being tested as support.
+
+    Needs its OWN, wider exclusion window, and this is not optional.
+    detect_base's standard search only holds out the trigger bar
+    (exclude_last=1), so a breakout-then-pullback sequence spanning several
+    bars would otherwise sit INSIDE the base search itself. Tested
+    directly: the window search found a short, tight recent candidate that
+    already included the breakout's own high as its pivot, which then
+    failed as "pivot_too_recent" — the search had absorbed the very
+    breakout this pattern needs to have happened BEFORE the base's pivot
+    was set. Excluding the whole retest window up front, then locating the
+    original base only in what remains, is what keeps the two phases from
+    corrupting each other.
+    """
+    df_visible = df.iloc[:-exclude_last] if exclude_last else df
+    n = len(df_visible)
+    if n < RETEST_LOOKBACK_SESSIONS + BASE_MIN_SESSIONS + PRIOR_UPTREND_WINDOW // 2:
+        raise Rejected("gate4", "retest_insufficient_history")
+
+    original = df_visible.iloc[:-RETEST_LOOKBACK_SESSIONS]
+    base = detect_base(original, exclude_last=0)   # already fully excludes the retest window
+
+    retest_window = df_visible.iloc[len(original):]
+    if len(retest_window) < 2:
+        raise Rejected("gate4", "retest_window_too_short")
+
+    broke_out = retest_window["close"] > base.pivot
+    if not broke_out.any():
+        raise Rejected("gate4", "retest_no_breakout_found")
+
+    first_breakout_pos = int(broke_out.to_numpy().nonzero()[0][0])
+    since_breakout = retest_window.iloc[first_breakout_pos + 1:]
+    if len(since_breakout) < 1:
+        raise Rejected("gate4", "retest_no_pullback_yet")
+
+    # A shallow undercut is the classic, often stronger version of this
+    # setup — a brief shakeout below the old resistance before reclaiming
+    # it. Anything deeper is a failed retest, not a valid one.
+    retest_low = float(since_breakout["low"].min())
+    if retest_low < base.pivot * (1 - RETEST_MAX_UNDERCUT_PCT / 100):
+        raise Rejected("gate4", "retest_broke_down",
+                       {"retest_low": round(retest_low, 2),
+                        "pivot": round(base.pivot, 2)})
+
+    last = df.iloc[-1]     # the actual trigger bar, not df_visible's tail
+    close = float(last["close"])
+    near_pivot = base.pivot * (1 - RETEST_MAX_UNDERCUT_PCT / 100) <= close <= base.pivot * 1.02
+    reversed_here = close > float(last["open"]) and float(last["low"]) <= base.pivot * 1.01
+
+    if not (near_pivot and reversed_here):
+        raise Rejected("gate5", "retest_not_confirmed_today",
+                       {"close": round(close, 2), "pivot": round(base.pivot, 2)})
+
+    # The base's SHAPE is whatever detect_base found (flat_base, cup_handle,
+    # VCP, ...) — retest describes how we are entering, not what the
+    # structure looked like. Returning the original base unchanged keeps
+    # that distinction intact.
+    return base
 
 
 def detect_flag_pennant(df: pd.DataFrame, exclude_last: int = 1) -> Base:
@@ -972,6 +1041,39 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     base_strategy is measurement-only — see detect_base. The live engine
     never passes anything but the default.
     """
+    # Breakout retest is tried FIRST, not as a fallback after the standard
+    # search. It needs its own wider exclusion window from the very start —
+    # trying it only after detect_base has already run would be too late,
+    # since detect_base's own search would already have looked at (and
+    # potentially been corrupted by) the retest bars themselves. Skipped
+    # entirely under the Stage 1->2 transition profile: retest presupposes
+    # an ALREADY-confirmed breakout from an established base, which is the
+    # opposite premise of a stock still emerging from Stage 1.
+    if not transition:
+        try:
+            base = detect_breakout_retest(df)
+            setup_type = "breakout_retest"
+            levels = derive_levels(df, base, setup_type, last_bar_incomplete)
+            total, breakdown = score_setup(df, base, setup_type, levels,
+                                           rs63, rs126, snap)
+            extension = extension_metrics(df, levels["entry"])
+            provisional = last_bar_incomplete   # trigger bar is today either way
+            return Setup(
+                symbol=symbol, setup_type=setup_type, pattern=base.pattern,
+                entry=levels["entry"], stop=levels["stop"], t1=levels["t1"],
+                t2=levels["t2"], r_multiple_t1=levels["r_multiple_t1"], base=base,
+                stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
+                t2_basis=levels.get("t2_basis"),
+                score_total=total, score_breakdown=breakdown,
+                extension=extension, provisional=provisional,
+                notes=[f"breakout retest: pivot {base.pivot:.2f}, "
+                      f"base {base.duration}d",
+                      f"stop from {levels['stop_basis']}",
+                      f"T1 from {levels['t1_basis']}"],
+            )
+        except Rejected:
+            pass   # not a retest — fall through to the standard flow below
+
     try:
         base = detect_base(df, strategy=base_strategy)
     except Rejected as base_rej:
