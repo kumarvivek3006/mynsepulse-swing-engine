@@ -285,6 +285,27 @@ def gate0_tradability(symbol: str, df: pd.DataFrame,
 # ---------------------------------------------------------------------
 PROMOTER_DROP_PP = float(os.environ.get("PROMOTER_DROP_PP", "2.0"))
 
+# Spec (Prompts 1, 5, 10) requires RS rating > 70 as a hard gate. RS is
+# computed and ranked on every signal today but never filtered on — Prompt
+# 10 is effectively unimplemented as a strategy for that reason.
+#
+# Defaulted OFF because every backtest this engine has run showed RS
+# carrying little signal AS SCORED, and turning it on would cut signal
+# count materially on an unvalidated basis. A hard floor is a different
+# claim from a ranking weight and has never been tested — so it ships
+# switchable, and the backtest decides rather than my judgement.
+RS_FLOOR_ENABLED = os.environ.get("RS_FLOOR_ENABLED", "false").lower() == "true"
+RS_FLOOR_PCT = float(os.environ.get("RS_FLOOR_PCT", "70"))
+
+# Weinstein breakout volume: >2x the 50-WEEK average, on the weekly candle.
+# Applies to the Stage 1->2 transition path only. The daily-chart setups
+# (VCP, retest, flag, triangle, cup-handle) keep their own daily multiples,
+# which is what the strategy spec actually calls for in each case — weekly
+# is the right measure for Weinstein specifically, not a global upgrade.
+WEEKLY_VOL_MULT = float(os.environ.get("WEEKLY_VOL_MULT", "2.0"))
+WEEKLY_VOL_CHECK_ENABLED = os.environ.get(
+    "WEEKLY_VOL_CHECK_ENABLED", "true").lower() == "true"
+
 
 def gate2_fundamentals(symbol: str, snap) -> GateResult:
     """
@@ -339,7 +360,12 @@ def gate2_missing_vetoes() -> list[str]:
 # ---------------------------------------------------------------------
 # Gate 3 — trend structure (Stage 2)
 # ---------------------------------------------------------------------
-def gate3_trend_structure(symbol: str, df: pd.DataFrame) -> GateResult:
+def gate3_trend_structure(symbol: str, df: pd.DataFrame,
+                          rs_rank_pct: float | None = None) -> GateResult:
+    """
+    rs_rank_pct is the stock's same-day RS percentile against the universe.
+    Only enforced when RS_FLOOR_ENABLED — see the constant's note.
+    """
     last = df.iloc[-1]
     needed = ["sma50", "sma150", "sma200", "high52", "low52",
               "sma200_slope25", "sma50_slope10"]
@@ -349,6 +375,14 @@ def gate3_trend_structure(symbol: str, df: pd.DataFrame) -> GateResult:
     close = float(last["close"])
     checks = {
         "close_above_50": close > last["sma50"],
+        # Minervini rule 1 requires price above BOTH the 150 and 200 DMA.
+        # Only close_above_50 was checked, plus the MAs' ordering relative
+        # to each other — which is a different claim. A stock declining
+        # sharply can sit below its 200 DMA while the MA stack is still
+        # stale and correctly ordered, so early breakdowns were passing a
+        # gate whose whole purpose is to exclude them.
+        "close_above_150": close > last["sma150"],
+        "close_above_200": close > last["sma200"],
         "50_above_150": last["sma50"] > last["sma150"],
         "150_above_200": last["sma150"] > last["sma200"],
         "200_rising": last["sma200_slope25"] > 0,
@@ -364,6 +398,11 @@ def gate3_trend_structure(symbol: str, df: pd.DataFrame) -> GateResult:
 
     if not weekly_structure_ok(df):
         return GateResult(symbol, False, "gate3", "weekly_structure")
+
+    # Minervini rule 8 / Prompt 10's core filter. Off by default.
+    if RS_FLOOR_ENABLED and rs_rank_pct is not None and rs_rank_pct < RS_FLOOR_PCT:
+        return GateResult(symbol, False, "gate3", "rs_below_floor",
+                          {"rs_rank_pct": rs_rank_pct, "floor": RS_FLOOR_PCT})
 
     return GateResult(symbol, True, detail={
         "pct_from_52w_high": round((close / float(last["high52"]) - 1) * 100, 2),
@@ -398,6 +437,43 @@ TRANSITION_MAX_200_DECLINE_PCT = float(
 # decorative. 20% still excludes stocks sitting on their lows.
 TRANSITION_MIN_ABOVE_52W_LOW_PCT = float(
     os.environ.get("TRANSITION_MIN_ABOVE_52W_LOW_PCT", "20"))
+
+
+def weekly_volume_surge(df: pd.DataFrame, mult: float) -> tuple[bool, float | None]:
+    """
+    Is the current week's volume above `mult` x the 50-week average?
+
+    Weinstein's framework is weekly throughout, and his breakout rule is a
+    weekly volume expansion — sustained accumulation across five sessions,
+    not a single day's spike. Our daily 1.5x-of-50-day check is a proxy for
+    that: a one-day news spike that fully reverses passes it, whereas a
+    genuine week of institutional buying is a different and stronger claim.
+
+    PARTIAL WEEKS: the current week is usually incomplete when this runs.
+    Volume only ACCUMULATES within a week — it cannot shrink — so a partial
+    week that already clears the threshold will still clear it at week's
+    end. Requiring it to be already met is therefore conservative and can
+    never be retroactively wrong. Nothing is prorated or projected: that
+    would be inventing a number, the same error as comparing three days of
+    volume against a five-day average.
+
+    Returns (passed, observed_multiple).
+    """
+    w = (df.set_index(pd.to_datetime(df["trade_date"]))
+           .resample("W")["volume"].sum()
+           .dropna())
+    if len(w) < 52:
+        return False, None
+
+    # Average EXCLUDES the current (possibly partial) week, so the week
+    # being tested is never part of its own baseline.
+    baseline = float(w.iloc[-51:-1].mean())
+    if baseline <= 0:
+        return False, None
+
+    current = float(w.iloc[-1])
+    observed = current / baseline
+    return observed >= mult, round(observed, 2)
 
 
 def gate3_stage1_transition(symbol: str, df: pd.DataFrame) -> GateResult:
@@ -436,11 +512,19 @@ def gate3_stage1_transition(symbol: str, df: pd.DataFrame) -> GateResult:
     if not weekly_structure_ok(df):
         return GateResult(symbol, False, "gate3b", "weekly_structure")
 
+    # Recorded here, enforced at trigger time in setups.py. The gate answers
+    # "is this stock in a Stage 1->2 transition"; whether THIS bar's breakout
+    # carries weekly volume is a trigger question, and enforcing it here
+    # would wrongly reject a stock still quietly basing before its breakout.
+    weekly_vol_ok, weekly_vol_mult = weekly_volume_surge(df, WEEKLY_VOL_MULT)
+
     return GateResult(symbol, True, detail={
         "sma200_slope25": round(slope_now, 2),
         "prior_slope": round(prior_slope, 2) if prior_slope is not None else None,
         "pct_above_200dma": round((close / sma200 - 1) * 100, 2),
         "pct_from_52w_high": round((close / float(last["high52"]) - 1) * 100, 2),
+        "weekly_vol_surge": weekly_vol_ok,
+        "weekly_vol_mult": weekly_vol_mult,
     })
 
 

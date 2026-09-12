@@ -20,6 +20,12 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+# gates.py imports nothing from this package, so this direction creates no
+# cycle. weekly_volume_surge lives there because that is where the other
+# weekly/indicator logic already sits.
+from gates import (WEEKLY_VOL_CHECK_ENABLED, WEEKLY_VOL_MULT,
+                   weekly_volume_surge)
+
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
 MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "4"))
 
@@ -33,6 +39,14 @@ FLAGPOLE_LOOKBACK = int(os.environ.get("FLAGPOLE_LOOKBACK", "20"))
 FLAGPOLE_MIN_GAIN_PCT = float(os.environ.get("FLAGPOLE_MIN_GAIN_PCT", "20"))
 FLAG_MIN_DEPTH_PCT = float(os.environ.get("FLAG_MIN_DEPTH_PCT", "2"))
 FLAG_MAX_DEPTH_PCT = float(os.environ.get("FLAG_MAX_DEPTH_PCT", "15"))
+# Spec requires >1.8x on the flag breakout — a higher bar than the generic
+# 1.5x, because a flag is a short pause inside an established move and the
+# resumption should carry more conviction than an ordinary base breakout.
+FLAG_BREAKOUT_VOL_MULT = float(os.environ.get("FLAG_BREAKOUT_VOL_MULT", "1.8"))
+# Spec: flag must not retrace more than 50% of the flagpole. A deeper
+# pullback is a reversal, not a continuation pause.
+FLAG_MAX_POLE_RETRACE_PCT = float(
+    os.environ.get("FLAG_MAX_POLE_RETRACE_PCT", "50"))
 BASE_MAX_SESSIONS = int(os.environ.get("BASE_MAX_SESSIONS", "120"))
 BREAKOUT_VOL_MULT = float(os.environ.get("BREAKOUT_VOL_MULT", "1.5"))
 # How close to the pivot a stock must sit to be worth arming an order on.
@@ -427,6 +441,45 @@ def _is_cup_and_handle(seg_high, seg_low, duration: int,
     return True
 
 
+def _is_ascending_triangle(seg_high, seg_low, duration: int,
+                           highs_first: float, highs_last: float,
+                           lows_first: float, lows_last: float) -> bool:
+    """
+    Spec requires at least 2 touches on the flat top AND 2 rising lows —
+    a touch count, not a shape approximation.
+
+    The previous test compared only the first third's extremes against the
+    last third's: flat_resistance if those two highs were within 3%, and
+    rising_lows if the last third's low exceeded the first's. That passes
+    on shapes with no triangle in them at all — a single spike early and a
+    single spike late, with nothing between, satisfies it. Counting actual
+    touches of the resistance line is what distinguishes a real triangle
+    from two coincidental highs.
+    """
+    resistance = float(seg_high.max())
+    if resistance <= 0:
+        return False
+
+    # A "touch" is any bar reaching within 1.5% of the resistance line.
+    touches = int((seg_high >= resistance * 0.985).sum())
+    if touches < 2:
+        return False
+
+    # Rising lows: split the base into halves and require the later half's
+    # low to sit meaningfully above the earlier half's, with at least two
+    # distinct swing lows forming the rising trendline.
+    if lows_first <= 0 or lows_last <= lows_first * 1.02:
+        return False
+
+    span = max(2, duration // 12)
+    rising_low_count = len(_find_local_minima(seg_low, span))
+    if rising_low_count < 2:
+        return False
+
+    # Flat top: the resistance must genuinely be flat, not sloping.
+    return abs(highs_last - highs_first) / highs_first < 0.03 if highs_first else False
+
+
 def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
     third = max(duration // 3, 3)
     lows_first = seg_low[:third].min()
@@ -457,7 +510,9 @@ def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
     if _is_cup_and_handle(seg_high, seg_low, duration, highs_first, highs_last):
         return "cup_handle"
     if flat_resistance and rising_lows:
-        return "asc_triangle"
+        return "asc_triangle" if _is_ascending_triangle(
+            seg_high, seg_low, duration, highs_first, highs_last,
+            lows_first, lows_last) else "consolidation"
     if lows_last > lows_first:
         # A genuine staircase of higher lows that fails the cup criteria
         # above — O'Neil's fourth classic base type, previously folded
@@ -477,9 +532,18 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
 
     # Breakout
     if last["close"] > base.pivot:
-        if vol50 <= 0 or last["volume"] < vol50 * BREAKOUT_VOL_MULT:
+        # A flag breakout carries a higher bar than an ordinary base
+        # breakout (spec: 1.8x vs 1.5x). A flag is a brief pause inside an
+        # already-running move, so the resumption should show more
+        # conviction than a breakout from a long, quiet base.
+        required_mult = (FLAG_BREAKOUT_VOL_MULT
+                         if base.pattern == "flag_pennant"
+                         else BREAKOUT_VOL_MULT)
+        if vol50 <= 0 or last["volume"] < vol50 * required_mult:
             raise Rejected("gate5", "breakout_without_volume",
-                           {"volume_mult": round(float(last["volume"]) / vol50, 2) if vol50 else None})
+                           {"volume_mult": round(float(last["volume"]) / vol50, 2) if vol50 else None,
+                            "required": required_mult,
+                            "pattern": base.pattern})
         if rng > 0 and (last["close"] - last["low"]) / rng < 0.66:
             raise Rejected("gate5", "weak_close_in_range")
         # Exhaustion: a huge range with a long upper wick is supply, not demand.
@@ -902,6 +966,44 @@ def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1) -> Base:
     if len(since_breakout) < 1:
         raise Rejected("gate4", "retest_no_pullback_yet")
 
+    # Volume is what separates a genuine retest from a failing breakout, and
+    # this detector had NO volume logic at all — verified by inspection. Two
+    # separate requirements, both from the strategy spec:
+    #
+    #   1. The breakout itself must have carried real demand (>1.5x the
+    #      50-day average). A breakout on ordinary volume is the exact
+    #      "false breakout" case this whole pattern exists to avoid — and
+    #      without this check, the retest logic was happily confirming
+    #      retests of breakouts that never had conviction behind them.
+    #   2. The pullback must be QUIETER than the breakout. A retest on
+    #      volume equal to or above the breakout is distribution — sellers
+    #      are hitting it, not a healthy pause.
+    breakout_bar = retest_window.iloc[first_breakout_pos]
+    breakout_vol = float(breakout_bar["volume"])
+    bo_vol50 = float(breakout_bar["vol50"]) if pd.notna(breakout_bar.get("vol50")) else 0.0
+
+    if bo_vol50 <= 0 or breakout_vol < bo_vol50 * BREAKOUT_VOL_MULT:
+        raise Rejected("gate4", "retest_breakout_without_volume",
+                       {"volume_mult": round(breakout_vol / bo_vol50, 2)
+                        if bo_vol50 else None,
+                        "required": BREAKOUT_VOL_MULT})
+
+    # Compared against the retest window's PEAK, not its mean.
+    #
+    # The mean masks exactly what this check exists to catch: traced on a
+    # constructed case, retest bars of [1M, 1M, 3M, 3M, 3M] averaged 2.2M
+    # against a 2.5M breakout and passed — while three of the five bars ran
+    # 20% ABOVE the breakout's own volume. That is sellers hitting the
+    # retest, which is precisely the distribution signature the spec's
+    # "retest volume < breakout volume" rule is meant to reject. A single
+    # heavy bar in the pullback invalidates the retest regardless of how
+    # quiet the others were.
+    retest_peak_vol = float(since_breakout["volume"].max())
+    if breakout_vol > 0 and retest_peak_vol >= breakout_vol:
+        raise Rejected("gate4", "retest_volume_not_lower",
+                       {"retest_peak_vol": int(retest_peak_vol),
+                        "breakout_vol": int(breakout_vol)})
+
     # A shallow undercut is the classic, often stronger version of this
     # setup — a brief shakeout below the old resistance before reclaiming
     # it. Anything deeper is a failed retest, not a valid one.
@@ -993,6 +1095,19 @@ def detect_flag_pennant(df: pd.DataFrame, exclude_last: int = 1) -> Base:
         if pole_gain < FLAGPOLE_MIN_GAIN_PCT:
             _note("weak_flagpole")
             continue
+
+        # Spec: a flag retracing more than half its own flagpole is a
+        # reversal, not a pause. Depth was previously bounded only as a
+        # percentage of price (FLAG_MAX_DEPTH_PCT), which says nothing
+        # about how much of the preceding MOVE has been given back — a 12%
+        # dip is trivial after a 60% pole and fatal after a 20% one.
+        pole_low = float(pole_window.min())
+        pole_height = pivot - pole_low
+        if pole_height > 0:
+            retrace_pct = (pivot - base_low) / pole_height * 100
+            if retrace_pct > FLAG_MAX_POLE_RETRACE_PCT:
+                _note("flag_retraced_too_much")
+                continue
 
         # Volume should contract inside the flag relative to the pole that
         # formed it — the pole runs on demand, the flag on its absence.
@@ -1094,12 +1209,29 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
                             "required": TRANSITION_MIN_BASE_SESSIONS})
         last = df.iloc[-1]
         vol50 = float(last["vol50"]) if pd.notna(last["vol50"]) else 0.0
-        if last["close"] > base.pivot and (
-                vol50 <= 0 or last["volume"] < vol50 * TRANSITION_VOL_MULT):
-            raise Rejected("gate5", "transition_volume_insufficient",
-                           {"required_mult": TRANSITION_VOL_MULT,
-                            "actual": round(float(last["volume"]) / vol50, 2)
-                            if vol50 else None})
+        if last["close"] > base.pivot:
+            # Weinstein's breakout rule is a WEEKLY volume expansion (>2x the
+            # 50-week average), not a daily one. The daily check here was a
+            # proxy for it: a single news-driven day that fully reverses
+            # satisfies a daily multiple, whereas a genuine week of
+            # institutional accumulation is a stronger and different claim —
+            # and Weinstein's entire stage framework is weekly throughout.
+            #
+            # Daily is kept as a floor alongside it: the breakout bar itself
+            # should still show real demand, not ride a surge that happened
+            # earlier in the week.
+            if vol50 <= 0 or last["volume"] < vol50 * TRANSITION_VOL_MULT:
+                raise Rejected("gate5", "transition_volume_insufficient",
+                               {"required_mult": TRANSITION_VOL_MULT,
+                                "actual": round(float(last["volume"]) / vol50, 2)
+                                if vol50 else None})
+
+            if WEEKLY_VOL_CHECK_ENABLED:
+                weekly_ok, weekly_mult = weekly_volume_surge(df, WEEKLY_VOL_MULT)
+                if not weekly_ok:
+                    raise Rejected("gate5", "transition_weekly_volume_insufficient",
+                                   {"required_weekly_mult": WEEKLY_VOL_MULT,
+                                    "actual_weekly_mult": weekly_mult})
 
     setup_type = detect_trigger(df, base)
     if transition:
