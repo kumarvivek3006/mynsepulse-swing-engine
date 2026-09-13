@@ -1629,6 +1629,31 @@ def backtest_job(request: Request):
             # Tasks 4.2 / 4.3 — what each classifier would have done.
             metrics["classifier_attribution"] = classifier_attribution(
                 result["trades"])
+
+            # Task 1 — walk-forward-based criterion for all 10 classifiers.
+            from backtest import classifier_improves_walk_forward, w5_classifier_test
+            _names = ["c1_close_above_200dma", "c2_close_above_50_and_stack",
+                      "c3_50dma_rising_20d", "c5_vix_below_15",
+                      "c6_vix_below_18", "c7_breadth_above_55",
+                      "c8_breadth_above_60", "majority_c1_c3_c5_c7",
+                      "c1_and_c5_or_c7", "c2_and_c7"]
+            _wf = {}
+            for _n in _names:
+                _ok, _d = classifier_improves_walk_forward(
+                    result["trades"], 6,
+                    lambda t, k=_n: (t.get("regime_classifiers") or {}).get(k))
+                _wf[_n] = _d
+            _qual = [k for k, v in _wf.items() if v.get("qualifies")]
+            metrics["classifier_walk_forward"] = {
+                "classifiers": _wf,
+                "qualifying": _qual,
+                "verdict": (f"improves walk-forward: {_qual}" if _qual else
+                            "NULL RESULT — no classifier increases the count "
+                            "of positive walk-forward windows"),
+            }
+
+            # Task 4 — W5 specifically.
+            metrics["w5_classifier_test"] = w5_classifier_test(result["trades"])
             # (a) per-window view of the c7 breadth filter
             from backtest import breadth_filter_windows
             metrics["breadth_filter_windows"] = breadth_filter_windows(

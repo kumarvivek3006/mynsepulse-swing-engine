@@ -1154,8 +1154,63 @@ def compare_base_strategies(main_trades: list[dict],
     winners = [n for n, r in out.items()
               if n != DEFAULT_BASE_STRATEGY
               and r.get("beats_live_default_both_halves")]
+
+    # Deterministic tie-break. The rule was
+    #   winners[0] if len(winners) == 1 else None
+    # which returns null whenever TWO strategies qualify — reading as
+    # "nothing qualified" when the truth was "two did and the code could
+    # not choose". Run #34 reported adopt_candidate=null with both
+    # first_valid and best_quality qualifying; the tolerance rule was
+    # working and this line discarded the result.
+    ADOPT_EXPECTANCY_MARGIN_R = float(
+        os.environ.get("ADOPT_EXPECTANCY_MARGIN_R", "0.02"))
+
+    adopt, tie, reason = None, [], None
+    strict = [n for n in winners
+              if (out[n].get("first_half_delta_r") or 0) > 0
+              and (out[n].get("second_half_delta_r") or 0) > 0]
+
+    if len(strict) == 1:
+        adopt = strict[0]
+        reason = "sole strategy beating strictly in both halves"
+    elif winners:
+        ranked = sorted(
+            winners,
+            key=lambda n: (out[n].get("full", {}).get("expectancy_r") or -99),
+            reverse=True)
+        best = out[ranked[0]].get("full", {}).get("expectancy_r")
+        rest = [out[n].get("full", {}).get("expectancy_r") or -99
+                for n in ranked[1:]]
+        if not rest or best - max(rest) >= ADOPT_EXPECTANCY_MARGIN_R:
+            adopt = ranked[0]
+            reason = (f"leads full-period expectancy by >= "
+                      f"{ADOPT_EXPECTANCY_MARGIN_R}R")
+        else:
+            tie = [n for n in ranked
+                   if abs((out[n].get("full", {}).get("expectancy_r") or -99)
+                          - best) < ADOPT_EXPECTANCY_MARGIN_R]
+            reason = (f"tie within {ADOPT_EXPECTANCY_MARGIN_R}R — "
+                      "keeping live default rather than choosing silently")
+    else:
+        reason = "no strategy qualified"
+
+    # The live default is itself a candidate: if it leads, the answer is
+    # "no change", which is different from "nothing qualified".
+    live_exp = out.get(DEFAULT_BASE_STRATEGY, {}).get("full", {}).get("expectancy_r")
+    recommended = adopt or DEFAULT_BASE_STRATEGY
+    if (adopt and live_exp is not None
+            and (out[adopt].get("full", {}).get("expectancy_r") or -99)
+                - live_exp < ADOPT_EXPECTANCY_MARGIN_R):
+        recommended = DEFAULT_BASE_STRATEGY
+        reason += " (but does not clear the margin over the live default)"
+
     out["verdict"] = {
-        "adopt_candidate": winners[0] if len(winners) == 1 else None,
+        "adopt_candidate": adopt,
+        "recommended_strategy": recommended,
+        "action_required": recommended != DEFAULT_BASE_STRATEGY,
+        "tie_between": tie,
+        "decision_reason": reason,
+        "expectancy_margin_r": ADOPT_EXPECTANCY_MARGIN_R,
         "beats_baseline_both_halves": winners,
         "live_default": DEFAULT_BASE_STRATEGY,
         "adopt_tolerance_r": ADOPT_TOLERANCE_R,
@@ -1266,6 +1321,130 @@ def _window_outcomes(trades: list[dict], windows: int = 6) -> tuple[set, set, li
                        "expectancy_r": round(exp, 3),
                        "outcome": "winning" if exp > 0 else "losing"})
     return losing, winning, detail
+
+
+def classifier_improves_walk_forward(trades: list[dict], windows: int,
+                                     classifier_fn) -> tuple[bool, dict]:
+    """
+    Does filtering by this classifier INCREASE the count of positive
+    walk-forward windows?
+
+    Replaces skips_only_losing_windows, which was near-vacuous: three
+    classifiers qualified in Run #34 by skipping W2 (n=3) while continuing
+    to trade W5 — the one consistently losing window with real sample.
+    Skipping a tiny window is not evidence of anything.
+
+    This asks the question that actually matters: after filtering, are MORE
+    windows positive than before? Run #34 unfiltered = 4.
+
+    classifier_fn(trade) -> True (take), False (skip), or None (unknown).
+    None is treated as TAKE, matching the live gate: a missing input must
+    not silently become a skip decision.
+    """
+    dated = sorted([t for t in trades
+                    if t.get("signal_date") and t.get("r_realised") is not None],
+                   key=lambda t: t["signal_date"])
+    if len(dated) < windows * 3:
+        return False, {"error": "too few trades", "n": len(dated)}
+
+    first, last = dated[0]["signal_date"], dated[-1]["signal_date"]
+    step = max((last - first).days, 1) / windows
+
+    def positive_windows(rows):
+        pos, detail = 0, []
+        for w in range(windows):
+            lo = first + timedelta(days=int(step * w))
+            hi = first + timedelta(days=int(step * (w + 1)))
+            rs = [t["r_realised"] for t in rows if lo <= t["signal_date"] < hi]
+            exp = round(sum(rs) / len(rs), 3) if rs else None
+            if exp is not None and exp > 0:
+                pos += 1
+            detail.append({"window": w + 1, "n": len(rs), "expectancy_r": exp})
+        return pos, detail
+
+    kept = [t for t in dated if classifier_fn(t) is not False]
+    unfiltered_pw, unfiltered_detail = positive_windows(dated)
+    filtered_pw, filtered_detail = positive_windows(kept)
+
+    return filtered_pw > unfiltered_pw, {
+        "unfiltered_positive_windows": unfiltered_pw,
+        "filtered_positive_windows": filtered_pw,
+        "signals_kept": len(kept),
+        "signals_skipped": len(dated) - len(kept),
+        "unfiltered_windows": unfiltered_detail,
+        "filtered_windows": filtered_detail,
+        "qualifies": filtered_pw > unfiltered_pw,
+    }
+
+
+def w5_classifier_test(trades: list[dict], windows: int = 6) -> dict:
+    """
+    Task 4 — can any single classifier split W5 into a positive and a
+    negative half?
+
+    W5 is the only decisively negative window across every run (-0.658,
+    -0.594, -0.609, -0.609 on n=16-18). It never flips. W1 and W4 are
+    marginal and do flip, so they are not the target.
+
+    Four singletons only. No composites: building one after four singletons
+    fail is fitting to 16 trades.
+    """
+    dated = sorted([t for t in trades
+                    if t.get("signal_date") and t.get("r_realised") is not None],
+                   key=lambda t: t["signal_date"])
+    if not dated:
+        return {"error": "no trades"}
+
+    first, last = dated[0]["signal_date"], dated[-1]["signal_date"]
+    step = max((last - first).days, 1) / windows
+    lo = first + timedelta(days=int(step * 4))      # W5 is index 4
+    hi = first + timedelta(days=int(step * 5))
+    w5 = [t for t in dated if lo <= t["signal_date"] < hi]
+    if not w5:
+        return {"error": "no trades in W5", "from": str(lo), "to": str(hi)}
+
+    tests = {
+        "w5_c1_close_above_200dma": lambda t: (t.get("regime_classifiers") or {}).get("c1_close_above_200dma"),
+        "w5_c2_vix_below_15":       lambda t: (t.get("regime_classifiers") or {}).get("c5_vix_below_15"),
+        "w5_c3_breadth_above_55":   lambda t: (t.get("regime_classifiers") or {}).get("c7_breadth_above_55"),
+        "w5_c4_50dma_above_200dma": lambda t: (t.get("regime_classifiers") or {}).get("c2_close_above_50_and_stack"),
+    }
+
+    def stat(rows):
+        rs = [t["r_realised"] for t in rows]
+        if not rs:
+            return {"n": 0, "expectancy_r": None}
+        return {"n": len(rs), "expectancy_r": round(sum(rs) / len(rs), 3),
+                "total_r": round(sum(rs), 2)}
+
+    out = {"w5_from": str(lo), "w5_to": str(hi),
+           "w5_overall": stat(w5), "classifiers": {}}
+    separating = []
+
+    for name, fn in tests.items():
+        passing = [t for t in w5 if fn(t) is True]
+        failing = [t for t in w5 if fn(t) is False]
+        unknown = [t for t in w5 if fn(t) is None]
+        p, f = stat(passing), stat(failing)
+        # "Separates" means one side is actually POSITIVE — not merely
+        # less negative. A classifier that splits -0.9 from -0.4 has found
+        # nothing tradeable.
+        sep = bool(p["expectancy_r"] is not None and p["expectancy_r"] > 0
+                   and p["n"] >= 5)
+        if sep:
+            separating.append(name)
+        out["classifiers"][name] = {
+            "passing": p, "failing": f, "not_computable": stat(unknown),
+            "separates_positive": sep,
+        }
+
+    out["separating_classifiers"] = separating
+    out["verdict"] = (
+        f"W5 separated by: {separating}" if separating else
+        "W5 not distinguishable from current market data. Next investment "
+        "is the four missing sources: sector dispersion, smallcap/largecap "
+        "ratio, advance/decline, new-highs-minus-lows.")
+    return out
 
 
 def classifier_attribution(trades: list[dict], windows: int = 6) -> dict:
@@ -1384,7 +1563,11 @@ def classifier_attribution(trades: list[dict], windows: int = 6) -> dict:
         "winning_windows": sorted(WINNING),
         "window_outcomes": window_outcomes,
         "derived_from": "this run's walk-forward, not a static list",
-        "skips_only_losing_windows": ideal,
+        # RETIRED — see classifier_improves_walk_forward. Near-vacuous:
+        # qualified on skipping the n=3 W2 while still trading W5. Kept
+        # visible so both criteria can be compared rather than silently
+        # swapped.
+        "skips_only_losing_windows_legacy": ideal,
         "over_fitted_classifiers": [n for n, r in out.items()
                                     if isinstance(r, dict) and r.get("over_fitted")],
         "note": ("A classifier blocking >2 windows is fitted to this "
