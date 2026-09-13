@@ -166,6 +166,9 @@ class Base:
     # accumulation signature. Real evidence a base is being bought into,
     # distinct from a stock that is merely quiet because nobody wants it.
     obv_rising: bool = False
+    # Records the strategy detect_base ACTUALLY ran with. Proves the
+    # parameter arrived rather than relying on it having been passed.
+    strategy_used: str | None = None
 
 
 @dataclass
@@ -187,6 +190,7 @@ class Setup:
     # Diagnostic only — no gate reads this. See extension_metrics().
     extension: dict = field(default_factory=dict)
     provisional: bool = False
+    strategy_requested: str | None = None
     notes: list = field(default_factory=list)
 
 
@@ -309,7 +313,14 @@ def swing_highs(df: pd.DataFrame, span: int = 3) -> list[int]:
 # the q4 inversion was traced to this selector. This comment previously
 # still described best_quality as the live path, which stopped being true
 # that same round.
-BASE_SELECTION_STRATEGIES = ("best_quality", "first_valid", "fixed_window")
+BASE_SELECTION_STRATEGIES = ("best_quality", "first_valid", "fixed_window",
+                             "first_valid_quality_gated")
+# Fourth option: take the first valid window, but only if it also clears a
+# minimum quality bar. first_valid can accept a technically-valid but poor
+# base purely because it appeared first; best_quality's own top quartile
+# loses. This sits between them — earliest acceptable rather than earliest
+# or best-scoring.
+FIRST_VALID_MIN_QUALITY = float(os.environ.get("FIRST_VALID_MIN_QUALITY", "40"))
 # Live default is first_valid, NOT best_quality.
 #
 # base_quality_quartile.q4 — the top bucket of the quality formula's own
@@ -501,13 +512,18 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
 
         candidate = Base(pattern, seg_start, pivot_idx, pivot, base_low, depth,
                          lookback, dryup, contraction, prior_gain, quality,
-                         contracting, obv_rising)
+                         contracting, obv_rising, strategy_used=strategy)
 
         if strategy == "first_valid":
             # Stop at the first legitimate window — no ranking against the
             # (now suspect) composite score.
             best = candidate
             break
+        if strategy == "first_valid_quality_gated":
+            if candidate.quality >= FIRST_VALID_MIN_QUALITY:
+                best = candidate
+                break
+            continue   # keep scanning for the first window that clears it
         if best is None or candidate.quality > best.quality:
             best = candidate
 
@@ -1853,6 +1869,7 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
         t2_basis=levels.get("t2_basis"),
         score_total=total, score_breakdown=breakdown,
         extension=extension, provisional=provisional,
+        strategy_requested=base_strategy,
         notes=[f"base {base.duration}d, depth {base.depth_pct:.1f}%"
                + (", contracting" if base.contracting else ""),
                f"stop from {levels['stop_basis']}", f"T1 from {levels['t1_basis']}"]

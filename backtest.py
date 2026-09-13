@@ -46,7 +46,8 @@ from gates import (
     relative_strength,
 )
 from ingest import connect
-from setups import BASE_SELECTION_STRATEGIES, Rejected, build_setup
+from setups import (BASE_SELECTION_STRATEGIES, DEFAULT_BASE_STRATEGY,
+                    Rejected, build_setup)
 
 log = logging.getLogger(__name__)
 
@@ -127,12 +128,28 @@ def _band(score: float) -> str:
 # entire +0.058R vs +0.016R discrepancy between exit_variants.baseline and
 # metrics.overall came from exactly that. Inferring behaviour from unrelated
 # flags is how that hid; naming it prevents a repeat.
+# Live exit policy. Changed from "baseline" to "let_it_run" after Run #28:
+# three no-scale-out variants outperformed baseline by roughly 3x on
+# full-period expectancy (0.072 -> 0.19-0.20), and the improvement held in
+# BOTH halves. The individual winner varies run to run; the family is what
+# is stable, so the default is set to a member of it rather than to whichever
+# variant topped one run.
+#
+# EXIT_VARIANT=baseline restores the previous behaviour exactly.
+EXIT_VARIANT = os.environ.get("EXIT_VARIANT", "let_it_run")
+
 EXIT_VARIANTS = {
     "baseline":        {"scale_pct": 50, "breakeven": True,  "trail": False, "max_hold": 40,  "t2_exit": True},
     "no_scale_out":    {"scale_pct": 0,  "breakeven": True,  "trail": False, "max_hold": 40,  "t2_exit": True},
     "no_breakeven":    {"scale_pct": 50, "breakeven": False, "trail": True,  "max_hold": 40,  "t2_exit": False},
     "let_it_run":      {"scale_pct": 0,  "breakeven": False, "trail": True,  "max_hold": 120, "t2_exit": False},
     "trail_only_long": {"scale_pct": 33, "breakeven": False, "trail": True,  "max_hold": 120, "t2_exit": False},
+    # New: hold the full position to T2, scale there, trail the remainder.
+    # Baseline scales at T1 and caps the winner early; let_it_run never
+    # scales at all. This tests whether the gain comes from not scaling, or
+    # simply from scaling LATER.
+    "scale_out_at_t2": {"scale_pct": 50, "breakeven": False, "trail": True,  "max_hold": 120,
+                        "t2_exit": False, "scale_at_t2": True},
 }
 
 
@@ -182,13 +199,16 @@ def _simulate_variant(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
             return _close(fwd, entry_idx, i, filled_at, live_stop, realised,
                           "stop" if not scaled else "trail_stop", mfe, mae)
 
-        if scale_pct and not scaled and high >= t1:
-            realised += scale_pct * (t1 - filled_at) / risk
+        # scale_at_t2 defers the partial exit to T2 instead of T1.
+        scale_level = (t2 if cfg.get("scale_at_t2") and t2 else t1)
+        if scale_pct and not scaled and high >= scale_level:
+            realised += scale_pct * (scale_level - filled_at) / risk
             remaining -= scale_pct
             scaled = True
             if remaining <= 0:
-                return _close(fwd, entry_idx, i, filled_at, t1, realised,
-                              "target", mfe, mae)
+                return _close(fwd, entry_idx, i, filled_at, scale_level, realised,
+                              "target2" if cfg.get("scale_at_t2") else "target",
+                              mfe, mae)
 
         # Breakeven only where the variant asks for it.
         if cfg["breakeven"] and scaled and live_stop < filled_at:
@@ -229,7 +249,9 @@ def _simulate(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
     One code path removes that entire class of bug rather than patching this
     instance of it.
     """
-    return _simulate_variant(fwd, entry, stop, t1, t2, EXIT_VARIANTS["baseline"])
+    return _simulate_variant(fwd, entry, stop, t1, t2,
+                             EXIT_VARIANTS.get(EXIT_VARIANT,
+                                               EXIT_VARIANTS["baseline"]))
 
 
 def _close(fwd, entry_idx, exit_idx, filled_at, exit_px, realised_r,
@@ -529,8 +551,16 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
         # cheap gates three times. Only base selection and everything
         # downstream of it (trigger, levels, score, simulation) runs once
         # per strategy.
+        # Alternatives are every strategy EXCEPT the one the main loop
+        # already ran. This excluded "best_quality" by name, which was
+        # correct only while best_quality was the default. Once the default
+        # became first_valid the main trades were first_valid trades — and
+        # compare_base_strategies still labelled them "best_quality" while
+        # ALSO running first_valid as an alternative. The comparison was
+        # first_valid against itself under two names, which is exactly why
+        # Run #28 returned byte-identical buckets, splits and metrics.
         base_strategy_trades: dict[str, list[dict]] = {
-            s: [] for s in BASE_SELECTION_STRATEGIES if s != "best_quality"}
+            s: [] for s in BASE_SELECTION_STRATEGIES if s != DEFAULT_BASE_STRATEGY}
         day_set = set(trading_days)
 
         for sym in universe:
@@ -724,6 +754,26 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
         conn.close()
 
 
+def _exit_reason_counts(trades: list[dict], variant: str) -> dict:
+    """
+    Exit-reason distribution per variant.
+
+    Only the live-path simulation records a per-trade exit_reason; the
+    variant side-simulations record R alone. Reported for the live variant
+    and left empty for the others rather than inventing a number, so an
+    absent distribution is visibly absent.
+    """
+    if variant != EXIT_VARIANT:
+        return {"note": "recorded for the live variant only"}
+    counts: dict = {}
+    for t in trades:
+        if t["variants"].get(variant) is None:
+            continue
+        reason = t.get("exit_reason") or "unknown"
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def compare_exits(trades: list[dict]) -> dict:
     """
     Expectancy of each exit policy, on the SAME signals, in BOTH halves.
@@ -755,11 +805,24 @@ def compare_exits(trades: list[dict]) -> dict:
             }
         allr = [t["variants"].get(name) for t in dated
                 if t["variants"].get(name) is not None]
+        wins = [r for r in allr if r > 0]
+        losses = [r for r in allr if r <= 0]
         row["full"] = {
             "filled": len(allr),
             "expectancy_r": round(sum(allr) / len(allr), 3) if allr else None,
             "total_r": round(sum(allr), 1) if allr else None,
+            # Per-variant detail required by the C2 manifest. Additive —
+            # every field the previous output had is still present above.
+            "hit_rate": round(len(wins) / len(allr), 3) if allr else None,
+            "avg_winner_r": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loser_r": round(sum(losses) / len(losses), 2) if losses else None,
+            "avg_bars_held": round(
+                sum(t.get("bars_held") or 0 for t in dated
+                    if t["variants"].get(name) is not None)
+                / max(len(allr), 1), 1) if allr else None,
+            "exit_reasons": _exit_reason_counts(dated, name),
         }
+        row["is_live_default"] = (name == EXIT_VARIANT)
         ef, es = row["first"]["expectancy_r"], row["second"]["expectancy_r"]
         row["positive_in_both_halves"] = bool(
             ef is not None and es is not None and ef > 0 and es > 0)
@@ -836,7 +899,10 @@ def compare_base_strategies(main_trades: list[dict],
     if it beats best_quality in BOTH halves — the same bar every other
     finding in this backtest has had to clear.
     """
-    all_strategies = {"best_quality": main_trades, **base_strategy_trades}
+    # Keyed by the strategy that ACTUALLY produced them. Hardcoding
+    # "best_quality" here mislabelled the main group the moment the default
+    # changed, and silently turned the comparison into a self-comparison.
+    all_strategies = {DEFAULT_BASE_STRATEGY: main_trades, **base_strategy_trades}
 
     def stats(subset):
         rs = [t["r_realised"] for t in subset if t.get("r_realised") is not None]
@@ -863,28 +929,30 @@ def compare_base_strategies(main_trades: list[dict],
             "positive_in_both_halves": bool(
                 first["expectancy_r"] is not None and second["expectancy_r"] is not None
                 and first["expectancy_r"] > 0 and second["expectancy_r"] > 0),
-            "beats_best_quality_both_halves": None,   # filled in below
+            "beats_live_default_both_halves": None,   # filled in below
         }
 
-    baseline = out.get("best_quality", {})
+    baseline = out.get(DEFAULT_BASE_STRATEGY, {})
     for name, row in out.items():
-        if name == "best_quality" or "error" in row:
+        if name == DEFAULT_BASE_STRATEGY or "error" in row:
             continue
         bf, bs = baseline.get("first_half", {}), baseline.get("second_half", {})
         if (row["first_half"].get("expectancy_r") is not None
                 and bf.get("expectancy_r") is not None
                 and row["second_half"].get("expectancy_r") is not None
                 and bs.get("expectancy_r") is not None):
-            row["beats_best_quality_both_halves"] = bool(
+            row["beats_live_default_both_halves"] = bool(
                 row["first_half"]["expectancy_r"] > bf["expectancy_r"]
                 and row["second_half"]["expectancy_r"] > bs["expectancy_r"])
 
     winners = [n for n, r in out.items()
-              if n != "best_quality" and r.get("beats_best_quality_both_halves")]
+              if n != DEFAULT_BASE_STRATEGY
+              and r.get("beats_live_default_both_halves")]
     out["verdict"] = {
         "adopt_candidate": winners[0] if len(winners) == 1 else None,
         "beats_baseline_both_halves": winners,
-        "note": ("A strategy must beat the current best_quality approach in "
+        "live_default": DEFAULT_BASE_STRATEGY,
+        "note": ("A strategy must beat the CURRENT LIVE DEFAULT in "
                  "BOTH halves to be a candidate for live code. Beating it only "
                  "in the full-period average, or in one half, is the same "
                  "illusion the split test exists to catch."),
