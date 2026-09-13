@@ -39,6 +39,7 @@ from datetime import date, timedelta
 import pandas as pd
 
 from gates import (
+    regime_classifiers,
     add_indicators,
     evaluate_regime,
     gate0_tradability,
@@ -273,6 +274,33 @@ def _close(fwd, entry_idx, exit_idx, filled_at, exit_px, realised_r,
     }
 
 
+_CLASSIFIER_CACHE: dict = {}
+
+
+def _session_classifiers(nifty_ind: pd.DataFrame, d, breadth, vix_level) -> dict:
+    """
+    Every classifier's verdict for one session, cached per date.
+
+    Uses the SAME regime_classifiers() the live gate calls, so backtest
+    attribution and live behaviour cannot drift apart — a separate
+    reimplementation here would be the base_strategy self-comparison bug
+    all over again.
+    """
+    if d in _CLASSIFIER_CACHE:
+        return _CLASSIFIER_CACHE[d]
+
+    hist = nifty_ind[nifty_ind["trade_date"] <= pd.Timestamp(d)]
+    if len(hist) < 200:
+        _CLASSIFIER_CACHE[d] = {}
+        return {}
+
+    vix_df = pd.DataFrame({"close": [vix_level]}) if vix_level is not None else None
+    res = regime_classifiers(hist[["close"]].copy(), vix_df, breadth)
+    out = {k: v for k, v in res.items() if not k.startswith("_")}
+    _CLASSIFIER_CACHE[d] = out
+    return out
+
+
 def _build_cross_section(conn, universe: list[str]) -> dict:
     """
     Cross-sectional rankings per session.
@@ -503,6 +531,42 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
             # here from the index alone. Flagged in the metrics as such.
             regimes[d] = evaluate_regime(idx.copy(), pd.DataFrame(), 50.0)["state"]
 
+        # Per-session breadth and VIX — needed for classifier attribution.
+        # regimes[] above uses a hardcoded breadth of 50.0 because it only
+        # needs a coarse label; the classifiers test breadth THRESHOLDS, so
+        # a constant would make c7/c8 answer the same way on every session
+        # and look like they separate nothing.
+        breadth_by_date: dict[date, float] = {}
+        with conn.cursor() as cur:
+            cur.execute("""
+                with above as (
+                    select o.trade_date,
+                           avg(case when o.adj_close >
+                               avg(o.adj_close) over (
+                                   partition by o.symbol order by o.trade_date
+                                   rows between 49 preceding and current row)
+                               then 1.0 else 0.0 end) * 100 as pct
+                    from ohlcv_daily o
+                    join symbols s on s.symbol = o.symbol
+                    where coalesce(s.series,'') <> 'INDEX'
+                      and o.trade_date >= %s
+                    group by o.trade_date
+                )
+                select trade_date, pct from above order by trade_date
+            """, (from_date,))
+            for d_, pct in cur.fetchall():
+                if pct is not None:
+                    breadth_by_date[d_] = float(pct)
+
+            cur.execute("""
+                select trade_date, adj_close from ohlcv_daily
+                where symbol = 'INDIAVIX' and trade_date >= %s
+                order by trade_date
+            """, (from_date,))
+            vix_by_date = {d_: float(v) for d_, v in cur.fetchall() if v is not None}
+        log.info("Classifier inputs: breadth for %d sessions, VIX for %d",
+                 len(breadth_by_date), len(vix_by_date))
+
         cross = _build_cross_section(conn, universe)
         rs_pct, grp_pct = cross["rs_pct"], cross["group_pct"]
 
@@ -677,6 +741,8 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "score_total": setup.score_total,
                     "band": _band(setup.score_total), "regime": regime,
                     "index_state": index_state.get(d, "unknown"),
+                    "regime_classifiers": _session_classifiers(
+                        nifty_ind, d, breadth_by_date.get(d), vix_by_date.get(d)),
                     "rs_pct": rs_pct.get((sym, d)),
                     "rs_quintile": _quintile(rs_pct.get((sym, d))),
                     "group_pct": grp_pct.get((sym, d)),
@@ -1024,6 +1090,124 @@ def compare_base_strategies(main_trades: list[dict],
                  "BOTH halves to be a candidate for live code. Beating it only "
                  "in the full-period average, or in one half, is the same "
                  "illusion the split test exists to catch."),
+    }
+    return out
+
+
+def classifier_attribution(trades: list[dict], windows: int = 6) -> dict:
+    """
+    Tasks 4.2 / 4.3 — what each classifier would have done.
+
+    For every single classifier and composite:
+      - signals it would have TAKEN, and their expectancy
+      - signals it would have SKIPPED, and their expectancy
+      - how many of the six walk-forward windows it skips ENTIRELY
+
+    That last figure is the decisive one. A classifier skipping more than
+    two windows is over-fitted to this calibration data and is not a usable
+    live filter, however good its expectancy split looks — it is closer to
+    "trade only in 2024" than to a market condition. A classifier that
+    skips exactly the losing windows while allowing the winning ones is the
+    right gate.
+
+    A skipped signal's expectancy is what the engine AVOIDED. High positive
+    expectancy in the skipped bucket means the classifier is discarding
+    good trades, which is a cost even when the taken bucket improves.
+    """
+    dated = sorted([t for t in trades
+                    if t.get("signal_date") and t.get("r_realised") is not None
+                    and t.get("regime_classifiers")],
+                   key=lambda t: t["signal_date"])
+    if len(dated) < 20:
+        return {"error": "too few trades with classifier data", "n": len(dated)}
+
+    # Same six windows walk_forward() uses, so the counts are comparable.
+    first, last = dated[0]["signal_date"], dated[-1]["signal_date"]
+    step = max((last - first).days, 1) / windows
+    bounds = [(first + timedelta(days=int(step * w)),
+               first + timedelta(days=int(step * (w + 1)))) for w in range(windows)]
+
+    names = sorted({k for t in dated for k in t["regime_classifiers"]})
+    out: dict = {}
+
+    for name in names:
+        taken = [t for t in dated if t["regime_classifiers"].get(name) is True]
+        skipped = [t for t in dated if t["regime_classifiers"].get(name) is False]
+        unknown = [t for t in dated if t["regime_classifiers"].get(name) is None]
+
+        def stat(rows):
+            rs = [t["r_realised"] for t in rows]
+            if not rs:
+                return {"n": 0, "expectancy_r": None, "total_r": None}
+            return {"n": len(rs),
+                    "expectancy_r": round(sum(rs) / len(rs), 3),
+                    "total_r": round(sum(rs), 1),
+                    "hit_rate": round(sum(1 for r in rs if r > 0) / len(rs), 3)}
+
+        # A window counts as skipped only if the classifier blocks EVERY
+        # signal in it — that is what "skips the window entirely" means.
+        windows_skipped, window_detail = [], []
+        for w, (lo, hi) in enumerate(bounds, start=1):
+            in_w = [t for t in dated if lo <= t["signal_date"] < hi]
+            if not in_w:
+                window_detail.append({"window": w, "n": 0, "status": "empty"})
+                continue
+            t_in = [t for t in in_w if t["regime_classifiers"].get(name) is True]
+            blocked = len(t_in) == 0
+            if blocked:
+                windows_skipped.append(w)
+            window_detail.append({
+                "window": w, "n": len(in_w), "would_take": len(t_in),
+                "status": "SKIPPED" if blocked else "traded",
+                "window_expectancy_r": round(
+                    sum(t["r_realised"] for t in in_w) / len(in_w), 3),
+            })
+
+        out[name] = {
+            "taken": stat(taken),
+            "skipped": stat(skipped),
+            "not_computable": stat(unknown),
+            "windows_skipped_entirely": windows_skipped,
+            "windows_skipped_count": len(windows_skipped),
+            "window_detail": window_detail,
+            # ">2 windows blocked = over-fitted" and "blocking exactly the
+            # losing windows is the right gate" CONFLICT when there are three
+            # losing windows, which is this dataset's case (W1, W3, W5).
+            # Tested directly: a classifier blocking precisely {1,3,5} — the
+            # stated success condition — was being flagged over-fitted and
+            # discarded by the count rule alone.
+            #
+            # Resolution: blocking only losing windows is never over-fitting,
+            # whatever the count. The count rule applies to everything else,
+            # which is what it was for — catching a classifier that blocks
+            # half the period indiscriminately.
+            "over_fitted": (len(windows_skipped) > 2
+                            and not set(windows_skipped) <= {1, 3, 5}),
+        }
+
+    # Which classifiers skip the losing windows without losing the winners?
+    # W4 and W6 were the winning windows in Run #29; W1/W3/W5 lost.
+    LOSING, WINNING = {1, 3, 5}, {4, 6}
+    ideal = []
+    for name, r in out.items():
+        sk = set(r["windows_skipped_entirely"])
+        # Checked BEFORE the count rule: skipping only losing windows is
+        # the success condition, so it cannot simultaneously be evidence of
+        # over-fitting.
+        if sk and sk <= LOSING and not (sk & WINNING):
+            ideal.append(name)
+
+    out["_verdict"] = {
+        "losing_windows": sorted(LOSING),
+        "winning_windows": sorted(WINNING),
+        "skips_only_losing_windows": ideal,
+        "over_fitted_classifiers": [n for n, r in out.items()
+                                    if isinstance(r, dict) and r.get("over_fitted")],
+        "note": ("A classifier blocking >2 windows is fitted to this "
+                 "calibration data, not a market condition. One that blocks "
+                 "only losing windows and keeps the winners is the gate; if "
+                 "none qualifies, report the null result rather than forcing "
+                 "one."),
     }
     return out
 

@@ -1602,12 +1602,16 @@ def backtest_job(request: Request):
             result = run_backtest(from_date, to_date, step=step)
             from backtest import (compare_base_strategies, compare_exits,
                                  diagnose_quality_quartile, simulate_portfolio,
-                                 split_sample, walk_forward, winning_profile)
+                                 classifier_attribution, split_sample,
+                                 walk_forward, winning_profile)
             metrics = summarise(result["trades"])
             metrics["split_sample"] = split_sample(result["trades"])
             # The pass/fail gate. Read this before overall expectancy — a
             # positive total that rests on one window is not an edge.
             metrics["walk_forward"] = walk_forward(result["trades"])
+            # Tasks 4.2 / 4.3 — what each classifier would have done.
+            metrics["classifier_attribution"] = classifier_attribution(
+                result["trades"])
             metrics["winning_profile"] = winning_profile(result["trades"])
             metrics["quality_diagnosis_q4"] = diagnose_quality_quartile(
                 result["trades"], "q4")
