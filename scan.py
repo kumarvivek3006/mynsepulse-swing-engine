@@ -36,7 +36,8 @@ from gates import (
 from ingest import connect
 from upstox_client import IST
 from fundamentals import load_snapshots
-from setups import Rejected, build_setup, minervini_no_rs_count
+from setups import (Rejected, build_setup, minervini_no_rs_count,
+                    minervini_no_rs_reset)
 
 log = logging.getLogger(__name__)
 
@@ -584,6 +585,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             for rank, (sym_, _ret) in enumerate(rows):
                 rs_percentiles[sym_] = round(rank / max(n - 1, 1) * 100, 1)
         log.info("RS percentiles computed for %d symbols", len(rs_percentiles))
+
+        # Reset at scan START. Previously cleared only when the summary
+        # read it, so a scan that failed earlier left its count to the next.
+        minervini_no_rs_reset()
 
         signals: list[dict] = []
         log_rows: list[tuple] = []

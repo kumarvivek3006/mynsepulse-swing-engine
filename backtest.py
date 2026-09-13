@@ -539,20 +539,31 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
         breadth_by_date: dict[date, float] = {}
         with conn.cursor() as cur:
             cur.execute("""
-                with above as (
-                    select o.trade_date,
-                           avg(case when o.adj_close >
-                               avg(o.adj_close) over (
-                                   partition by o.symbol order by o.trade_date
-                                   rows between 49 preceding and current row)
-                               then 1.0 else 0.0 end) * 100 as pct
+                -- Window function in a CTE, aggregate in the outer query.
+                -- These cannot be combined: avg(...) over (...) nested
+                -- inside avg(...) is invalid SQL and failed the run in 8
+                -- seconds with GroupingError.
+                with dma as (
+                    select o.symbol, o.trade_date, o.adj_close,
+                           avg(o.adj_close) over (
+                               partition by o.symbol order by o.trade_date
+                               rows between 49 preceding and current row
+                           ) as sma50,
+                           count(*) over (
+                               partition by o.symbol order by o.trade_date
+                               rows between 49 preceding and current row
+                           ) as bars
                     from ohlcv_daily o
                     join symbols s on s.symbol = o.symbol
                     where coalesce(s.series,'') <> 'INDEX'
-                      and o.trade_date >= %s
-                    group by o.trade_date
                 )
-                select trade_date, pct from above order by trade_date
+                select trade_date,
+                       avg((adj_close > sma50)::int::float) * 100 as pct
+                from dma
+                -- bars = 50 excludes the warm-up window: a 3-bar average is
+                -- not a 50DMA, and counting it would overstate early breadth.
+                where sma50 is not null and bars = 50 and trade_date >= %s
+                group by trade_date order by trade_date
             """, (from_date,))
             for d_, pct in cur.fetchall():
                 if pct is not None:

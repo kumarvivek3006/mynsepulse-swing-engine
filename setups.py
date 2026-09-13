@@ -1820,14 +1820,50 @@ TRANSITION_VOL_MULT = float(os.environ.get("TRANSITION_VOL_MULT", "2.0"))
 
 # Counts Minervini passes where the RS component was skipped for want of a
 # percentile. Drained by the scan into its summary.
-_MINERVINI_NO_RS: list = []
+# Module-level, so it accumulates across EVERY call in the process — not
+# per scan. Two faults followed from that, and 795 on a 500-symbol scan is
+# the visible symptom of both:
+#
+#  1. Never reset at the START of a scan. It was only cleared when the
+#     summary READ it, so a scan that raised before reaching the summary
+#     left its count to be inherited by the next one. The intraday slots
+#     run hourly, so a day's counts compound.
+#
+#  2. Counted per CALL, not per SYMBOL. build_setup runs more than once
+#     for the same symbol — the breakout-retest path calls it, the
+#     standard path calls it again, and the backtest additionally calls it
+#     once per alternative base strategy. A symbol reaching Minervini
+#     three ways counted three times.
+#
+# Now a SET of symbols, reset explicitly at scan start. The count can no
+# longer exceed the universe size, which is what makes it readable.
+_MINERVINI_NO_RS: set = set()
 
 
-def minervini_no_rs_count(reset: bool = True) -> int:
+def minervini_no_rs_reset() -> None:
+    """Called at scan start. Without this the counter is cumulative across
+    every scan in the process lifetime."""
+    _MINERVINI_NO_RS.clear()
+
+
+def minervini_no_rs_count(reset: bool = False) -> int:
+    """
+    Distinct symbols that cleared Minervini with the RS check SKIPPED for
+    want of a percentile.
+
+    reset defaults to False now: reading a diagnostic should not mutate it.
+    Resetting on read meant the value depended on whether anything else had
+    read it first.
+    """
     n = len(_MINERVINI_NO_RS)
     if reset:
         _MINERVINI_NO_RS.clear()
     return n
+
+
+# Set by build_setup so _minervini_ok can attribute the skip to a symbol
+# without changing its signature everywhere it is called.
+_minervini_symbol_hint: list = ["?"]
 
 
 def _minervini_ok(last, rs_rank_pct: float | None) -> tuple[bool, str | None]:
@@ -1885,7 +1921,9 @@ def _minervini_ok(last, rs_rank_pct: float | None) -> tuple[bool, str | None]:
     # counted as a "pass without RS". The summary key promises passes; it
     # was reporting arrivals.
     if rs_skipped:
-        _MINERVINI_NO_RS.append(1)
+        # Symbol-keyed: build_setup can run several times for one symbol
+        # (retest path, standard path, per-strategy in the backtest).
+        _MINERVINI_NO_RS.add(_minervini_symbol_hint[0])
     return True, None
 
 
