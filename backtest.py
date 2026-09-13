@@ -892,6 +892,127 @@ def compare_base_strategies(main_trades: list[dict],
     return out
 
 
+def walk_forward(trades: list[dict], windows: int = 6) -> dict:
+    """
+    Six consecutive 6-month windows, each scored on its own trades.
+
+    split_sample() halves the period once, which a single favourable stretch
+    can dominate — Run #27 is +0.072R overall but -0.323R / +0.472R by half,
+    so the positive result rests entirely on the back end. Six windows show
+    whether the edge recurs or happened once.
+
+    NOTE ON "OPTIMISATION": no parameter is fitted per window here. Fitting
+    thresholds on window N and testing on N+1 across ~175 trades would mean
+    optimising on ~29 trades a window, which produces a number that looks
+    like validation and is noise. This reports each window's OUT-OF-SAMPLE
+    expectancy under one fixed configuration — the honest version of the
+    same question, and the one whose pass/fail can be trusted.
+
+    Pass criterion: at least 4 of 6 windows positive.
+    """
+    dated = sorted([t for t in trades
+                    if t.get("signal_date") and t.get("r_realised") is not None],
+                   key=lambda t: t["signal_date"])
+    if len(dated) < windows * 5:
+        return {"error": "too few trades to split", "n": len(dated),
+                "windows": windows, "passed": False}
+
+    first, last = dated[0]["signal_date"], dated[-1]["signal_date"]
+    span_days = max((last - first).days, 1)
+    step = span_days / windows
+
+    out, positive = [], 0
+    for w in range(windows):
+        lo = first + timedelta(days=int(step * w))
+        hi = first + timedelta(days=int(step * (w + 1)))
+        subset = [t for t in dated
+                  if lo <= t["signal_date"] < hi
+                  or (w == windows - 1 and t["signal_date"] == last)]
+        rs = [t["r_realised"] for t in subset]
+        exp = round(sum(rs) / len(rs), 3) if rs else None
+        if exp is not None and exp > 0:
+            positive += 1
+        out.append({
+            "window": w + 1,
+            "from": str(lo), "to": str(hi),
+            "n": len(rs),
+            "expectancy_r": exp,
+            "total_r": round(sum(rs), 2) if rs else None,
+            "hit_rate": round(sum(1 for r in rs if r > 0) / len(rs), 3) if rs else None,
+        })
+
+    underpowered = [w["window"] for w in out if (w["n"] or 0) < 15]
+    return {
+        "windows": out,
+        "positive_windows": positive,
+        "required": 4,
+        "passed": positive >= 4,
+        "underpowered_windows": underpowered,
+        "note": ("Pass needs 4 of 6 windows positive. Windows with n<15 are "
+                 "flagged: a positive sign on a handful of trades is not "
+                 "evidence, and a pass carried by them should be read as a "
+                 "fail."),
+    }
+
+
+def winning_profile(trades: list[dict]) -> dict:
+    """
+    The subset the evidence actually supports, measured as one book.
+
+    Defined BEFORE looking at its result, from findings that already held:
+    flat_base was the best-performing pattern, and RSI 70-80 was the only
+    sub-signal positive in both halves of Run #21.
+
+    Acceptance: n >= 100, expectancy >= +0.3R, positive in BOTH halves.
+    A subset that clears expectancy but fails the sign test is the same
+    illusion the whole split-sample discipline exists to catch.
+    """
+    def in_profile(t):
+        pattern = (t.get("pattern") or "")
+        setup = (t.get("setup_type") or "")
+        rsi_zone = t.get("rsi_zone")
+        if pattern == "flat_base":
+            return True
+        if rsi_zone == "overbought_70_80":
+            return True
+        if setup.startswith("breakout") and t.get("breakout_rsi") == "breakout_rsi_70_80":
+            return True
+        return False
+
+    subset = sorted([t for t in trades
+                     if in_profile(t) and t.get("r_realised") is not None
+                     and t.get("signal_date")],
+                    key=lambda t: t["signal_date"])
+    if not subset:
+        return {"error": "no trades matched the profile", "n": 0, "accepted": False}
+
+    def stats(rows):
+        rs = [t["r_realised"] for t in rows]
+        if not rs:
+            return {"n": 0, "expectancy_r": None, "hit_rate": None, "total_r": None}
+        wins = [r for r in rs if r > 0]
+        return {"n": len(rs),
+                "expectancy_r": round(sum(rs) / len(rs), 3),
+                "hit_rate": round(len(wins) / len(rs), 3),
+                "total_r": round(sum(rs), 2),
+                "avg_win": round(sum(wins) / len(wins), 2) if wins else None}
+
+    mid = len(subset) // 2
+    full, a, b = stats(subset), stats(subset[:mid]), stats(subset[mid:])
+    both_positive = (a["expectancy_r"] is not None and b["expectancy_r"] is not None
+                     and a["expectancy_r"] > 0 and b["expectancy_r"] > 0)
+
+    return {
+        "definition": "flat_base OR rsi_zone=overbought_70_80 OR breakout_rsi_70_80",
+        "full": full, "first_half": a, "second_half": b,
+        "both_halves_positive": both_positive,
+        "accepted": bool(full["n"] >= 100
+                         and (full["expectancy_r"] or 0) >= 0.3
+                         and both_positive),
+        "acceptance": "n >= 100 AND expectancy >= +0.3R AND positive in both halves",
+    }
+
+
 def split_sample(trades: list[dict]) -> dict:
     """
     Does anything hold across BOTH halves of the period?
