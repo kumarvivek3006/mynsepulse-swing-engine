@@ -169,10 +169,14 @@ def _swing_low(lows: list, i: int) -> float | None:
 
 
 def _simulate_variant(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
-                      t2: float | None, cfg: dict) -> dict | None:
+                      t2: float | None, cfg: dict,
+                      expiry_sessions: int | None = None) -> dict | None:
     """One exit policy. Entry logic is identical across variants."""
     filled_at = entry_idx = None
-    for i in range(min(EXPIRY_SESSIONS, len(fwd))):
+    # Explicit rather than read from the module global, so a what-if can
+    # vary it without mutating engine state. Defaults to the live value.
+    expiry = expiry_sessions if expiry_sessions is not None else EXPIRY_SESSIONS
+    for i in range(min(expiry, len(fwd))):
         bar = fwd.iloc[i]
         if bar["high"] >= entry:
             filled_at = max(float(entry), float(bar["open"]))
@@ -1321,6 +1325,108 @@ def _window_outcomes(trades: list[dict], windows: int = 6) -> tuple[set, set, li
                        "expectancy_r": round(exp, 3),
                        "outcome": "winning" if exp > 0 else "losing"})
     return losing, winning, detail
+
+
+def never_triggered_whatif(conn, run_id: int, extended_expiry: int = 20,
+                           variant: str | None = None) -> dict:
+    """
+    Task 5.4 — what the never-triggered signals would have done.
+
+    Reads stored signals and replays them through the SAME
+    _simulate_variant the engine uses, with only the expiry window
+    changed. Reimplementing the exit logic here would measure a copy of
+    the engine rather than the engine.
+
+    Nothing is written and no engine parameter changes.
+    """
+    cfg = EXIT_VARIANTS.get(variant or EXIT_VARIANT, EXIT_VARIANTS["let_it_run"])
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select symbol, signal_date, setup_type, pattern,
+                   entry_trigger, stop_loss, t1, t2
+            from backtest_trades
+            where run_id = %s and r_realised is null
+              and entry_trigger is not null and stop_loss is not null
+            order by signal_date
+        """, (run_id,))
+        rows = cur.fetchall()
+
+    if not rows:
+        return {"error": "no never-triggered signals with levels",
+                "run_id": run_id}
+
+    filled, never, by_bucket = [], 0, {}
+    for sym, sig_date, setup_type, pattern, entry, stop, t1, t2 in rows:
+        with conn.cursor() as cur:
+            cur.execute("""
+                select trade_date, adj_open, adj_high, adj_low, adj_close
+                from ohlcv_daily
+                where symbol = %s and trade_date > %s
+                order by trade_date limit %s
+            """, (sym, sig_date, extended_expiry + cfg["max_hold"]))
+            bars = cur.fetchall()
+        if len(bars) < 2:
+            continue
+
+        fwd = pd.DataFrame(bars, columns=["trade_date", "open", "high",
+                                          "low", "close"])
+        for c in ("open", "high", "low", "close"):
+            fwd[c] = pd.to_numeric(fwd[c])
+
+        # Which session would it have triggered on?
+        hit = fwd.index[fwd["high"] >= float(entry)]
+        if len(hit) == 0:
+            never += 1
+            continue
+        session = int(hit[0]) + 1
+        if session <= EXPIRY_SESSIONS:
+            # Should already have filled — a data mismatch, not a finding.
+            by_bucket.setdefault("would_have_filled_in_original_window", []).append(None)
+            continue
+
+        # Extended window passed explicitly — no global mutation, so a
+        # concurrent scan cannot see a changed expiry.
+        res = _simulate_variant(fwd, float(entry), float(stop),
+                                float(t1) if t1 else float(entry) * 1.05,
+                                float(t2) if t2 else None, cfg,
+                                expiry_sessions=extended_expiry)
+
+        if res and res.get("r_realised") is not None:
+            bucket = "day_6_10" if session <= 10 else "day_11_20"
+            rec = {"symbol": sym, "signal_date": sig_date,
+                   "setup_type": setup_type, "pattern": pattern,
+                   "trigger_session": session,
+                   "r_realised": res["r_realised"],
+                   "exit_reason": res["exit_reason"],
+                   "max_favourable_r": res["max_favourable_r"],
+                   "max_adverse_r": res["max_adverse_r"]}
+            filled.append(rec)
+            by_bucket.setdefault(bucket, []).append(rec)
+
+    def stat(recs):
+        rs = [r["r_realised"] for r in recs if isinstance(r, dict)]
+        if not rs:
+            return {"n": len([r for r in recs if r is None]) or 0,
+                    "expectancy_r": None}
+        wins = [r for r in rs if r > 0]
+        return {"n": len(rs), "expectancy_r": round(sum(rs) / len(rs), 3),
+                "total_r": round(sum(rs), 2),
+                "hit_rate": round(len(wins) / len(rs), 3)}
+
+    return {
+        "run_id": run_id,
+        "exit_variant": variant or EXIT_VARIANT,
+        "original_expiry_sessions": EXPIRY_SESSIONS,
+        "extended_expiry_sessions": extended_expiry,
+        "never_triggered_examined": len(rows),
+        "never_trigger_in_20": never,
+        "by_bucket": {k: stat(v) for k, v in by_bucket.items()},
+        "all_late_fills": stat(filled),
+        "note": ("Hypothetical. These trades were never taken. A positive "
+                 "expectancy here means the 5-session expiry is discarding "
+                 "edge; a negative one means it is working as intended."),
+    }
 
 
 def classifier_improves_walk_forward(trades: list[dict], windows: int,

@@ -1763,6 +1763,26 @@ def backtest_job(request: Request):
     return {"ok": True, "started": True, "from": str(from_date), "to": str(to_date)}
 
 
+@app.get("/jobs/never-triggered-whatif")
+def never_triggered_whatif_endpoint(request: Request,
+                                    run_id: int = Query(34),
+                                    expiry: int = Query(20)):
+    """
+    Task 5.4 — replay never-triggered signals with a longer expiry.
+
+    Read-only. Changes no engine parameter and writes nothing.
+    """
+    require_internal_key(request)
+    from backtest import never_triggered_whatif
+    from ingest import connect
+
+    conn = connect()
+    try:
+        return never_triggered_whatif(conn, run_id, expiry)
+    finally:
+        conn.close()
+
+
 @app.get("/jobs/backtest")
 def backtest_results(request: Request):
     """Latest backtest run with its metrics."""
