@@ -650,6 +650,11 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                         "score_total": alt_setup.score_total,
                         "band": _band(alt_setup.score_total), "regime": regime,
                         "strategy_used": alt_setup.base.strategy_used,
+                        # Taken from the Setup that produced this signal, not
+                        # from the harness env var: a trade whose base came
+                        # from the flag fallback has strategy_used=None while
+                        # strategy_requested still records what was asked for.
+                        "strategy_requested": alt_setup.strategy_requested,
                         "base_start_idx": alt_setup.base.start_idx,
                         "base_duration": alt_setup.base.duration,
                         "base_quality": round(alt_setup.base.quality, 2),

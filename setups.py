@@ -377,7 +377,11 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         quality ranking at all. Mirrors a trader taking the most recent
         legitimate base rather than grading twenty of them against a
         formula.
-      "first_valid_quality_gated" — scan shortest-to-longest like
+      "first_valid_quality_gated" (can reject with
+        no_base_quality_below_floor, which is DISTINCT from
+        no_base_no_windows: the former means windows were valid but all
+        scored under FIRST_VALID_MIN_QUALITY, the latter that none were
+        valid at all) — scan shortest-to-longest like
         first_valid, but skip windows scoring below FIRST_VALID_MIN_QUALITY
         and take the first that clears it. Sits between the other two:
         first_valid can accept a technically-valid but poor base purely
@@ -549,7 +553,13 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
             if candidate.quality >= FIRST_VALID_MIN_QUALITY:
                 best = candidate
                 break
-            continue   # keep scanning for the first window that clears it
+            # Counted. Without this the window was discarded silently and
+            # the eventual failure surfaced as no_base_no_windows — which is
+            # indistinguishable from "the loop never ran" and "nothing was
+            # valid". A window that passed every validity check and failed
+            # only the quality floor is a different diagnosis entirely.
+            _note("quality_below_floor")
+            continue
         if best is None or candidate.quality > best.quality:
             best = candidate
 

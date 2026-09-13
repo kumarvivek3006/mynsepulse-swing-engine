@@ -1638,9 +1638,18 @@ def backtest_job(request: Request):
                                  score_total, band, regime, entry_trigger, stop_loss,
                                  t1, t2, r_planned, entry_date, entry_price,
                                  exit_date, exit_price, exit_reason, r_realised,
-                                 max_favourable_r, max_adverse_r, bars_held)
+                                 max_favourable_r, max_adverse_r, bars_held,
+                                 -- C1: which strategy was asked for, and which
+                                 -- actually selected the base. Without these the
+                                 -- 3-year first_valid vs best_quality diagnostic
+                                 -- cannot be run at all — the scan path wrote
+                                 -- them into signals.notes but this insert
+                                 -- dropped them, so every historical row was null.
+                                 strategy_used, strategy_requested,
+                                 base_start_idx, base_duration, base_quality)
                             values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                    %s,%s,%s,%s,%s,%s,%s)
+                                    %s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s,%s)
                         """, (run_id, t["symbol"], t["signal_date"], t["setup_type"],
                               t["pattern"], t["score_total"], t["band"], t["regime"],
                               t["entry_trigger"], t["stop_loss"], t["t1"], t.get("t2"),
@@ -1648,7 +1657,10 @@ def backtest_job(request: Request):
                               t.get("exit_date"), t.get("exit_price"),
                               t.get("exit_reason"), t.get("r_realised"),
                               t.get("max_favourable_r"), t.get("max_adverse_r"),
-                              t.get("bars_held")))
+                              t.get("bars_held"),
+                              t.get("strategy_used"), t.get("strategy_requested"),
+                              t.get("base_start_idx"), t.get("base_duration"),
+                              t.get("base_quality")))
                     cur.execute("""
                         update backtest_runs set finished_at = now(), status = 'success',
                                universe = %s, signals = %s, metrics = %s
