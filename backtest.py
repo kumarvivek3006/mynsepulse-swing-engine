@@ -1357,6 +1357,10 @@ def never_triggered_whatif(conn, run_id: int, extended_expiry: int = 20,
                 "run_id": run_id}
 
     filled, never, by_bucket = [], 0, {}
+    # Per setup type as well as per bucket. armed and pullback have already
+    # diverged sharply on fill-later rate (40% vs 73%) and are different
+    # populations; a combined expectancy would average the answer away.
+    by_setup: dict = {}
     for sym, sig_date, setup_type, pattern, entry, stop, t1, t2 in rows:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1403,6 +1407,7 @@ def never_triggered_whatif(conn, run_id: int, extended_expiry: int = 20,
                    "max_adverse_r": res["max_adverse_r"]}
             filled.append(rec)
             by_bucket.setdefault(bucket, []).append(rec)
+            by_setup.setdefault(setup_type or "unknown", []).append(rec)
 
     def stat(recs):
         rs = [r["r_realised"] for r in recs if isinstance(r, dict)]
@@ -1422,7 +1427,13 @@ def never_triggered_whatif(conn, run_id: int, extended_expiry: int = 20,
         "never_triggered_examined": len(rows),
         "never_trigger_in_20": never,
         "by_bucket": {k: stat(v) for k, v in by_bucket.items()},
+        "by_setup_type": {k: stat(v) for k, v in by_setup.items()},
         "all_late_fills": stat(filled),
+        "scope": ("The 39 LATE-FILL signals only. The 47 that never trigger "
+                  "within 20 sessions are a DISJOINT population and are not "
+                  "addressed here — 18 of those are narrow misses (<1% short "
+                  "of trigger) and need a separate ENTRY_BUFFER experiment, "
+                  "not an expiry one."),
         "note": ("Hypothetical. These trades were never taken. A positive "
                  "expectancy here means the 5-session expiry is discarding "
                  "edge; a negative one means it is working as intended."),
