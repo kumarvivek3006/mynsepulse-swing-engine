@@ -458,9 +458,23 @@ TRANSITION_MIN_ABOVE_52W_LOW_PCT = float(
 #   - new highs minus new lows (needs rolling 52w extremes per symbol)
 # We ingest NIFTY50, NIFTY500 and INDIAVIX only. Building a proxy for any
 # of these from what we have would be inventing a number.
+# Default OFF. Run #31 measured the c1_and_c5_or_c7 default as INVERTED:
+# taken expectancy -0.071R against skipped +0.455R. Both components are
+# individually inverted too — above-200DMA and VIX<15 each select the worse
+# half. A gate that reliably picks the wrong side is worse than no gate, so
+# it ships disabled until a classifier earns it.
 REGIME_GATE_ENABLED = os.environ.get(
-    "REGIME_GATE_ENABLED", "true").lower() == "true"
+    "REGIME_GATE_ENABLED", "false").lower() == "true"
 REGIME_CLASSIFIER = os.environ.get("REGIME_CLASSIFIER", "c1_and_c5_or_c7")
+
+# c7 (breadth > 55%) applied PER SIGNAL rather than as a day-level gate.
+# It is the one classifier showing real separation (+0.508R between taken
+# and skipped) even though it does not flip the walk-forward. A per-signal
+# filter drops individual signals on weak-breadth days instead of blanking
+# the whole day, so partial days remain possible.
+BREADTH_FILTER_ENABLED = os.environ.get(
+    "BREADTH_FILTER_ENABLED", "false").lower() == "true"
+BREADTH_FILTER_MIN_PCT = float(os.environ.get("BREADTH_FILTER_MIN_PCT", "55"))
 REGIME_VIX_LOW = float(os.environ.get("REGIME_VIX_LOW", "15"))
 REGIME_VIX_HIGH = float(os.environ.get("REGIME_VIX_HIGH", "18"))
 REGIME_BREADTH_LOW = float(os.environ.get("REGIME_BREADTH_LOW", "55"))

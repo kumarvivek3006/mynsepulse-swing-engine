@@ -23,6 +23,8 @@ import gc
 import pandas as pd
 
 from gates import (
+    BREADTH_FILTER_ENABLED,
+    BREADTH_FILTER_MIN_PCT,
     REGIME_GATE_ENABLED,
     regime_gate_passes,
     gate2_fundamentals,
@@ -688,6 +690,18 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                     counts["no_intraday_bar"] = counts.get("no_intraday_bar", 0) + 1
                     continue
                 df = add_indicators(live)
+
+            # c7 per-signal breadth filter. Rejects the SIGNAL, not the day —
+            # a day-level gate blanks everything, which is what the inverted
+            # regime gate did. Logged with its own reason code so its cost is
+            # attributable if it turns out to reject good setups.
+            if BREADTH_FILTER_ENABLED and breadth is not None \
+                    and breadth < BREADTH_FILTER_MIN_PCT:
+                log_rows.append((as_of, sym, "gate1", "breadth_below_filter",
+                                 json.dumps({"breadth": round(breadth, 2),
+                                             "required": BREADTH_FILTER_MIN_PCT})))
+                counts["breadth_below_filter"] = counts.get("breadth_below_filter", 0) + 1
+                continue
 
             try:
                 setup = build_setup(sym, df, rs63, rs126,

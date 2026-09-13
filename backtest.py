@@ -752,6 +752,7 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "score_total": setup.score_total,
                     "band": _band(setup.score_total), "regime": regime,
                     "index_state": index_state.get(d, "unknown"),
+                    "breadth_pct": breadth_by_date.get(d),
                     "regime_classifiers": _session_classifiers(
                         nifty_ind, d, breadth_by_date.get(d), vix_by_date.get(d)),
                     "rs_pct": rs_pct.get((sym, d)),
@@ -1103,6 +1104,70 @@ def compare_base_strategies(main_trades: list[dict],
                  "illusion the split test exists to catch."),
     }
     return out
+
+
+def breadth_filter_windows(trades: list[dict], min_pct: float = 55.0,
+                           windows: int = 6) -> dict:
+    """
+    (a) — per-window expectancy when ONLY c7-passing signals are counted.
+
+    c7 shows the largest taken/skipped separation of any classifier
+    (+0.508R) but does not flip the walk-forward as a day-level gate. The
+    question this answers is narrower and more useful: do W1, W3 and W5 —
+    the losing windows — actually improve once weak-breadth signals are
+    dropped, or does the filter simply remove signals evenly and leave the
+    sign unchanged?
+    """
+    dated = sorted([t for t in trades
+                    if t.get("signal_date") and t.get("r_realised") is not None],
+                   key=lambda t: t["signal_date"])
+    with_breadth = [t for t in dated if t.get("breadth_pct") is not None]
+    if len(with_breadth) < 20:
+        return {"error": "insufficient breadth data",
+                "n_with_breadth": len(with_breadth), "n_total": len(dated)}
+
+    first, last = dated[0]["signal_date"], dated[-1]["signal_date"]
+    step = max((last - first).days, 1) / windows
+
+    def stat(rows):
+        rs = [t["r_realised"] for t in rows]
+        if not rs:
+            return {"n": 0, "expectancy_r": None}
+        return {"n": len(rs), "expectancy_r": round(sum(rs) / len(rs), 3),
+                "total_r": round(sum(rs), 1)}
+
+    out, improved = [], 0
+    for w in range(windows):
+        lo = first + timedelta(days=int(step * w))
+        hi = first + timedelta(days=int(step * (w + 1)))
+        in_w = [t for t in with_breadth if lo <= t["signal_date"] < hi]
+        passing = [t for t in in_w if t["breadth_pct"] >= min_pct]
+        blocked = [t for t in in_w if t["breadth_pct"] < min_pct]
+
+        a, f = stat(in_w), stat(passing)
+        better = (f["expectancy_r"] is not None and a["expectancy_r"] is not None
+                  and f["expectancy_r"] > a["expectancy_r"])
+        if better:
+            improved += 1
+        out.append({
+            "window": w + 1, "from": str(lo), "to": str(hi),
+            "unfiltered": a, "c7_passing": f, "c7_blocked": stat(blocked),
+            "filter_improves_window": better,
+            "sign_flipped_positive": bool(
+                a["expectancy_r"] is not None and f["expectancy_r"] is not None
+                and a["expectancy_r"] <= 0 < f["expectancy_r"]),
+        })
+
+    flipped = [w["window"] for w in out if w["sign_flipped_positive"]]
+    return {
+        "min_breadth_pct": min_pct,
+        "windows": out,
+        "windows_improved": improved,
+        "windows_flipped_to_positive": flipped,
+        "note": ("A window counts as flipped only if it was <=0 unfiltered "
+                 "and >0 with the filter. Improving a window that was "
+                 "already positive does not move the walk-forward."),
+    }
 
 
 def classifier_attribution(trades: list[dict], windows: int = 6) -> dict:

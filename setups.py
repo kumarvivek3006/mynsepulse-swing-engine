@@ -372,7 +372,12 @@ CUP_ROUNDING_V_MAX_BARS = int(os.environ.get("CUP_ROUNDING_V_MAX_BARS", "2"))
 # band) and has been rebuilt to band-scoring — but until a re-run shows the
 # inversion is actually gone, the live path should not use the selector that
 # produced it. best_quality stays available for A/B measurement.
-DEFAULT_BASE_STRATEGY = os.environ.get("BASE_STRATEGY", "first_valid")
+# Run #31: first_valid_quality_gated is the ONLY strategy positive in both
+# halves (+0.006 / +0.420). first_valid is second and also beats
+# best_quality, which produces MORE signals at WORSE expectancy — the
+# aggregate-vs-walk-forward trap this whole sequence exists to avoid.
+# Reverted from best_quality accordingly.
+DEFAULT_BASE_STRATEGY = os.environ.get("BASE_STRATEGY", "first_valid_quality_gated")
 FIXED_BASE_WINDOW = int(os.environ.get("FIXED_BASE_WINDOW", "45"))
 
 

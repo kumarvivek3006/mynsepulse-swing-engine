@@ -1629,6 +1629,10 @@ def backtest_job(request: Request):
             # Tasks 4.2 / 4.3 — what each classifier would have done.
             metrics["classifier_attribution"] = classifier_attribution(
                 result["trades"])
+            # (a) per-window view of the c7 breadth filter
+            from backtest import breadth_filter_windows
+            metrics["breadth_filter_windows"] = breadth_filter_windows(
+                result["trades"])
             metrics["winning_profile"] = winning_profile(result["trades"])
             metrics["quality_diagnosis_q4"] = diagnose_quality_quartile(
                 result["trades"], "q4")
