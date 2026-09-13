@@ -32,6 +32,15 @@ MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "4"))
 VCP_FINAL_CONTRACTION_PCT = float(os.environ.get("VCP_FINAL_CONTRACTION_PCT", "8"))
 # Rounding bottom is a LONG base by definition — 8-30 weeks per spec.
 ROUNDING_MIN_SESSIONS = int(os.environ.get("ROUNDING_MIN_SESSIONS", "40"))
+# High tight flag (spec): pole +100% in 4-8 weeks, flag 3-5 weeks, <25% retrace.
+HTF_MIN_POLE_GAIN_PCT = float(os.environ.get("HTF_MIN_POLE_GAIN_PCT", "100"))
+HTF_POLE_MIN_SESSIONS = int(os.environ.get("HTF_POLE_MIN_SESSIONS", "20"))
+HTF_POLE_MAX_SESSIONS = int(os.environ.get("HTF_POLE_MAX_SESSIONS", "40"))
+HTF_FLAG_MIN_SESSIONS = int(os.environ.get("HTF_FLAG_MIN_SESSIONS", "15"))
+HTF_FLAG_MAX_SESSIONS = int(os.environ.get("HTF_FLAG_MAX_SESSIONS", "25"))
+HTF_MAX_RETRACE_PCT = float(os.environ.get("HTF_MAX_RETRACE_PCT", "25"))
+# Base-on-base: how far back to look for the prior consolidation.
+BASE_ON_BASE_LOOKBACK = int(os.environ.get("BASE_ON_BASE_LOOKBACK", "40"))
 
 # Flag/pennant: a genuinely different animal from the 15-120 session bases
 # above. A short, tight consolidation (1-3 weeks) immediately after a
@@ -339,7 +348,19 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         last_range = seg_high[-third:].max() - seg_low[-third:].min()
         contraction = float(last_range / first_range) if first_range > 0 else 1.0
 
-        pattern = _classify(seg_high, seg_low, depth, lookback, contraction)
+        pattern = _classify(seg_high, seg_low, depth, lookback, contraction,
+                            volumes[seg_start:])
+
+        # Two patterns need the full frame (a prior base, or a flagpole
+        # before the base), not just the base slice _classify receives, so
+        # they are resolved here. Both are MORE specific than whatever
+        # _classify returned, so they override it — a high tight flag would
+        # otherwise be labelled flat_base and lose the thing that makes it
+        # worth trading.
+        if _is_high_tight_flag(df, seg_start, pivot, base_low, lookback):
+            pattern = "high_tight_flag"
+        elif _is_base_on_base(df, seg_start, base_low, pivot):
+            pattern = "base_on_base"
         contracting = bool(contraction < 0.6 and depth < 25)
 
         # Deliberately NOT added into the quality score below. That formula
@@ -353,11 +374,30 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         obv_rising = bool(
             obv is not None and obv[-1] > obv[seg_start]) if obv is not None else False
 
+        # Depth and duration score toward the spec's IDEAL BANDS, not
+        # monotonically. This was "(1 - depth/35) * 30 — tighter is better",
+        # which peaks at depth 0 and rates a 2% base (28/30) far above a 20%
+        # base (13/30). Prompt 7 states the ideal depth is 15-25%, and the
+        # engine's own backtest agrees with the spec rather than the formula:
+        #
+        #   15-25% depth -> +0.157R (n=224)
+        #    6-15% depth -> -0.014R (n=401)
+        #   under 6%     -> -0.230R (n=35)
+        #
+        # This matters more than a scoring tweak: `quality` is what
+        # best_quality uses to CHOOSE which candidate window becomes the
+        # base. A formula that prefers shallower is one plausible reason the
+        # top-rated quartile (q4) has been the worst performer in every
+        # backtest — it was selecting for the wrong thing, and selecting
+        # hardest on exactly the trades it rated highest.
+        depth_score = _band_score(depth, 15.0, 25.0, 35.0) * 30
+        duration_score = _band_score(lookback, 25.0, 40.0, 120.0) * 10
+
         quality = (
-            (1.0 - min(depth / 35, 1.0)) * 30           # tighter is better
+            depth_score
             + max(0.0, 1.0 - dryup) * 25               # volume drying up
             + max(0.0, 1.0 - contraction) * 25         # ranges contracting
-            + min(lookback / 60, 1.0) * 10             # duration
+            + duration_score
             + min(prior_gain / 60, 1.0) * 10           # strength into the base
         )
 
@@ -445,6 +485,27 @@ def _is_cup_and_handle(seg_high, seg_low, duration: int,
     return True
 
 
+def _band_score(value: float, ideal_lo: float, ideal_hi: float,
+                hard_max: float) -> float:
+    """
+    1.0 inside the ideal band, tapering to 0 outside it.
+
+    Used where a spec gives an IDEAL RANGE rather than "more is better" —
+    base depth (15-25%) and duration (5-8 weeks). A monotonic score cannot
+    express "too little is also bad", which is precisely the error that made
+    the old depth term rate a 2% base above a 20% one.
+    """
+    if value <= 0:
+        return 0.0
+    if ideal_lo <= value <= ideal_hi:
+        return 1.0
+    if value < ideal_lo:
+        return max(0.0, value / ideal_lo)
+    if value >= hard_max:
+        return 0.0
+    return max(0.0, 1.0 - (value - ideal_hi) / (hard_max - ideal_hi))
+
+
 def _count_contractions(seg_high, seg_low, duration: int) -> list[float]:
     """
     Depths of each successive pullback inside the base, oldest first.
@@ -495,10 +556,16 @@ def _is_vcp(seg_high, seg_low, depth, duration: int) -> bool:
     return depths[-1] < VCP_FINAL_CONTRACTION_PCT
 
 
-def _is_double_bottom(seg_high, seg_low, duration: int) -> bool:
+def _is_double_bottom(seg_high, seg_low, duration: int,
+                      seg_vol=None) -> bool:
     """
-    Spec: two lows within 2% of each other, separated in time, with a
-    meaningful peak between them. Previously fell into `consolidation`.
+    Spec: two lows within 2%, 4-12 weeks apart, VOLUME HIGHER on the second
+    reversal. Previously fell into `consolidation` entirely.
+
+    The volume rule is the part that distinguishes a real double bottom from
+    two coincidental equal lows: the second test should attract more buying
+    than the first, showing demand arriving rather than the level simply
+    being touched again on apathy.
     """
     span = max(2, duration // 12)
     troughs = _find_local_minima(seg_low, span)
@@ -517,8 +584,19 @@ def _is_double_bottom(seg_high, seg_low, duration: int) -> bool:
                 continue                       # lows not within 2%
             mid_peak = float(seg_high[a:b + 1].max())
             # A real W needs a genuine recovery between the two feet.
-            if mid_peak > max(low_a, low_b) * 1.05:
-                return True
+            if mid_peak <= max(low_a, low_b) * 1.05:
+                continue
+
+            # Volume higher on the second reversal (spec). Compared over a
+            # small window around each low so a single quiet bar does not
+            # decide it.
+            if seg_vol is not None and len(seg_vol) == len(seg_low):
+                w = max(2, duration // 20)
+                v1 = float(seg_vol[max(0, a - w):a + w + 1].mean())
+                v2 = float(seg_vol[max(0, b - w):b + w + 1].mean())
+                if v1 > 0 and v2 <= v1:
+                    continue
+            return True
     return False
 
 
@@ -555,6 +633,69 @@ def _is_rounding_bottom(seg_high, seg_low, depth, duration: int) -> bool:
         if worst / rng > 0.4:
             return False
     return True
+
+
+def _is_high_tight_flag(df: pd.DataFrame, seg_start: int, pivot: float,
+                        base_low: float, duration: int) -> bool:
+    """
+    Spec: flagpole +100% in 4-8 weeks, flag 3-5 weeks retracing under 25%.
+
+    The rarest and most explosive of O'Neil's patterns, and a genuinely
+    different shape from the ordinary flag already detected: that one wants
+    a 20% pole over 20 sessions, this demands a DOUBLE over 20-40 sessions.
+    Treating them as one pattern would bury the rare, powerful case inside
+    the common one.
+    """
+    if not (HTF_FLAG_MIN_SESSIONS <= duration <= HTF_FLAG_MAX_SESSIONS):
+        return False
+    if pivot <= 0:
+        return False
+
+    retrace = (pivot - base_low) / pivot * 100
+    if retrace > HTF_MAX_RETRACE_PCT:
+        return False
+
+    closes = df["close"].values
+    pole_start = max(0, seg_start - HTF_POLE_MAX_SESSIONS)
+    pole_window = closes[pole_start:seg_start + 1]
+    if len(pole_window) < HTF_POLE_MIN_SESSIONS:
+        return False
+
+    pole_gain = (float(pole_window[-1]) / float(pole_window.min()) - 1) * 100
+    return pole_gain >= HTF_MIN_POLE_GAIN_PCT
+
+
+def _is_base_on_base(df: pd.DataFrame, seg_start: int, base_low: float,
+                     pivot: float) -> bool:
+    """
+    Spec: a base forming on top of a prior base — consolidation of prior
+    gains rather than a fresh advance. Very bullish continuation.
+
+    Detected as: a PRIOR consolidation immediately before this one, whose
+    own high sits at or below this base's low. That is what "on top of"
+    means structurally — the new base has not given back the prior one's
+    range.
+    """
+    if seg_start < BASE_ON_BASE_LOOKBACK + 10 or base_low <= 0:
+        return False
+
+    prior = df.iloc[seg_start - BASE_ON_BASE_LOOKBACK:seg_start]
+    if len(prior) < 15:
+        return False
+
+    prior_high = float(prior["high"].max())
+    prior_low = float(prior["low"].min())
+    if prior_high <= 0 or prior_low <= 0:
+        return False
+
+    prior_depth = (prior_high - prior_low) / prior_high * 100
+    # The prior stretch must itself have been a consolidation, not a run.
+    if prior_depth > 30:
+        return False
+
+    # This base sits ON TOP of it: the new base's floor is at or above the
+    # prior base's high (allowing a small overlap).
+    return base_low >= prior_high * 0.97 and pivot > prior_high
 
 
 def _is_ascending_triangle(seg_high, seg_low, duration: int,
@@ -596,7 +737,8 @@ def _is_ascending_triangle(seg_high, seg_low, duration: int,
     return abs(highs_last - highs_first) / highs_first < 0.03 if highs_first else False
 
 
-def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
+def _classify(seg_high, seg_low, depth, duration, contraction,
+              seg_vol=None) -> str:
     third = max(duration // 3, 3)
     lows_first = seg_low[:third].min()
     lows_last = seg_low[-third:].min()
@@ -629,7 +771,7 @@ def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
         return "vcp"
     if _is_inverse_head_shoulders(seg_high, seg_low, duration):
         return "inverse_head_shoulders"
-    if _is_double_bottom(seg_high, seg_low, duration):
+    if _is_double_bottom(seg_high, seg_low, duration, seg_vol):
         return "double_bottom"
     if _is_cup_and_handle(seg_high, seg_low, duration, highs_first, highs_last):
         return "cup_handle"
