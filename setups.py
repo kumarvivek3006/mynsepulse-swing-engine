@@ -303,8 +303,12 @@ def swing_highs(df: pd.DataFrame, span: int = 3) -> list[int]:
 # points at the SELECTION MECHANISM (best-of-~20-windows) rather than any one
 # factor in the formula.
 #
-# "best_quality" (default) is BYTE-IDENTICAL to the original function and is
-# what the live engine calls. The other two only run inside the backtest.
+# "best_quality" is BYTE-IDENTICAL to the original function and is retained
+# for A/B MEASUREMENT ONLY — it is no longer what the live engine calls. The
+# live default became "first_valid" (see DEFAULT_BASE_STRATEGY below) once
+# the q4 inversion was traced to this selector. This comment previously
+# still described best_quality as the live path, which stopped being true
+# that same round.
 BASE_SELECTION_STRATEGIES = ("best_quality", "first_valid", "fixed_window")
 # Live default is first_valid, NOT best_quality.
 #
@@ -332,10 +336,14 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
     and evaluated separately in detect_trigger().
 
     strategy:
-      "best_quality" (live default) — scan every window, keep the one
-        scoring highest on the composite formula. Unchanged from before.
-      "first_valid" — scan windows shortest-to-longest (most recent base
-        first) and take the FIRST one clearing every validity check, no
+      "best_quality" — scan every window, keep the one scoring highest on
+        the composite formula. Byte-identical to the original function, but
+        NO LONGER THE LIVE DEFAULT: its own top-rated quartile was the worst
+        performer across both halves of both 3-year runs. Retained for A/B
+        measurement against the alternatives below.
+      "first_valid" (LIVE DEFAULT, via DEFAULT_BASE_STRATEGY) — scan
+        windows shortest-to-longest (most recent base first) and take the
+        FIRST one clearing every validity check, no
         quality ranking at all. Mirrors a trader taking the most recent
         legitimate base rather than grading twenty of them against a
         formula.
@@ -922,6 +930,14 @@ def detect_trigger(df: pd.DataFrame, base: Base,
 
     This is the same monotonicity argument weekly_volume_surge() uses for
     partial weeks, applied at the daily scale.
+
+    SCOPE: the monotonicity rule governs FILTERS — quantities asked "is this
+    stock good enough", such as RSI and volume. It does NOT govern
+    TRIGGER-SHAPE checks (close above pivot, bullish candle, close position
+    in range, exhaustion wick). Those define what the current bar IS, so
+    they are inherently same-bar and continue to read the forming bar. A
+    trigger-shape check on the previous bar would be asking whether
+    YESTERDAY broke out, which is a different question entirely.
     """
     last = df.iloc[-1]
     rng = float(last["high"] - last["low"])
