@@ -439,6 +439,116 @@ TRANSITION_MIN_ABOVE_52W_LOW_PCT = float(
     os.environ.get("TRANSITION_MIN_ABOVE_52W_LOW_PCT", "20"))
 
 
+# ---------------------------------------------------------------------
+# C3 / D4 — top-level regime gate
+#
+# ADDITIVE. evaluate_regime() below is untouched and still drives scoring;
+# this is a separate gate that runs BEFORE Gate 1 and can stop a day
+# producing signals at all. REGIME_GATE_ENABLED=false restores the prior
+# behaviour exactly.
+#
+# Run #29 walk-forward: the engine won W4 and W6, lost W1, W3, W5. The
+# score-based regime filter flips sign in the split test, so it does not
+# separate them.
+#
+# NOT COMPUTABLE from current ingestion — follow-up ticket, do not block:
+#   - sector dispersion (needs Nifty sector indices)
+#   - smallcap/largecap ratio (needs Nifty Smallcap 100)
+#   - advance/decline ratio (needs per-symbol daily A/D, not stored)
+#   - new highs minus new lows (needs rolling 52w extremes per symbol)
+# We ingest NIFTY50, NIFTY500 and INDIAVIX only. Building a proxy for any
+# of these from what we have would be inventing a number.
+REGIME_GATE_ENABLED = os.environ.get(
+    "REGIME_GATE_ENABLED", "true").lower() == "true"
+REGIME_CLASSIFIER = os.environ.get("REGIME_CLASSIFIER", "c1_and_c5_or_c7")
+REGIME_VIX_LOW = float(os.environ.get("REGIME_VIX_LOW", "15"))
+REGIME_VIX_HIGH = float(os.environ.get("REGIME_VIX_HIGH", "18"))
+REGIME_BREADTH_LOW = float(os.environ.get("REGIME_BREADTH_LOW", "55"))
+REGIME_BREADTH_HIGH = float(os.environ.get("REGIME_BREADTH_HIGH", "60"))
+
+
+def regime_classifiers(nifty: pd.DataFrame, vix: pd.DataFrame | None,
+                       breadth: float | None) -> dict:
+    """
+    The six computable single-metric classifiers plus three composites.
+
+    Every one returns True (trade), False (skip) or None (cannot compute).
+    None is NOT treated as False anywhere: a missing input must not silently
+    become a skip decision, or a data outage reads as a bearish market.
+    """
+    out: dict = {}
+    if nifty is None or len(nifty) < 200:
+        return {"error": "insufficient nifty history"}
+
+    close = float(nifty["close"].iloc[-1])
+    sma50 = float(nifty["close"].rolling(50).mean().iloc[-1])
+    sma200 = float(nifty["close"].rolling(200).mean().iloc[-1])
+    sma50_prev = (float(nifty["close"].rolling(50).mean().iloc[-21])
+                  if len(nifty) > 220 else None)
+
+    out["c1_close_above_200dma"] = close > sma200
+    out["c2_close_above_50_and_stack"] = bool(close > sma50 and sma50 > sma200)
+    out["c3_50dma_rising_20d"] = (sma50 > sma50_prev) if sma50_prev else None
+
+    vix_level = None
+    if vix is not None and len(vix):
+        try:
+            vix_level = float(vix["close"].iloc[-1])
+        except Exception:
+            vix_level = None
+    out["c5_vix_below_15"] = (vix_level < REGIME_VIX_LOW) if vix_level is not None else None
+    out["c6_vix_below_18"] = (vix_level < REGIME_VIX_HIGH) if vix_level is not None else None
+
+    out["c7_breadth_above_55"] = (breadth > REGIME_BREADTH_LOW) if breadth is not None else None
+    out["c8_breadth_above_60"] = (breadth > REGIME_BREADTH_HIGH) if breadth is not None else None
+
+    # Composites. Any None propagates rather than counting as False.
+    c1, c3 = out["c1_close_above_200dma"], out["c3_50dma_rising_20d"]
+    c2, c5 = out["c2_close_above_50_and_stack"], out["c5_vix_below_15"]
+    c7 = out["c7_breadth_above_55"]
+
+    out["c1_and_c5_or_c7"] = (
+        bool(c1 and (c5 or c7)) if None not in (c5, c7) else None)
+    out["c2_and_c7"] = bool(c2 and c7) if c7 is not None else None
+
+    votes = [v for v in (c1, c3, c5, c7) if v is not None]
+    out["majority_c1_c3_c5_c7"] = (
+        (sum(votes) > len(votes) / 2) if len(votes) >= 3 else None)
+
+    out["_inputs"] = {
+        "nifty_close": round(close, 2), "sma50": round(sma50, 2),
+        "sma200": round(sma200, 2), "vix": vix_level,
+        "breadth_pct": round(breadth, 2) if breadth is not None else None,
+    }
+    return out
+
+
+def regime_gate_passes(nifty: pd.DataFrame, vix: pd.DataFrame | None,
+                       breadth: float | None,
+                       classifier: str | None = None) -> tuple[bool, dict]:
+    """
+    Does the configured classifier permit trading today?
+
+    An unavailable classifier result defaults to TRADE, not skip. A gate
+    that silently blocks every day because an input is missing is worse
+    than no gate — the engine would go quiet and look like a dead market.
+    """
+    name = classifier or REGIME_CLASSIFIER
+    results = regime_classifiers(nifty, vix, breadth)
+    if "error" in results:
+        return True, {"decision": "trade", "reason": results["error"],
+                      "classifier": name, "defaulted": True}
+
+    verdict = results.get(name)
+    if verdict is None:
+        return True, {"decision": "trade", "reason": "classifier_not_computable",
+                      "classifier": name, "defaulted": True,
+                      "classifiers": results}
+    return bool(verdict), {"decision": "trade" if verdict else "skip",
+                           "classifier": name, "defaulted": False,
+                           "classifiers": results}
+
+
 def weekly_volume_surge(df: pd.DataFrame, mult: float) -> tuple[bool, float | None]:
     """
     Is the current week's volume above `mult` x the 50-week average?

@@ -23,6 +23,8 @@ import gc
 import pandas as pd
 
 from gates import (
+    REGIME_GATE_ENABLED,
+    regime_gate_passes,
     gate2_fundamentals,
     gate3_stage1_transition,
     add_indicators,
@@ -458,9 +460,40 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             raise RuntimeError("NIFTY50 series missing or too short — cannot assess regime")
 
         breadth = _breadth(conn, universe)
+        # --- C3/D4: additive top-level regime gate, BEFORE Gate 1 --------
+        #
+        # evaluate_regime() below is untouched and still drives scoring.
+        # This is a SEPARATE gate that can stop the day producing signals
+        # at all. REGIME_GATE_ENABLED=false restores prior behaviour.
+        regime_gate_ok, regime_gate_detail = True, {"enabled": False}
+        if REGIME_GATE_ENABLED:
+            regime_gate_ok, regime_gate_detail = regime_gate_passes(
+                nifty, vix, breadth)
+            regime_gate_detail["enabled"] = True
+            log.info("Regime gate [%s]: %s",
+                     regime_gate_detail.get("classifier"),
+                     regime_gate_detail.get("decision"))
+
         regime = evaluate_regime(nifty, vix if vix is not None else pd.DataFrame(), breadth)
         log.info("Regime: %s (breadth %.1f%%, vix %s, distribution %d)",
                  regime["state"], breadth, regime["vix"], regime["distribution_days"])
+
+        if REGIME_GATE_ENABLED and not regime_gate_ok:
+            # No signals today. The regime row above is still written, and
+            # every rejection reason stays attributable — this is logged as
+            # a decision, not a silent empty scan.
+            log.info("Regime gate: skipping signal generation for %s", as_of)
+            summary = {
+                "as_of": str(as_of), "mode": mode,
+                "regime": regime["state"],
+                "universe": len(universe),
+                "signals": 0,
+                "regime_gate": "skipped",
+                "regime_gate_detail": regime_gate_detail,
+            }
+            # run_scan returns; server.py is what persists to
+            # engine_settings.last_scan_summary. There is no _store_summary.
+            return summary
 
         # Trailing-performance throttle.
         #
@@ -1040,6 +1073,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "signals": len(signals),
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": fundamentals_ready,
+            "regime_gate": "passed" if regime_gate_ok else "skipped",
+            "regime_gate_detail": regime_gate_detail,
             "gate2_coverage": len(snapshots),
             # Stocks that cleared Minervini without an RS percentile —
             # typically fresh listings lacking 127 bars. A high number here

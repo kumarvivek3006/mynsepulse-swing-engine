@@ -695,6 +695,15 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "base_start_idx": setup.base.start_idx,
                     "base_duration": setup.base.duration,
                     "base_quality": round(setup.base.quality, 2),
+                    # C4 shape diagnostics, flattened for SQL.
+                    "handle_slope": setup.base.shape_diag.get("handle_slope"),
+                    "handle_slope_pct": setup.base.shape_diag.get("handle_slope_pct"),
+                    "handle_depth_pct": setup.base.shape_diag.get("handle_depth_pct"),
+                    "cup_shape": setup.base.shape_diag.get("cup_shape"),
+                    "cup_rounding_bars": setup.base.shape_diag.get("cup_rounding_bars"),
+                    "cup_low_idx_in_window": setup.base.shape_diag.get("cup_low_idx_in_window"),
+                    "handle_start_idx": setup.base.shape_diag.get("handle_start_idx"),
+                    "shape_diag": setup.base.shape_diag,
 
                     "base_quality_quartile": _quintile(
                         min(setup.base.quality, 100)) if setup.base.quality is not None

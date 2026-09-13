@@ -172,6 +172,11 @@ class Base:
     # Records the strategy detect_base ACTUALLY ran with. Proves the
     # parameter arrived rather than relying on it having been passed.
     strategy_used: str | None = None
+    # C4 shape diagnostics. Populated for every base, whatever the pattern,
+    # so the LOSING population can be characterised rather than only the
+    # accepted one. Nothing gates on these — cup_handle and ascending_base
+    # remain fully tradeable while the mechanism is investigated.
+    shape_diag: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -340,6 +345,23 @@ BASE_SELECTION_STRATEGIES = ("best_quality", "first_valid", "fixed_window",
 # loses. This sits between them — earliest acceptable rather than earliest
 # or best-scoring.
 FIRST_VALID_MIN_QUALITY = float(os.environ.get("FIRST_VALID_MIN_QUALITY", "40"))
+
+# ---------------------------------------------------------------------
+# C4 diagnostic thresholds (measurement only — nothing gates on these)
+#
+# HANDLE SLOPE: the handle is "rising"/"falling" when its net move exceeds
+# +/-1% OF THE HANDLE'S OWN RANGE, flat otherwise. Expressed relative to
+# the handle rather than to price so a 2% handle on a 3000-rupee stock and
+# on a 30-rupee stock classify the same way. The diagnosis must be robust
+# to +/-0.5% here; if it is not, the finding is a threshold artefact and
+# must be reported as such.
+HANDLE_SLOPE_FLAT_PCT = float(os.environ.get("HANDLE_SLOPE_FLAT_PCT", "1.0"))
+#
+# CUP ROUNDING: bars whose low sits in the LOWER THIRD of (cup_high -
+# cup_low). U-shape >= 5 such bars, V-shape <= 2. A U spends time at the
+# bottom; a V touches once and leaves.
+CUP_ROUNDING_U_MIN_BARS = int(os.environ.get("CUP_ROUNDING_U_MIN_BARS", "5"))
+CUP_ROUNDING_V_MAX_BARS = int(os.environ.get("CUP_ROUNDING_V_MAX_BARS", "2"))
 # Live default is first_valid, NOT best_quality.
 #
 # base_quality_quartile.q4 — the top bucket of the quality formula's own
@@ -540,9 +562,27 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
             + min(prior_gain / 60, 1.0) * 10           # strength into the base
         )
 
+        # Measured for cup_handle and ascending_base regardless of which
+        # label won — a base rejected as a cup is exactly the population
+        # the diagnosis needs.
+        shape_diag: dict = {}
+        if pattern in ("cup_handle", "rounding_bottom", "ascending_base",
+                       "double_bottom", "consolidation"):
+            try:
+                if pattern == "ascending_base":
+                    shape_diag = _ascending_base_diagnostics(
+                        seg_high, seg_low, lookback)
+                else:
+                    shape_diag = _cup_handle_diagnostics(
+                        seg_high, seg_low, lookback)
+            except Exception as exc:          # diagnostics must never break a scan
+                log.debug("shape_diag failed: %s", exc)
+                shape_diag = {}
+
         candidate = Base(pattern, seg_start, pivot_idx, pivot, base_low, depth,
                          lookback, dryup, contraction, prior_gain, quality,
-                         contracting, obv_rising, strategy_used=strategy)
+                         contracting, obv_rising, strategy_used=strategy,
+                         shape_diag=shape_diag)
 
         if strategy == "first_valid":
             # Stop at the first legitimate window — no ranking against the
@@ -567,6 +607,106 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         dominant = max(fail_counts, key=fail_counts.get) if fail_counts else "no_windows"
         raise Rejected("gate4", f"no_base_{dominant}", dict(fail_counts))
     return best
+
+
+def _cup_handle_diagnostics(seg_high, seg_low, duration: int) -> dict:
+    """
+    Shape measurements for the C4 investigation. Computed for EVERY base
+    that reaches the cup test, pass or fail, so the failing population can
+    be characterised rather than only the accepted one.
+
+    Nothing gates on these. cup_handle and ascending_base stay tradeable;
+    this exists to find out WHY they lose -25R over three years.
+    """
+    out: dict = {}
+    handle_len = max(5, min(duration // 4, 15))
+    if duration - handle_len < 10 or len(seg_low) < duration:
+        return out
+
+    cup_portion_low = seg_low[:-handle_len]
+    cup_portion_high = seg_high[:-handle_len]
+    if len(cup_portion_low) == 0:
+        return out
+
+    cup_low_idx = int(np.argmin(cup_portion_low))
+    cup_low = float(cup_portion_low[cup_low_idx])
+    cup_high = float(cup_portion_high.max())
+    handle_lows = seg_low[-handle_len:]
+    handle_highs = seg_high[-handle_len:]
+
+    out["cup_low_idx_in_window"] = cup_low_idx
+    out["handle_start_idx"] = duration - handle_len
+    out["handle_end_idx"] = duration - 1
+    out["handle_length"] = handle_len
+
+    if cup_high > cup_low > 0:
+        # Handle slope, as a fraction of the handle's own range.
+        h_range = float(handle_highs.max() - handle_lows.min())
+        net = float(handle_lows[-1] - handle_lows[0])
+        if h_range > 0:
+            slope_pct = net / h_range * 100
+            out["handle_slope_pct"] = round(slope_pct, 2)
+            if slope_pct > HANDLE_SLOPE_FLAT_PCT:
+                out["handle_slope"] = "rising"
+            elif slope_pct < -HANDLE_SLOPE_FLAT_PCT:
+                out["handle_slope"] = "falling"
+            else:
+                out["handle_slope"] = "flat"
+
+        h_high = float(handle_highs.max())
+        h_low = float(handle_lows.min())
+        out["handle_depth_pct"] = round((h_high - h_low) / h_high * 100, 2) if h_high > 0 else None
+
+        # Rounding: bars resting in the lower third of the cup's range.
+        lower_third = cup_low + (cup_high - cup_low) / 3.0
+        bars_low = int((cup_portion_low <= lower_third).sum())
+        out["cup_rounding_bars"] = bars_low
+        out["cup_shape"] = ("U" if bars_low >= CUP_ROUNDING_U_MIN_BARS
+                            else "V" if bars_low <= CUP_ROUNDING_V_MAX_BARS
+                            else "intermediate")
+        out["cup_duration"] = duration - handle_len
+        out["cup_depth_pct"] = round((cup_high - cup_low) / cup_high * 100, 2)
+
+        # At least one higher low inside the cup, after its bottom.
+        after = cup_portion_low[cup_low_idx + 1:]
+        out["cup_has_higher_low"] = bool(len(after) >= 2 and any(
+            after[i] > after[i - 1] for i in range(1, len(after))))
+
+        # Right side vs left side — already enforced, recorded per trade.
+        third = max(duration // 3, 3)
+        lhs = float(seg_high[:third].max())
+        rhs = float(seg_high[-third:].max())
+        out["right_vs_left_pct"] = round((rhs / lhs - 1) * 100, 2) if lhs > 0 else None
+
+    return out
+
+
+def _ascending_base_diagnostics(seg_high, seg_low, duration: int) -> dict:
+    """
+    Shape measurements for ascending_base (Task 2.5). Same principle:
+    measure, do not gate.
+    """
+    out: dict = {}
+    span = max(2, duration // 12)
+    troughs = _find_local_minima(seg_low, span)
+    out["pullback_count"] = len(troughs)
+    if len(troughs) < 2:
+        return out
+
+    lows = [float(seg_low[t]) for t in troughs]
+    base_low = float(seg_low.min())
+    out["first_pullback_low"] = round(lows[0], 2)
+    out["last_pullback_low"] = round(lows[-1], 2)
+    out["base_low"] = round(base_low, 2)
+    out["first_pullback_above_base_low"] = bool(lows[0] > base_low * 1.001)
+    out["has_higher_low_between"] = bool(
+        len(lows) >= 3 and any(lows[i] > lows[i - 1] for i in range(1, len(lows) - 1)))
+    if lows[0] > 0:
+        rise = (lows[-1] / lows[0] - 1) * 100
+        out["last_vs_first_pullback_pct"] = round(rise, 2)
+        # "Materially higher" vs "roughly flat" — 2% of the first low.
+        out["pullbacks_materially_rising"] = bool(rise > 2.0)
+    return out
 
 
 def _is_cup_and_handle(seg_high, seg_low, duration: int,

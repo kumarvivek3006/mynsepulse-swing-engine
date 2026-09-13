@@ -1646,10 +1646,17 @@ def backtest_job(request: Request):
                                  -- them into signals.notes but this insert
                                  -- dropped them, so every historical row was null.
                                  strategy_used, strategy_requested,
-                                 base_start_idx, base_duration, base_quality)
+                                 base_start_idx, base_duration, base_quality,
+                                 -- C4: shape diagnostics for the cup_handle /
+                                 -- ascending_base investigation. Measurement
+                                 -- only; nothing gates on these.
+                                 handle_slope, handle_slope_pct, handle_depth_pct,
+                                 cup_shape, cup_rounding_bars,
+                                 cup_low_idx_in_window, shape_diag)
                             values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                     %s,%s,%s,%s,%s,%s,%s,
-                                    %s,%s,%s,%s,%s)
+                                    %s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s,%s,%s,%s)
                         """, (run_id, t["symbol"], t["signal_date"], t["setup_type"],
                               t["pattern"], t["score_total"], t["band"], t["regime"],
                               t["entry_trigger"], t["stop_loss"], t["t1"], t.get("t2"),
@@ -1660,7 +1667,12 @@ def backtest_job(request: Request):
                               t.get("bars_held"),
                               t.get("strategy_used"), t.get("strategy_requested"),
                               t.get("base_start_idx"), t.get("base_duration"),
-                              t.get("base_quality")))
+                              t.get("base_quality"),
+                              t.get("handle_slope"), t.get("handle_slope_pct"),
+                              t.get("handle_depth_pct"), t.get("cup_shape"),
+                              t.get("cup_rounding_bars"),
+                              t.get("cup_low_idx_in_window"),
+                              json.dumps(t.get("shape_diag") or {})))
                     cur.execute("""
                         update backtest_runs set finished_at = now(), status = 'success',
                                universe = %s, signals = %s, metrics = %s
