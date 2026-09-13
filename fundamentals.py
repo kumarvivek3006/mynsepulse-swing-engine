@@ -126,6 +126,214 @@ def parse_income_statement(payload: dict) -> list[dict]:
     return rows
 
 
+def parse_company_profile(payload: dict) -> dict:
+    """
+    Sector, description and sector market cap.
+
+    USD market cap is normalised to BILLIONS. The API returns either
+    "million" or "billion" in the unit field — mixing the two in one
+    numeric column would put some sectors 1000x out with nothing in the
+    value to reveal it.
+    """
+    data = (payload or {}).get("data") or {}
+    if not isinstance(data, dict):
+        return {}
+
+    def money(node, to_billions: bool = False) -> float | None:
+        if not isinstance(node, dict):
+            return None
+        try:
+            v = float(node.get("value"))
+        except (TypeError, ValueError):
+            return None
+        if to_billions and str(node.get("unit", "")).lower().startswith("million"):
+            return round(v / 1000.0, 4)
+        return v
+
+    return {
+        "company_profile": data.get("company_profile"),
+        "sector": data.get("sector"),
+        "sector_market_cap_inr_cr": money(data.get("sector_market_cap_inr")),
+        "sector_market_cap_usd_bn": money(data.get("sector_market_cap_usd"), True),
+    }
+
+
+def _history_by_period(blocks, key_field: str, wanted: dict) -> dict:
+    """
+    Shared shape handler: [{<key_field>: name, history:[{period, value}]}]
+    collapsed to {period_end: {mapped_field: value}}.
+
+    Income statement, cash flow, balance sheet and share holdings all use
+    this same envelope. Four near-identical loops drifted apart once
+    already — key_ratios and share_holdings both assumed data was an object
+    when it is a bare list.
+    """
+    by_period: dict = {}
+    if not isinstance(blocks, list):
+        return by_period
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        field = wanted.get(str(block.get(key_field) or "").strip().lower())
+        if not field:
+            continue
+        for point in block.get("history") or []:
+            if not isinstance(point, dict):
+                continue
+            d = parse_upstox_period(point.get("period"))
+            if d is None or point.get("value") is None:
+                continue
+            try:
+                by_period.setdefault(d, {"period_end": d})[field] = float(point["value"])
+            except (TypeError, ValueError):
+                continue
+    return by_period
+
+
+def parse_balance_sheet(payload: dict) -> list[dict]:
+    """Total assets / liabilities per period, plus line items when fs=true."""
+    data = (payload or {}).get("data") or {}
+    if not isinstance(data, dict):
+        return []
+
+    wanted = {"total_assets": "total_assets", "total assets": "total_assets",
+              "total_liabilities": "total_liabilities",
+              "total liabilities": "total_liabilities"}
+    by_period = _history_by_period(
+        data.get("balance_sheet") or data.get("history") or [],
+        "category", wanted)
+
+    fs_wanted = {"total assets": "total_assets",
+                 "total liabilities": "total_liabilities",
+                 "current assets": "current_assets",
+                 "total current assets": "current_assets",
+                 "current liabilities": "current_liabilities",
+                 "total current liabilities": "current_liabilities",
+                 "net worth": "net_worth", "total equity": "net_worth"}
+    for d, row in _history_by_period(
+            data.get("full_statement") or [], "particular", fs_wanted).items():
+        by_period.setdefault(d, {"period_end": d}).update(
+            {k: v for k, v in row.items() if k != "period_end"})
+
+    return [by_period[d] for d in sorted(by_period, reverse=True)]
+
+
+def parse_cash_flow(payload: dict) -> list[dict]:
+    """Operating / investing / financing per period, with net derived."""
+    data = (payload or {}).get("data") or {}
+    if not isinstance(data, dict):
+        return []
+
+    wanted = {"operating": "operating", "operating_activities": "operating",
+              "cash from operating activity": "operating",
+              "investing": "investing", "investing_activities": "investing",
+              "cash from investing activity": "investing",
+              "financing": "financing", "financing_activities": "financing",
+              "cash from financing activity": "financing"}
+    by_period = _history_by_period(
+        data.get("cash_flow") or data.get("history") or [], "category", wanted)
+
+    rows = []
+    for d in sorted(by_period, reverse=True):
+        row = by_period[d]
+        parts = [row.get(k) for k in ("operating", "investing", "financing")]
+        # Net only when all three are present — summing a partial set would
+        # produce a plausible-looking number that is not the net cash flow.
+        row["net"] = round(sum(parts), 2) if all(p is not None for p in parts) else None
+        rows.append(row)
+    return rows
+
+
+def _parse_loose_date(raw):
+    """'14 Aug 2025' -> date. Returns None rather than guessing."""
+    if not raw:
+        return None
+    for fmt in ("%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(str(raw).strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_corporate_actions(payload: dict) -> list[dict]:
+    """
+    Dividends, bonuses, splits, rights — newest first.
+
+    Sub-dates live in event_details as name/value pairs rather than as
+    top-level fields, so they are matched on the label.
+    """
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
+        return []
+
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        details = {}
+        for ev in item.get("event_details") or []:
+            if isinstance(ev, dict) and ev.get("name"):
+                details[str(ev["name"]).strip().lower()] = ev.get("value")
+
+        def pick(*labels):
+            for lab in labels:
+                for k, v in details.items():
+                    if lab in k:
+                        return v
+            return None
+
+        expiry_raw = item.get("expiry_date")
+        expiry = _parse_loose_date(expiry_raw)
+        if expiry_raw and expiry is None:
+            log.debug("corporate_actions: unparsed date %r", expiry_raw)
+
+        out.append({
+            "name": item.get("name"),
+            "expiry_date": expiry,
+            "expiry_date_raw": expiry_raw,
+            "amount": item.get("amount"),
+            "ratio": item.get("ratio"),
+            "announcement_date": _parse_loose_date(pick("announcement")),
+            "ex_date": _parse_loose_date(pick("ex dividend", "ex date", "ex-date")),
+            "record_date": _parse_loose_date(pick("record")),
+        })
+
+    out.sort(key=lambda r: (r["expiry_date"] is not None, r["expiry_date"]),
+             reverse=True)
+    return out
+
+
+def parse_competitors(payload: dict) -> list[dict]:
+    """
+    Peers. instrument_key is "NSE_EQ|INE242A01010" — the ISIN after the
+    pipe is what cross-references our own symbols table.
+    """
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
+        return []
+
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("instrument_key") or ""
+        isin = key.split("|", 1)[1].strip() if "|" in key else None
+        mcap = item.get("sector_market_cap_inr") or {}
+        try:
+            mcap_cr = float(mcap.get("value")) if isinstance(mcap, dict) else None
+        except (TypeError, ValueError):
+            mcap_cr = None
+        out.append({
+            "competitor_instrument_key": key or None,
+            "competitor_isin": isin,
+            "company_profile": item.get("company_profile"),
+            "sector": item.get("sector"),
+            "sector_market_cap_inr_cr": mcap_cr,
+        })
+    return out
+
+
 def parse_share_holdings(payload: dict) -> list[dict]:
     """
     Promoter / FII / DII / public by quarter.

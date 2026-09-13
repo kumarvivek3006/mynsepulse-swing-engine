@@ -1491,6 +1491,8 @@ def upstox_fundamentals_probe(request: Request, symbol: str = Query("RELIANCE"))
     describe("cash_flow", lambda: client.cash_flow(isin))
     describe("share_holdings", lambda: client.share_holdings(isin))
     describe("key_ratios", lambda: client.key_ratios(isin))
+    describe("corporate_actions", lambda: client.corporate_actions(isin))
+    describe("competitors", lambda: client.competitors(isin))
 
     # Run the income-statement parser on the live payload. Its schema is
     # verified against the API reference, so this proves the wiring end to
@@ -1511,6 +1513,21 @@ def upstox_fundamentals_probe(request: Request, symbol: str = Query("RELIANCE"))
         # ingestion writes hundreds of null rows that look like real data.
         out["parsed_holdings_rows"] = len(parse_share_holdings(client.share_holdings(isin)))
         out["parsed_ratios"] = parse_key_ratios(client.key_ratios(isin))
+
+        from fundamentals import (parse_balance_sheet, parse_cash_flow,
+                                  parse_company_profile,
+                                  parse_competitors, parse_corporate_actions)
+        out["parsed_profile"] = parse_company_profile(client.company_profile(isin))
+        out["parsed_balance_rows"] = len(parse_balance_sheet(client.balance_sheet(isin)))
+        out["parsed_cashflow_rows"] = len(parse_cash_flow(client.cash_flow(isin)))
+        ca = parse_corporate_actions(client.corporate_actions(isin))
+        out["parsed_corp_actions_rows"] = len(ca)
+        out["parsed_corp_actions_sample"] = (
+            {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in ca[0].items()}
+            if ca else None)
+        comp = parse_competitors(client.competitors(isin))
+        out["parsed_competitors_rows"] = len(comp)
+        out["parsed_competitors_sample"] = comp[0] if comp else None
     except Exception as exc:
         out["parse_error"] = str(exc)[:300]
 

@@ -473,6 +473,10 @@ class UpstoxClient:
         benchmark. Supplies CANSLIM's ROE requirement."""
         return self._get(f"{self.FUNDAMENTALS_BASE}/{isin}/key-ratios")
 
+    def competitors(self, isin: str) -> dict:
+        """Peer companies with their ISINs and sector market caps."""
+        return self._get(f"{self.FUNDAMENTALS_BASE}/{isin}/competitors")
+
     def quotes(self, instrument_keys: list[str]) -> dict:
         result: dict = {}
         for i in range(0, len(instrument_keys), 100):
