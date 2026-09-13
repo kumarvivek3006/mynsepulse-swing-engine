@@ -96,6 +96,14 @@ REJECT_NEGATIVE_PATTERNS = os.environ.get(
 NEGATIVE_PATTERNS = {"asc_triangle", "flag_pennant"}
 if os.environ.get("CUP_HANDLE_ENABLED", "false").lower() != "true":
     NEGATIVE_PATTERNS = NEGATIVE_PATTERNS | {"cup_handle"}
+# ascending_base: negative in every run, ~-0.5R on ~21 fills. Its
+# diagnosis is NOT complete — the trail forensics (trail_activated,
+# stop_at_mfe, mae/mfe_bar_index) require a run on migration 011, which
+# has not happened. Disabled until that diagnosis lands and a fix is
+# validated, per the acceptance criteria. Detection continues, so the
+# population keeps growing for analysis.
+if os.environ.get("ASCENDING_BASE_ENABLED", "false").lower() != "true":
+    NEGATIVE_PATTERNS = NEGATIVE_PATTERNS | {"ascending_base"}
 
 # ---------------------------------------------------------------------
 # Why DELIVERY_GATE defaults to false
