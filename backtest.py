@@ -822,6 +822,11 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "cup_low_idx_in_window": setup.base.shape_diag.get("cup_low_idx_in_window"),
                     "handle_start_idx": setup.base.shape_diag.get("handle_start_idx"),
                     "shape_diag": setup.base.shape_diag,
+                    # (A) entry-timing
+                    "trigger_volume_vs_50d": setup.trigger_diag.get("trigger_volume_vs_50d"),
+                    "pct_above_ema20_at_entry": setup.trigger_diag.get("pct_above_ema20_at_entry"),
+                    "trigger_close_position_in_range": setup.trigger_diag.get(
+                        "trigger_close_position_in_range"),
 
                     "base_quality_quartile": _quintile(
                         min(setup.base.quality, 100)) if setup.base.quality is not None
@@ -884,6 +889,8 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     "t1": setup.t1, "t2": setup.t2,
                     "r_planned": setup.r_multiple_t1,
                 }
+                # result carries the trail forensics (trail_activated,
+                # stop_at_exit, mae_bar_index, ...) from _simulate_variant.
                 record.update(result or {"exit_reason": "never_triggered"})
                 record["variants"] = variants
                 trades.append(record)

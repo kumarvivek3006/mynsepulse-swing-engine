@@ -84,7 +84,18 @@ OBV_GATE = os.environ.get("OBV_GATE", "true").lower() == "true"
 # Set REJECT_NEGATIVE_PATTERNS=false to measure them again.
 REJECT_NEGATIVE_PATTERNS = os.environ.get(
     "REJECT_NEGATIVE_PATTERNS", "true").lower() == "true"
+# cup_handle added: 17 trades, 1 winner, -0.954R, and MFE averaging 0.4R
+# means they go DOWN immediately rather than rallying and stopping out.
+# The mechanism is entry timing and is not yet understood, so the pattern
+# is disabled as a SIGNAL while remaining fully detected and labelled —
+# the 17 trades stay as a diagnostic set, and detection continues so the
+# population keeps growing for analysis.
+#
+# This is not a fix and is not presented as one. CUP_HANDLE_ENABLED=true
+# restores it.
 NEGATIVE_PATTERNS = {"asc_triangle", "flag_pennant"}
+if os.environ.get("CUP_HANDLE_ENABLED", "false").lower() != "true":
+    NEGATIVE_PATTERNS = NEGATIVE_PATTERNS | {"cup_handle"}
 
 # ---------------------------------------------------------------------
 # Why DELIVERY_GATE defaults to false
@@ -215,6 +226,7 @@ class Setup:
     extension: dict = field(default_factory=dict)
     provisional: bool = False
     strategy_requested: str | None = None
+    trigger_diag: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
 
 
@@ -2076,6 +2088,28 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
         base.start_idx, base.duration, base.quality,
     )
 
+    # Entry-timing diagnostics. The cup_handle evidence showed MFE
+    # averaging 0.4R across 17 trades — they go down immediately rather
+    # than rallying and stopping out, which is an entry-timing signature,
+    # not a stop-placement one. Recorded for EVERY setup so the failing
+    # population can be compared against the working one.
+    _last = df.iloc[-1]
+    _vol50 = float(_last["vol50"]) if pd.notna(_last.get("vol50")) else 0.0
+    _ema20 = float(_last["ema20"]) if pd.notna(_last.get("ema20")) else None
+    _rng = float(_last["high"]) - float(_last["low"])
+    trigger_diag = {
+        "trigger_volume_vs_50d": (round(float(_last["volume"]) / _vol50, 2)
+                                  if _vol50 > 0 else None),
+        "pct_above_ema20_at_entry": (
+            round((float(_last["close"]) / _ema20 - 1) * 100, 2)
+            if _ema20 else None),
+        # 0 = closed on its low, 1 = closed on its high. A breakout closing
+        # in the lower half of its own bar is being sold into.
+        "trigger_close_position_in_range": (
+            round((float(_last["close"]) - float(_last["low"])) / _rng, 3)
+            if _rng > 0 else None),
+    }
+
     extension = extension_metrics(df, levels["entry"])
 
     # Levels are never provisional intraday: with last_bar_incomplete set,
@@ -2101,6 +2135,7 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
         score_total=total, score_breakdown=breakdown,
         extension=extension, provisional=provisional,
         strategy_requested=base_strategy,
+        trigger_diag=trigger_diag,
         notes=[f"base {base.duration}d, depth {base.depth_pct:.1f}%"
                + (", contracting" if base.contracting else ""),
                f"stop from {levels['stop_basis']}", f"T1 from {levels['t1_basis']}"]

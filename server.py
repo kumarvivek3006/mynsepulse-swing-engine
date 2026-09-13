@@ -1677,11 +1677,19 @@ def backtest_job(request: Request):
                                  -- only; nothing gates on these.
                                  handle_slope, handle_slope_pct, handle_depth_pct,
                                  cup_shape, cup_rounding_bars,
-                                 cup_low_idx_in_window, shape_diag)
+                                 cup_low_idx_in_window, shape_diag,
+                                 -- (A) entry timing / (B) trail forensics
+                                 trigger_volume_vs_50d,
+                                 pct_above_ema20_at_entry,
+                                 trigger_close_position_in_range,
+                                 trail_activated, initial_stop, stop_at_exit,
+                                 stop_at_mfe, mae_bar_index, mfe_bar_index)
                             values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                     %s,%s,%s,%s,%s,%s,%s,
                                     %s,%s,%s,%s,%s,
-                                    %s,%s,%s,%s,%s,%s,%s)
+                                    %s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,
+                                    %s,%s,%s,%s,%s,%s)
                         """, (run_id, t["symbol"], t["signal_date"], t["setup_type"],
                               t["pattern"], t["score_total"], t["band"], t["regime"],
                               t["entry_trigger"], t["stop_loss"], t["t1"], t.get("t2"),
@@ -1697,7 +1705,13 @@ def backtest_job(request: Request):
                               t.get("handle_depth_pct"), t.get("cup_shape"),
                               t.get("cup_rounding_bars"),
                               t.get("cup_low_idx_in_window"),
-                              json.dumps(t.get("shape_diag") or {})))
+                              json.dumps(t.get("shape_diag") or {}),
+                              t.get("trigger_volume_vs_50d"),
+                              t.get("pct_above_ema20_at_entry"),
+                              t.get("trigger_close_position_in_range"),
+                              t.get("trail_activated"), t.get("initial_stop"),
+                              t.get("stop_at_exit"), t.get("stop_at_mfe"),
+                              t.get("mae_bar_index"), t.get("mfe_bar_index")))
                     cur.execute("""
                         update backtest_runs set finished_at = now(), status = 'success',
                                universe = %s, signals = %s, metrics = %s
