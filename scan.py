@@ -34,7 +34,7 @@ from gates import (
 from ingest import connect
 from upstox_client import IST
 from fundamentals import load_snapshots
-from setups import Rejected, build_setup
+from setups import Rejected, build_setup, minervini_no_rs_count
 
 log = logging.getLogger(__name__)
 
@@ -299,6 +299,11 @@ def _breadth(conn, universe: list[str]) -> float:
     return (above / total * 100) if total else 0.0
 
 
+# Declared above its consumer. Python resolves module globals at call
+# time so the old ordering worked, but it read as undefined.
+_instrument_keys: dict[str, str] = {}
+
+
 def _forming_bar(client, conn, symbols: list[str]) -> dict[str, pd.DataFrame]:
     """
     Append today's in-progress session as a provisional daily bar.
@@ -341,7 +346,6 @@ def _forming_bar(client, conn, symbols: list[str]) -> dict[str, pd.DataFrame]:
     return out
 
 
-_instrument_keys: dict[str, str] = {}
 
 
 def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
@@ -1030,6 +1034,10 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "gate2_enforced": fundamentals_ready,
             "gate2_coverage": len(snapshots),
+            # Stocks that cleared Minervini without an RS percentile —
+            # typically fresh listings lacking 127 bars. A high number here
+            # explains an unexpected pass-rate on new names.
+            "minervini_passed_without_rs": minervini_no_rs_count(),
             "gate2_fundamentals_fresh": fundamentals_fresh,
             "cooldown": {
                 "active": cooldown_active,

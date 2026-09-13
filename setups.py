@@ -53,10 +53,19 @@ MINERVINI_GATE = os.environ.get("MINERVINI_GATE", "true").lower() == "true"
 MINERVINI_RS_FLOOR = float(os.environ.get("MINERVINI_RS_FLOOR", "70"))
 
 RS_MIN_GATE = os.environ.get("RS_MIN_GATE", "true").lower() == "true"
-RS63_FLOOR = float(os.environ.get("RS63_FLOOR", "20"))
-RS126_FLOOR = float(os.environ.get("RS126_FLOOR", "30"))
+# These are PERCENTAGE POINTS of outperformance vs the index, not
+# percentiles. 20pp over 63 days is roughly top-decile and 30pp over 126
+# days top-5% — far stricter than the evidence supports. The 3-year run
+# justifies HAVING a floor (bottom RS quintiles were sign-stable negative);
+# it says nothing about this floor. Set near top-quartile outperformance
+# and let the re-run identify where the separation actually is.
+RS63_FLOOR = float(os.environ.get("RS63_FLOOR", "8"))
+RS126_FLOOR = float(os.environ.get("RS126_FLOOR", "10"))
 
-SETUP_MIN_SCORE = float(os.environ.get("SETUP_MIN_SCORE", "55"))
+# Named HARD floor to distinguish it from scan.py's regime-scaled
+# MIN_SCORE/MIN_SCORE_NEUTRAL/MIN_SCORE_RISK_OFF, which is the primary live
+# gate. Two gates sharing one reason code made attribution ambiguous.
+SETUP_HARD_FLOOR = float(os.environ.get("SETUP_HARD_FLOOR", "55"))
 
 DELIVERY_GATE = os.environ.get("DELIVERY_GATE", "false").lower() == "true"
 DELIVERY_MIN_PCT = float(os.environ.get("DELIVERY_MIN_PCT", "30"))
@@ -312,7 +321,7 @@ FIXED_BASE_WINDOW = int(os.environ.get("FIXED_BASE_WINDOW", "45"))
 
 
 def detect_base(df: pd.DataFrame, exclude_last: int = 1,
-                strategy: str = "best_quality") -> Base:
+                strategy: str = DEFAULT_BASE_STRATEGY) -> Base:
     """
     The base is formed by the bars BEFORE the trigger.
 
@@ -885,7 +894,8 @@ def _classify(seg_high, seg_low, depth, duration,
 # ---------------------------------------------------------------------
 # Gate 5 — trigger
 # ---------------------------------------------------------------------
-def detect_trigger(df: pd.DataFrame, base: Base) -> str:
+def detect_trigger(df: pd.DataFrame, base: Base,
+                   last_bar_incomplete: bool = False) -> str:
     last = df.iloc[-1]
     rng = float(last["high"] - last["low"])
     atr = float(last["atr14"])
@@ -911,11 +921,15 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
         # Without this the engine cannot tell them apart — every breakout
         # was undifferentiated.
         if BREAKOUT_RSI_GATE:
-            rsi = float(last["rsi14"]) if pd.notna(last.get("rsi14")) else None
+            # Same reasoning as the retest path: gate on a closed bar's RSI.
+            rsi_bar = (df.iloc[-2] if (last_bar_incomplete and len(df) >= 2)
+                       else df.iloc[-1])
+            rsi = float(rsi_bar["rsi14"]) if pd.notna(rsi_bar.get("rsi14")) else None
             if rsi is None or not (BREAKOUT_RSI_LO <= rsi <= BREAKOUT_RSI_HI):
                 raise Rejected("gate5", "breakout_rsi_outside_band",
                                {"rsi14": round(rsi, 1) if rsi is not None else None,
-                                "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI]})
+                                "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI],
+                                "used_closed_bar": bool(last_bar_incomplete)})
 
         if DELIVERY_GATE:
             dp = last.get("delivery_pct")
@@ -1313,7 +1327,9 @@ RETEST_LOOKBACK_SESSIONS = int(os.environ.get("RETEST_LOOKBACK_SESSIONS", "15"))
 RETEST_MAX_UNDERCUT_PCT = float(os.environ.get("RETEST_MAX_UNDERCUT_PCT", "3.0"))
 
 
-def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1) -> Base:
+def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1,
+                           base_strategy: str = DEFAULT_BASE_STRATEGY,
+                           last_bar_incomplete: bool = False) -> Base:
     """
     Base -> genuine breakout above the pivot -> controlled pullback BACK
     down to that same level -> reversal today. Anchored to the pivot
@@ -1334,11 +1350,19 @@ def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1) -> Base:
     """
     df_visible = df.iloc[:-exclude_last] if exclude_last else df
     n = len(df_visible)
-    if n < RETEST_LOOKBACK_SESSIONS + BASE_MIN_SESSIONS + PRIOR_UPTREND_WINDOW // 2:
+    # Full PRIOR_UPTREND_WINDOW, not half: detect_base needs the whole
+    # window of prior closes, so a // 2 threshold let calls through that
+    # then failed inside detect_base with prior_window_too_short — a
+    # misleading reason code pointing at the wrong cause.
+    if n < RETEST_LOOKBACK_SESSIONS + BASE_MIN_SESSIONS + PRIOR_UPTREND_WINDOW:
         raise Rejected("gate4", "retest_insufficient_history")
 
     original = df_visible.iloc[:-RETEST_LOOKBACK_SESSIONS]
-    base = detect_base(original, exclude_last=0)   # already fully excludes the retest window
+    # Strategy threaded through. This called detect_base with no strategy,
+    # inheriting its best_quality default — so the retest detector kept
+    # using the one selector the code documents as producing the q4
+    # inversion, even after the live path moved to first_valid.
+    base = detect_base(original, exclude_last=0, strategy=base_strategy)
 
     retest_window = df_visible.iloc[len(original):]
     if len(retest_window) < 2:
@@ -1415,11 +1439,18 @@ def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1) -> Base:
     # halves. Separate reason code so attribution can tell the two paths
     # apart.
     if BREAKOUT_RSI_GATE:
-        rsi = float(last["rsi14"]) if pd.notna(last.get("rsi14")) else None
+        # Read the last CLOSED bar intraday. RSI on a forming bar moves
+        # through the session, so a 14:00 reading can sit inside the band
+        # and finish outside it — the gate would be deciding on a value
+        # that never existed at any close. provisional=True warns the
+        # consumer, but a gate should not act on an unconfirmed number.
+        rsi_bar = df.iloc[-2] if (last_bar_incomplete and len(df) >= 2) else df.iloc[-1]
+        rsi = float(rsi_bar["rsi14"]) if pd.notna(rsi_bar.get("rsi14")) else None
         if rsi is None or not (BREAKOUT_RSI_LO <= rsi <= BREAKOUT_RSI_HI):
             raise Rejected("gate5", "retest_rsi_outside_band",
                            {"rsi14": round(rsi, 1) if rsi is not None else None,
-                            "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI]})
+                            "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI],
+                            "used_closed_bar": bool(last_bar_incomplete)})
 
     # The base's SHAPE is whatever detect_base found (flat_base, cup_handle,
     # VCP, ...) — retest describes how we are entering, not what the
@@ -1544,6 +1575,18 @@ TRANSITION_MIN_BASE_SESSIONS = int(
 TRANSITION_VOL_MULT = float(os.environ.get("TRANSITION_VOL_MULT", "2.0"))
 
 
+# Counts Minervini passes where the RS component was skipped for want of a
+# percentile. Drained by the scan into its summary.
+_MINERVINI_NO_RS: list = []
+
+
+def minervini_no_rs_count(reset: bool = True) -> int:
+    n = len(_MINERVINI_NO_RS)
+    if reset:
+        _MINERVINI_NO_RS.clear()
+    return n
+
+
 def _minervini_ok(last, rs_rank_pct: float | None) -> tuple[bool, str | None]:
     """
     All 8 Minervini trend-template rules, as a GATE.
@@ -1580,8 +1623,15 @@ def _minervini_ok(last, rs_rank_pct: float | None) -> tuple[bool, str | None]:
         "30pct_above_52w_low": last["close"] >= float(last["low52"]) * 1.30,
         "within_25pct_of_52w_high": last["close"] >= float(last["high52"]) * 0.75,
     }
+    # Skipped, not failed, when the percentile is unavailable — a missing
+    # input should not masquerade as a rule violation. The consequence is
+    # asymmetric though: freshly-listed names without 127 bars of history
+    # bypass the RS component entirely. Reported so a suspiciously high
+    # pass-rate on new listings is traceable rather than mysterious.
     if rs_rank_pct is not None:
         checks["rs_rank_above_floor"] = rs_rank_pct >= MINERVINI_RS_FLOOR
+    else:
+        _MINERVINI_NO_RS.append(1)
     for name, ok in checks.items():
         if not ok:
             return False, name
@@ -1629,6 +1679,9 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
             raise Rejected("gate3", "minervini_template_failed",
                            {"failed_rule": failed})
     # Breakout retest is tried FIRST, not as a fallback after the standard
+    retest_base: Base | None = None
+    setup_type: str | None = None
+
     # search. It needs its own wider exclusion window from the very start —
     # trying it only after detect_base has already run would be too late,
     # since detect_base's own search would already have looked at (and
@@ -1637,88 +1690,80 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     # an ALREADY-confirmed breakout from an established base, which is the
     # opposite premise of a stock still emerging from Stage 1.
     if not transition:
+        # Detection ONLY here — no levels, no scoring, no early return.
+        #
+        # The retest branch used to build levels, score, and return a Setup
+        # inline. That early return skipped every gate defined below it:
+        # NEGATIVE_PATTERNS and OBV_GATE never ran for retests, so a retest
+        # on a banned pattern fired normally. Detecting here and falling
+        # through to one shared tail removes the whole class of bug rather
+        # than re-adding each gate in a second place.
         try:
-            base = detect_breakout_retest(df)
-            setup_type = "breakout_retest"
-            levels = derive_levels(df, base, setup_type, last_bar_incomplete)
-            total, breakdown = score_setup(df, base, setup_type, levels,
-                                           rs63, rs126, snap)
-            # Retest gets the SAME score floor as every other setup — it
-            # previously bypassed all downstream gating entirely.
-            if total < SETUP_MIN_SCORE:
-                raise Rejected("gate8", "score_below_minimum",
-                               {"score": total, "floor": SETUP_MIN_SCORE})
-            extension = extension_metrics(df, levels["entry"])
-            provisional = last_bar_incomplete   # trigger bar is today either way
-            return Setup(
-                symbol=symbol, setup_type=setup_type, pattern=base.pattern,
-                entry=levels["entry"], stop=levels["stop"], t1=levels["t1"],
-                t2=levels["t2"], r_multiple_t1=levels["r_multiple_t1"], base=base,
-                stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
-                t2_basis=levels.get("t2_basis"),
-                score_total=total, score_breakdown=breakdown,
-                extension=extension, provisional=provisional,
-                notes=[f"breakout retest: pivot {base.pivot:.2f}, "
-                      f"base {base.duration}d",
-                      f"stop from {levels['stop_basis']}",
-                      f"T1 from {levels['t1_basis']}"],
-            )
+            retest_base = detect_breakout_retest(
+                df, base_strategy=base_strategy,
+                last_bar_incomplete=last_bar_incomplete)
         except Rejected:
-            pass   # not a retest — fall through to the standard flow below
+            retest_base = None
 
-    try:
-        base = detect_base(df, strategy=base_strategy)
-    except Rejected as base_rej:
-        # Fallback only on the live path. The alternate strategies
-        # (first_valid, fixed_window) exist purely to compare window
-        # SELECTION within detect_base's own search — letting a flag
-        # fallback fire underneath them would let identical flag signals
-        # leak into all three, diluting exactly the comparison that
-        # backtest is measuring.
-        if base_strategy != "best_quality":
-            raise
-        base = detect_flag_pennant(df)
-
-    if transition:
-        if base.duration < TRANSITION_MIN_BASE_SESSIONS:
-            raise Rejected("gate4", "transition_base_too_short",
-                           {"duration": base.duration,
-                            "required": TRANSITION_MIN_BASE_SESSIONS})
-        last = df.iloc[-1]
-        vol50 = float(last["vol50"]) if pd.notna(last["vol50"]) else 0.0
-        if last["close"] > base.pivot:
-            # Weinstein's breakout rule is a WEEKLY volume expansion (>2x the
-            # 50-week average), not a daily one. The daily check here was a
-            # proxy for it: a single news-driven day that fully reverses
-            # satisfies a daily multiple, whereas a genuine week of
-            # institutional accumulation is a stronger and different claim —
-            # and Weinstein's entire stage framework is weekly throughout.
+    if retest_base is not None:
+        base = retest_base
+        setup_type = "breakout_retest"
+    else:
+        try:
+            base = detect_base(df, strategy=base_strategy)
+        except Rejected:
+            # The flag fallback is blocked only for fixed_window, which
+            # exists purely to measure ONE lookback and would be corrupted
+            # by a fallback firing underneath it.
             #
-            # Daily is kept as a floor alongside it: the breakout bar itself
-            # should still show real demand, not ride a surge that happened
-            # earlier in the week.
-            if vol50 <= 0 or last["volume"] < vol50 * TRANSITION_VOL_MULT:
-                raise Rejected("gate5", "transition_volume_insufficient",
-                               {"required_mult": TRANSITION_VOL_MULT,
-                                "actual": round(float(last["volume"]) / vol50, 2)
-                                if vol50 else None})
+            # This previously read `if base_strategy != "best_quality"`,
+            # written when best_quality was the default. Once first_valid
+            # became the live default that condition inverted: the live path
+            # started raising instead of falling back, and every flag and
+            # pennant setup was silently lost.
+            if base_strategy == "fixed_window":
+                raise
+            base = detect_flag_pennant(df)
 
-            if WEEKLY_VOL_CHECK_ENABLED:
-                weekly_ok, weekly_mult = weekly_volume_surge(df, WEEKLY_VOL_MULT)
-                if not weekly_ok:
-                    raise Rejected("gate5", "transition_weekly_volume_insufficient",
-                                   {"required_weekly_mult": WEEKLY_VOL_MULT,
-                                    "actual_weekly_mult": weekly_mult})
+        if transition:
+            # A flag is 5-15 sessions, so the duration check below would
+            # ALWAYS fire for one — rejecting correctly but reporting
+            # "base too short", as though a base had been found and
+            # measured. It is a different pattern type that should never
+            # have been considered for this path at all.
+            if base.pattern == "flag_pennant":
+                raise Rejected("gate4", "flag_not_valid_for_transition_path",
+                               {"pattern": base.pattern})
+            if base.duration < TRANSITION_MIN_BASE_SESSIONS:
+                raise Rejected("gate4", "transition_base_too_short",
+                               {"duration": base.duration,
+                                "required": TRANSITION_MIN_BASE_SESSIONS})
+            last = df.iloc[-1]
+            vol50 = float(last["vol50"]) if pd.notna(last["vol50"]) else 0.0
+            if last["close"] > base.pivot:
+                # Weinstein's breakout rule is a WEEKLY volume expansion
+                # (>2x the 50-week average), not a daily one. Daily is kept
+                # as a floor alongside it so the breakout bar itself shows
+                # real demand rather than riding an earlier surge.
+                if vol50 <= 0 or last["volume"] < vol50 * TRANSITION_VOL_MULT:
+                    raise Rejected("gate5", "transition_volume_insufficient",
+                                   {"required_mult": TRANSITION_VOL_MULT,
+                                    "actual": round(float(last["volume"]) / vol50, 2)
+                                    if vol50 else None})
 
-    setup_type = detect_trigger(df, base)
-    if transition:
-        setup_type = f"{setup_type}_transition"
-    levels = derive_levels(df, base, setup_type, last_bar_incomplete)
-    total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126, snap)
+                if WEEKLY_VOL_CHECK_ENABLED:
+                    weekly_ok, weekly_mult = weekly_volume_surge(df, WEEKLY_VOL_MULT)
+                    if not weekly_ok:
+                        raise Rejected("gate5",
+                                       "transition_weekly_volume_insufficient",
+                                       {"required_weekly_mult": WEEKLY_VOL_MULT,
+                                        "actual_weekly_mult": weekly_mult})
 
-    # OBV was computed and stored but read by nothing. Applied only to the
-    # ACCUMULATION patterns — a flag or high-tight-flag is momentum, where
-    # demanding a rising OBV over the base makes no sense.
+    # --- shared gates: both paths reach these ---------------------------
+    #
+    # Pattern rejection runs BEFORE trigger detection and level derivation:
+    # there is no point finding a trigger on a banned pattern, and the
+    # rejection reason is cleaner without levels attached.
     if REJECT_NEGATIVE_PATTERNS and base.pattern in NEGATIVE_PATTERNS:
         raise Rejected("gate6", "pattern_currently_negative",
                        {"pattern": base.pattern})
@@ -1726,6 +1771,13 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     if OBV_GATE and base.pattern in ("vcp", "flat_base", "ascending_base"):
         if not base.obv_rising:
             raise Rejected("gate5", "obv_not_rising", {"pattern": base.pattern})
+
+    if setup_type is None:
+        setup_type = detect_trigger(df, base, last_bar_incomplete)
+        if transition:
+            setup_type = f"{setup_type}_transition"
+    levels = derive_levels(df, base, setup_type, last_bar_incomplete)
+    total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126, snap)
 
     extension = extension_metrics(df, levels["entry"])
 
@@ -1737,9 +1789,9 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     # earlier "provisional" naming wrongly implied.
     # Nothing gated on the score before this: a 20/100 setup was published
     # identically to an 80/100 one.
-    if total < SETUP_MIN_SCORE:
-        raise Rejected("gate8", "score_below_minimum",
-                       {"score": total, "floor": SETUP_MIN_SCORE})
+    if total < SETUP_HARD_FLOOR:
+        raise Rejected("gate8", "score_below_hard_floor",
+                       {"score": total, "floor": SETUP_HARD_FLOOR})
 
     provisional = last_bar_incomplete and not setup_type.startswith("armed")
 
