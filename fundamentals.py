@@ -130,40 +130,67 @@ def parse_share_holdings(payload: dict) -> list[dict]:
     """
     Promoter / FII / DII / public by quarter.
 
-    Schema NOT yet verified against the reference — the published example
-    was not retrievable. Parsed defensively across the plausible shapes and
-    returns [] rather than guessing when none match, so a shape change
-    surfaces as "no data" rather than as a table of nulls that reads like
-    real data. Confirm with /jobs/fundamentals/upstox-probe first.
+    Schema CONFIRMED from a live RELIANCE probe:
+        data = [ {category, history:[{period, value}]}, ... ]   # 5 rows
+
+    `data` is a BARE LIST, exactly like key-ratios. The earlier draft did
+    data.get("share_holdings"), which raised
+    "'list' object has no attribute 'get'" — the parse_error the probe
+    reported. Both of my guessed parsers made the same wrong assumption
+    about the envelope, which is why guessing was the wrong approach twice
+    over.
+
+    This is the sole source of FII and DII, null since the engine was
+    built, and the reason CANSLIM's "I" has been unimplementable.
     """
-    data = (payload or {}).get("data") or {}
-    holdings = (data.get("share_holdings") or data.get("shareholding")
-                or data.get("holdings") or [])
-    if not isinstance(holdings, list):
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
         return []
 
     label_map = {
         "promoters": "promoter_pct", "promoter": "promoter_pct",
         "promoter and promoter group": "promoter_pct",
-        "fii": "fii_pct", "fiis": "fii_pct", "foreign institutions": "fii_pct",
-        "dii": "dii_pct", "diis": "dii_pct", "domestic institutions": "dii_pct",
-        "public": "public_pct",
+        "promoter & promoter group": "promoter_pct",
+        "fii": "fii_pct", "fiis": "fii_pct",
+        "foreign institutions": "fii_pct",
+        "foreign institutional investors": "fii_pct",
+        "dii": "dii_pct", "diis": "dii_pct",
+        "domestic institutions": "dii_pct",
+        "domestic institutional investors": "dii_pct",
+        "public": "public_pct", "retail": "public_pct",
+        "others": "others_pct", "government": "govt_pct",
     }
 
     by_period: dict[date, dict] = {}
-    for block in holdings:
+    unmapped: set = set()
+
+    for block in data:
         if not isinstance(block, dict):
             continue
         raw = (block.get("category") or block.get("holder_type")
-               or block.get("particular") or block.get("type") or "")
+               or block.get("particular") or "")
         field = label_map.get(str(raw).strip().lower())
         if not field:
+            if raw:
+                unmapped.add(str(raw))
             continue
         for point in block.get("history") or []:
-            d = parse_upstox_period(point.get("period"))
-            if d is None or point.get("value") is None:
+            if not isinstance(point, dict):
                 continue
-            by_period.setdefault(d, {"period_end": d})[field] = float(point["value"])
+            d = parse_upstox_period(point.get("period"))
+            value = point.get("value")
+            if d is None or value is None:
+                continue
+            try:
+                by_period.setdefault(d, {"period_end": d})[field] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+    if unmapped:
+        # Surfaced rather than silently skipped: an unrecognised holder
+        # category means the label map needs extending, which is invisible
+        # if the row is just dropped.
+        log.warning("share_holdings: unmapped categories %s", sorted(unmapped))
 
     return [by_period[d] for d in sorted(by_period, reverse=True)]
 

@@ -649,6 +649,10 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                         "setup_type": alt_setup.setup_type,
                         "score_total": alt_setup.score_total,
                         "band": _band(alt_setup.score_total), "regime": regime,
+                        "strategy_used": alt_setup.base.strategy_used,
+                        "base_start_idx": alt_setup.base.start_idx,
+                        "base_duration": alt_setup.base.duration,
+                        "base_quality": round(alt_setup.base.quality, 2),
                         **(alt_result or {"exit_reason": "never_triggered"}),
                     })
 
@@ -679,6 +683,14 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                     # only the downstream trade score has. If quality does
                     # not separate results either, the window-selection
                     # formula is picking noise that merely looks tidy.
+                    # C1: recorded per trade so base selection can be
+                    # attributed rather than inferred.
+                    "strategy_used": setup.base.strategy_used,
+                    "strategy_requested": setup.strategy_requested,
+                    "base_start_idx": setup.base.start_idx,
+                    "base_duration": setup.base.duration,
+                    "base_quality": round(setup.base.quality, 2),
+
                     "base_quality_quartile": _quintile(
                         min(setup.base.quality, 100)) if setup.base.quality is not None
                         else "unknown",
@@ -944,6 +956,48 @@ def compare_base_strategies(main_trades: list[dict],
             row["beats_live_default_both_halves"] = bool(
                 row["first_half"]["expectancy_r"] > bf["expectancy_r"]
                 and row["second_half"]["expectancy_r"] > bs["expectancy_r"])
+
+    # Task 5's comparison, produced automatically rather than by hand:
+    # do the strategies actually pick DIFFERENT windows? Identical
+    # distributions across all four would mean either genuine convergence
+    # or a plumbing fault, and the quality spread distinguishes them.
+    for name, trs in all_strategies.items():
+        if "error" in out.get(name, {}):
+            continue
+        quals = [t["base_quality"] for t in trs if t.get("base_quality") is not None]
+        starts = [t["base_start_idx"] for t in trs if t.get("base_start_idx") is not None]
+        if quals:
+            ordered = sorted(quals)
+            out[name]["base_selection"] = {
+                "n_with_quality": len(quals),
+                "quality_mean": round(sum(quals) / len(quals), 2),
+                "quality_median": round(ordered[len(ordered) // 2], 2),
+                "quality_min": round(min(quals), 2),
+                "quality_max": round(max(quals), 2),
+                "distinct_start_idx": len(set(starts)),
+            }
+
+    # How many signals did each alternative select a DIFFERENT window for
+    # than the live default? Zero across the board is the signature of a
+    # plumbing fault.
+    default_by_key = {
+        (t.get("symbol"), t.get("signal_date")): t.get("base_start_idx")
+        for t in all_strategies.get(DEFAULT_BASE_STRATEGY, [])}
+    for name, trs in all_strategies.items():
+        if name == DEFAULT_BASE_STRATEGY or "error" in out.get(name, {}):
+            continue
+        compared = differing = 0
+        for t in trs:
+            key = (t.get("symbol"), t.get("signal_date"))
+            if key in default_by_key and t.get("base_start_idx") is not None:
+                compared += 1
+                if default_by_key[key] != t["base_start_idx"]:
+                    differing += 1
+        out[name]["vs_live_default"] = {
+            "signals_compared": compared,
+            "different_base_selected": differing,
+            "pct_different": round(differing / compared * 100, 1) if compared else None,
+        }
 
     winners = [n for n, r in out.items()
               if n != DEFAULT_BASE_STRATEGY

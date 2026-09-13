@@ -707,6 +707,11 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "pattern": setup.pattern,
                 "contracting": setup.base.contracting,
                 "obv_rising": setup.base.obv_rising,
+                # C1 diagnostic: which strategy was ASKED for vs which
+                # actually selected the base. strategy_used is None when the
+                # flag fallback fired.
+                "strategy_used": setup.base.strategy_used,
+                "strategy_requested": setup.strategy_requested,
                 "entry_trigger": setup.entry,
                 "stop_loss": setup.stop,
                 "t1": setup.t1,
@@ -990,6 +995,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                                   "extension": s_["extension"],
                                   "contracting": s_["contracting"],
                                   "obv_rising": s_["obv_rising"],
+                                  "strategy_used": s_.get("strategy_used"),
+                                  "strategy_requested": s_.get("strategy_requested"),
                                   "notes": s_["notes"]}),
                       as_of + timedelta(days=SIGNAL_EXPIRY_SESSIONS * 2),
                       first_seen.get(s_["symbol"])))

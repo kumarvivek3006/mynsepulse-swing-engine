@@ -460,6 +460,8 @@ def signals(request: Request):
         r["t2_basis"] = _notes.get("t2_basis")
         r["rs_rank_pct"] = _notes.get("rs_rank_pct")
         r["obv_rising"] = bool(_notes.get("obv_rising"))
+        r["strategy_used"] = _notes.get("strategy_used")
+        r["strategy_requested"] = _notes.get("strategy_requested")
         r["is_new_opportunity"] = bool(_notes.get("is_new_opportunity"))
 
         # Live progress against the levels. Everything here is derived from

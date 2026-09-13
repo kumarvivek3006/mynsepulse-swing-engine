@@ -14,11 +14,14 @@ is not a trade; it is a stock you missed.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 # gates.py imports nothing from this package, so this direction creates no
 # cycle. weekly_volume_surge lives there because that is where the other
@@ -173,6 +176,22 @@ class Base:
 
 @dataclass
 class Setup:
+    """
+    A constructed setup with its levels, score and provenance.
+
+    strategy_requested vs strategy_used — these are NOT interchangeable:
+
+      strategy_requested — the top-level config value handed to
+        build_setup (BASE_STRATEGY, or whatever a caller passed).
+
+      base.strategy_used — the strategy that ACTUALLY selected the base.
+        None when the flag/pennant fallback produced it, since flag
+        detection is not a base strategy.
+
+    Diagnostic comparisons must read base.strategy_used. Reading
+    strategy_requested only tells you what was asked for, which is exactly
+    the mistake that let a self-comparison go unnoticed in Run #28.
+    """
     symbol: str
     setup_type: str
     pattern: str
@@ -358,6 +377,13 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         quality ranking at all. Mirrors a trader taking the most recent
         legitimate base rather than grading twenty of them against a
         formula.
+      "first_valid_quality_gated" — scan shortest-to-longest like
+        first_valid, but skip windows scoring below FIRST_VALID_MIN_QUALITY
+        and take the first that clears it. Sits between the other two:
+        first_valid can accept a technically-valid but poor base purely
+        because it appeared first, while best_quality's own top quartile
+        measured worst. Earliest ACCEPTABLE rather than earliest or
+        best-scoring.
       "fixed_window" — try exactly ONE lookback (FIXED_BASE_WINDOW
         sessions). No search at all.
     """
@@ -1619,6 +1645,11 @@ def detect_flag_pennant(df: pd.DataFrame, exclude_last: int = 1) -> Base:
         # contracting=False: that field now means "is a VCP" everywhere
         # else. A flag is a momentum pause, not a Minervini contraction, and
         # marking it True put every flag into the VCP bucket for attribution.
+        #
+        # strategy_used is intentionally None here — flag detection is not a
+        # base strategy, so there is nothing to record. A diagnostic seeing
+        # strategy_requested=<x> alongside strategy_used=None should read
+        # this as "the flag fallback fired", not "the parameter was lost".
         candidate = Base("flag_pennant", flag_start, pivot_idx, pivot, base_low,
                          depth, flag_len, dryup, dryup, pole_gain, quality,
                          False, False)
@@ -1844,6 +1875,13 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
             setup_type = f"{setup_type}_transition"
     levels = derive_levels(df, base, setup_type, last_bar_incomplete)
     total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126, snap)
+
+    log.debug(
+        "strategy_trace symbol=%s requested=%s used=%s "
+        "base_start=%s base_duration=%s base_quality=%.2f",
+        symbol, base_strategy, base.strategy_used,
+        base.start_idx, base.duration, base.quality,
+    )
 
     extension = extension_metrics(df, levels["entry"])
 
