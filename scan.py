@@ -512,6 +512,42 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
 
         # --- Gates 0 / 2 / 3 per symbol -------------------------------
         counts: dict[str, int] = {}
+        # RS percentile across the universe, computed BEFORE setup
+        # construction because the Minervini gate needs it at build time.
+        # The existing rs_rank_pct was derived after the fact from published
+        # signals only — a percentile against a handful of survivors, not
+        # against the universe, and unusable as a gate input.
+        # Computed in SQL, not by re-reading every symbol. A Python two-pass
+        # would double the per-scan database reads for a single number per
+        # stock — the same reason breadth is computed server-side.
+        rs_percentiles: dict[str, float] = {}
+        with conn.cursor() as cur:
+            cur.execute("""
+                with ranked as (
+                    select symbol, adj_close,
+                           row_number() over (partition by symbol
+                                              order by trade_date desc) as rn
+                    from ohlcv_daily
+                    where symbol = any(%s)
+                ),
+                spans as (
+                    select symbol,
+                           max(adj_close) filter (where rn = 1)   as now_px,
+                           max(adj_close) filter (where rn = 127) as then_px
+                    from ranked where rn in (1, 127) group by symbol
+                )
+                select symbol, (now_px / then_px - 1) * 100 as ret_pct
+                from spans
+                where then_px is not null and then_px > 0
+                order by ret_pct
+            """, (universe,))
+            rows = cur.fetchall()
+        if rows:
+            n = len(rows)
+            for rank, (sym_, _ret) in enumerate(rows):
+                rs_percentiles[sym_] = round(rank / max(n - 1, 1) * 100, 1)
+        log.info("RS percentiles computed for %d symbols", len(rs_percentiles))
+
         signals: list[dict] = []
         log_rows: list[tuple] = []
         intraday_frames: dict[str, pd.DataFrame] = {}
@@ -615,7 +651,8 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 setup = build_setup(sym, df, rs63, rs126,
                                     snapshots.get(sym) if fundamentals_ready else None,
                                     transition=transition,
-                                    last_bar_incomplete=(mode == "intraday"))
+                                    last_bar_incomplete=(mode == "intraday"),
+                                    rs_rank_pct=rs_percentiles.get(sym))
             except Rejected as rej:
                 counts[rej.reason] = counts.get(rej.reason, 0) + 1
                 log_rows.append((as_of, sym, rej.gate, rej.reason,

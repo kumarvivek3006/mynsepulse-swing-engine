@@ -27,9 +27,69 @@ from gates import (WEEKLY_VOL_CHECK_ENABLED, WEEKLY_VOL_MULT,
                    weekly_volume_surge)
 
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
-MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "4"))
+MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "6"))
 # Spec (Prompt 7): VCP's final contraction should be tightest, under ~8%.
 VCP_FINAL_CONTRACTION_PCT = float(os.environ.get("VCP_FINAL_CONTRACTION_PCT", "8"))
+
+# ---------------------------------------------------------------------
+# Evidence-derived gates (Run #21, sign-stable across both halves).
+#
+# EVERY ONE IS SWITCHABLE. These were each measured in ISOLATION; turning
+# on 20 simultaneously is a different and untested claim, and several of
+# these same findings flipped sign in earlier runs. Defaults are on so the
+# re-run measures the full stack, but any single gate can be disabled from
+# the environment when the data says it does not hold.
+# ---------------------------------------------------------------------
+BREAKOUT_RSI_GATE = os.environ.get("BREAKOUT_RSI_GATE", "true").lower() == "true"
+BREAKOUT_RSI_LO = float(os.environ.get("BREAKOUT_RSI_LO", "70"))
+BREAKOUT_RSI_HI = float(os.environ.get("BREAKOUT_RSI_HI", "80"))
+
+ARMED_MIN_DISTANCE_PCT = float(os.environ.get("ARMED_MIN_DISTANCE_PCT", "2.0"))
+
+PRIOR_MOVE_REJECT_LO = float(os.environ.get("PRIOR_MOVE_REJECT_LO", "25"))
+PRIOR_MOVE_REJECT_HI = float(os.environ.get("PRIOR_MOVE_REJECT_HI", "35"))
+
+MINERVINI_GATE = os.environ.get("MINERVINI_GATE", "true").lower() == "true"
+MINERVINI_RS_FLOOR = float(os.environ.get("MINERVINI_RS_FLOOR", "70"))
+
+RS_MIN_GATE = os.environ.get("RS_MIN_GATE", "true").lower() == "true"
+RS63_FLOOR = float(os.environ.get("RS63_FLOOR", "20"))
+RS126_FLOOR = float(os.environ.get("RS126_FLOOR", "30"))
+
+SETUP_MIN_SCORE = float(os.environ.get("SETUP_MIN_SCORE", "55"))
+
+DELIVERY_GATE = os.environ.get("DELIVERY_GATE", "false").lower() == "true"
+DELIVERY_MIN_PCT = float(os.environ.get("DELIVERY_MIN_PCT", "30"))
+
+OBV_GATE = os.environ.get("OBV_GATE", "true").lower() == "true"
+
+# asc_triangle and flag_pennant were both sign-stable negative in the 3-year
+# run. _is_ascending_triangle has since been rebuilt (it previously counted
+# local minima without checking they RISE, so descending troughs passed), and
+# the flag detector gained a pole-retracement limit and the spec's 1.8x
+# volume bar — so the negative result may already be reversed. But that
+# cannot be known without a re-run, and until it is these should not trade.
+# Set REJECT_NEGATIVE_PATTERNS=false to measure them again.
+REJECT_NEGATIVE_PATTERNS = os.environ.get(
+    "REJECT_NEGATIVE_PATTERNS", "true").lower() == "true"
+NEGATIVE_PATTERNS = {"asc_triangle", "flag_pennant"}
+
+# ---------------------------------------------------------------------
+# Why DELIVERY_GATE defaults to false
+#
+# The spec (Layer 8) requires delivery >= 30% on the breakout day, and
+# armed_delivery.confirmed was sign-stable positive. It is off because
+# delivery_pct is not on the indicator frame — it lives in its own table and
+# the join is not wired. Turning it on before that would reject EVERY
+# breakout on missing data rather than on evidence.
+#
+# Flip to true once: (a) delivery_pct is joined onto the frame, and (b) the
+# armed_delivery.confirmed bucket has n >= 100 after a re-run.
+#
+# PRIOR_MOVE_REJECT_LO/HI (25-35%) overlaps PRIOR_UPTREND_PCT (60) and is
+# currently redundant. Kept deliberately: if the 60% floor is ever lowered
+# for testing, the specific losing band stays excluded.
+# ---------------------------------------------------------------------
 # Rounding bottom is a LONG base by definition — 8-30 weeks per spec.
 ROUNDING_MIN_SESSIONS = int(os.environ.get("ROUNDING_MIN_SESSIONS", "40"))
 # High tight flag (spec): pole +100% in 4-8 weeks, flag 3-5 weeks, <25% retrace.
@@ -64,10 +124,10 @@ BASE_MAX_SESSIONS = int(os.environ.get("BASE_MAX_SESSIONS", "120"))
 BREAKOUT_VOL_MULT = float(os.environ.get("BREAKOUT_VOL_MULT", "1.5"))
 # How close to the pivot a stock must sit to be worth arming an order on.
 ARMED_MAX_DISTANCE_PCT = float(os.environ.get("ARMED_MAX_DISTANCE_PCT", "4.0"))
-MIN_RR = float(os.environ.get("MIN_RR", "1.0"))
+MIN_RR = float(os.environ.get("MIN_RR", "1.5"))
 MIN_STOP_ATR_MULT = float(os.environ.get("MIN_STOP_ATR_MULT", "0.75"))
 MAX_STOP_PCT = float(os.environ.get("MAX_STOP_PCT", "8"))
-PRIOR_UPTREND_PCT = float(os.environ.get("PRIOR_UPTREND_PCT", "25"))
+PRIOR_UPTREND_PCT = float(os.environ.get("PRIOR_UPTREND_PCT", "60"))
 # Bars over which the prior advance is measured. The classic trend-template
 # looks at the whole advance into the base, not a fixed two-month window —
 # a stock that ran 40% over five months and then consolidated is a valid
@@ -237,6 +297,17 @@ def swing_highs(df: pd.DataFrame, span: int = 3) -> list[int]:
 # "best_quality" (default) is BYTE-IDENTICAL to the original function and is
 # what the live engine calls. The other two only run inside the backtest.
 BASE_SELECTION_STRATEGIES = ("best_quality", "first_valid", "fixed_window")
+# Live default is first_valid, NOT best_quality.
+#
+# base_quality_quartile.q4 — the top bucket of the quality formula's own
+# ranking — was sign-stable NEGATIVE across both halves of both 3-year runs
+# (-0.698/-0.660 and -0.698/-0.616). best_quality is the mechanism that
+# selects q4. The depth term was separately found to be scoring backwards
+# (rating a 2% base above a 20% one, when 15-25% is the measured winning
+# band) and has been rebuilt to band-scoring — but until a re-run shows the
+# inversion is actually gone, the live path should not use the selector that
+# produced it. best_quality stays available for A/B measurement.
+DEFAULT_BASE_STRATEGY = os.environ.get("BASE_STRATEGY", "first_valid")
 FIXED_BASE_WINDOW = int(os.environ.get("FIXED_BASE_WINDOW", "45"))
 
 
@@ -323,6 +394,12 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
             _note("prior_window_too_short")
             continue
         prior_gain = (prior_window[-1] / prior_window.min() - 1) * 100
+        # 25-35% was sign-stable NEGATIVE across both halves of the 3-year
+        # run, and the old 25% floor put the threshold exactly inside that
+        # losing band — the detector was selecting for it.
+        if PRIOR_MOVE_REJECT_LO <= prior_gain <= PRIOR_MOVE_REJECT_HI:
+            _note("prior_move_near_floor")
+            continue
         if prior_gain < PRIOR_UPTREND_PCT:
             _note("weak_prior_uptrend")
             continue
@@ -348,7 +425,7 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         last_range = seg_high[-third:].max() - seg_low[-third:].min()
         contraction = float(last_range / first_range) if first_range > 0 else 1.0
 
-        pattern = _classify(seg_high, seg_low, depth, lookback, contraction,
+        pattern = _classify(seg_high, seg_low, depth, lookback,
                             volumes[seg_start:])
 
         # Two patterns need the full frame (a prior base, or a flagpole
@@ -361,7 +438,11 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
             pattern = "high_tight_flag"
         elif _is_base_on_base(df, seg_start, base_low, pivot):
             pattern = "base_on_base"
-        contracting = bool(contraction < 0.6 and depth < 25)
+        # Derived from the PATTERN, and computed AFTER the overrides above —
+        # two edits landed out of order and left this unconditionally False,
+        # so every base including genuine VCPs reported contracting=False and
+        # the whole attribution dimension was dead.
+        contracting = (pattern == "vcp")
 
         # Deliberately NOT added into the quality score below. That formula
         # is the one measured to be inverted — its own top-rated quartile
@@ -728,16 +809,23 @@ def _is_ascending_triangle(seg_high, seg_low, duration: int,
     if lows_first <= 0 or lows_last <= lows_first * 1.02:
         return False
 
+    # _find_local_minima returns ALL local minima, rising or falling. The
+    # old check only counted them — so a DESCENDING series of troughs
+    # satisfied "ascending triangle". Each trough must actually be higher
+    # than the one before it.
     span = max(2, duration // 12)
-    rising_low_count = len(_find_local_minima(seg_low, span))
-    if rising_low_count < 2:
+    troughs = _find_local_minima(seg_low, span)
+    if len(troughs) < 2:
+        return False
+    if not all(seg_low[troughs[i + 1]] > seg_low[troughs[i]]
+               for i in range(len(troughs) - 1)):
         return False
 
     # Flat top: the resistance must genuinely be flat, not sloping.
     return abs(highs_last - highs_first) / highs_first < 0.03 if highs_first else False
 
 
-def _classify(seg_high, seg_low, depth, duration, contraction,
+def _classify(seg_high, seg_low, depth, duration,
               seg_vol=None) -> str:
     third = max(duration // 3, 3)
     lows_first = seg_low[:third].min()
@@ -761,14 +849,17 @@ def _classify(seg_high, seg_low, depth, duration, contraction,
     # ones after it, so it gets first refusal — the same precedence rule that
     # had to be applied when a genuine cup was being swallowed by the looser
     # ascending-triangle test.
-    if depth <= 15:
-        return "flat_base"
+    # VCP checked BEFORE flat_base. A genuine VCP with depth <=15% was
+    # being labelled flat_base and losing its identity — and the spec's
+    # tightest final contraction (<8%) can occur in shallower bases too.
     if _is_vcp(seg_high, seg_low, depth, duration):
         # A real stepwise volatility contraction: >=2 pullbacks, each under
         # 0.7x the prior. Previously VCP existed only as a boolean flag
         # derived from a single first-third vs last-third range ratio, and
         # never as a pattern label — so it could not be measured at all.
         return "vcp"
+    if depth <= 15:
+        return "flat_base"
     if _is_inverse_head_shoulders(seg_high, seg_low, duration):
         return "inverse_head_shoulders"
     if _is_double_bottom(seg_high, seg_low, duration, seg_vol):
@@ -814,6 +905,24 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
                            {"volume_mult": round(float(last["volume"]) / vol50, 2) if vol50 else None,
                             "required": required_mult,
                             "pattern": base.pattern})
+
+        # breakout_rsi_70_80 was the ONLY sub-signal positive in both halves
+        # (+0.281R / +0.513R); breakout_other_rsi was sign-stable negative.
+        # Without this the engine cannot tell them apart — every breakout
+        # was undifferentiated.
+        if BREAKOUT_RSI_GATE:
+            rsi = float(last["rsi14"]) if pd.notna(last.get("rsi14")) else None
+            if rsi is None or not (BREAKOUT_RSI_LO <= rsi <= BREAKOUT_RSI_HI):
+                raise Rejected("gate5", "breakout_rsi_outside_band",
+                               {"rsi14": round(rsi, 1) if rsi is not None else None,
+                                "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI]})
+
+        if DELIVERY_GATE:
+            dp = last.get("delivery_pct")
+            dp = float(dp) if dp is not None and pd.notna(dp) else None
+            if dp is None or dp < DELIVERY_MIN_PCT:
+                raise Rejected("gate5", "breakout_delivery_too_low",
+                               {"delivery_pct": dp, "required": DELIVERY_MIN_PCT})
         if rng > 0 and (last["close"] - last["low"]) / rng < 0.66:
             raise Rejected("gate5", "weak_close_in_range")
         # Exhaustion: a huge range with a long upper wick is supply, not demand.
@@ -895,7 +1004,10 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
     close = float(last["close"])
     distance_pct = (base.pivot / close - 1) * 100
 
-    if 0 <= distance_pct <= ARMED_MAX_DISTANCE_PCT:
+    # tight_0_2pct was sign-stable negative, wide_2_4pct positive. The old
+    # 0-4% window contained both, so half of every armed signal came from
+    # the measurably losing sub-band.
+    if ARMED_MIN_DISTANCE_PCT <= distance_pct <= ARMED_MAX_DISTANCE_PCT:
         # Must still be constructive: sitting in the upper half of the base
         # and holding the 20 EMA. A stock at the bottom of its base is not
         # coiling, it is failing.
@@ -944,6 +1056,11 @@ def detect_trigger(df: pd.DataFrame, base: Base) -> str:
                                {"upper_wick_pct": round(upper_wick_pct * 100, 1)})
 
         return "armed"
+
+    if 0 <= distance_pct < ARMED_MIN_DISTANCE_PCT:
+        raise Rejected("gate5", "armed_distance_too_tight",
+                       {"distance_to_pivot_pct": round(distance_pct, 2),
+                        "min_required": ARMED_MIN_DISTANCE_PCT})
 
     raise Rejected("gate5", "no_trigger",
                    {"distance_to_pivot_pct": round(distance_pct, 2)})
@@ -1292,6 +1409,18 @@ def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1) -> Base:
         raise Rejected("gate5", "retest_not_confirmed_today",
                        {"close": round(close, 2), "pivot": round(base.pivot, 2)})
 
+    # A retest is a breakout variant, but build_setup calls this BEFORE
+    # detect_trigger and returns early on success — so retests were skipping
+    # the RSI band entirely, the one sub-signal measured positive in both
+    # halves. Separate reason code so attribution can tell the two paths
+    # apart.
+    if BREAKOUT_RSI_GATE:
+        rsi = float(last["rsi14"]) if pd.notna(last.get("rsi14")) else None
+        if rsi is None or not (BREAKOUT_RSI_LO <= rsi <= BREAKOUT_RSI_HI):
+            raise Rejected("gate5", "retest_rsi_outside_band",
+                           {"rsi14": round(rsi, 1) if rsi is not None else None,
+                            "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI]})
+
     # The base's SHAPE is whatever detect_base found (flat_base, cup_handle,
     # VCP, ...) — retest describes how we are entering, not what the
     # structure looked like. Returning the original base unchanged keeps
@@ -1394,9 +1523,12 @@ def detect_flag_pennant(df: pd.DataFrame, exclude_last: int = 1) -> Base:
             + min(pole_gain / 60, 1.0) * 30
         )
 
+        # contracting=False: that field now means "is a VCP" everywhere
+        # else. A flag is a momentum pause, not a Minervini contraction, and
+        # marking it True put every flag into the VCP bucket for attribution.
         candidate = Base("flag_pennant", flag_start, pivot_idx, pivot, base_low,
                          depth, flag_len, dryup, dryup, pole_gain, quality,
-                         True, False)
+                         False, False)
         if best is None or candidate.quality > best.quality:
             best = candidate
 
@@ -1412,10 +1544,55 @@ TRANSITION_MIN_BASE_SESSIONS = int(
 TRANSITION_VOL_MULT = float(os.environ.get("TRANSITION_VOL_MULT", "2.0"))
 
 
+def _minervini_ok(last, rs_rank_pct: float | None) -> tuple[bool, str | None]:
+    """
+    All 8 Minervini trend-template rules, as a GATE.
+
+    rs_rank_pct is a PERCENTILE (0-100) against the universe — Minervini's
+    "RS rating > 70" means top 30% of all stocks.
+
+    This previously received rs126, which relative_strength() returns as
+    OUTPERFORMANCE VS THE INDEX IN PERCENTAGE POINTS. Comparing that to a
+    floor of 70 demanded a stock beat the Nifty by 70 points over six
+    months — a silent over-filter that would reject nearly everything. The
+    units were wrong, not the threshold.
+
+    When no percentile is available the RS check is SKIPPED rather than
+    failed, so a missing input never masquerades as a rule violation.
+    """
+    # NaN guard first: comparing against NaN yields False, which would
+    # report a genuine-looking rule failure when the real cause is a stock
+    # with insufficient history.
+    required = ["sma50", "sma150", "sma200", "sma200_slope25", "low52", "high52"]
+    for field in required:
+        value = last.get(field)
+        if value is None or pd.isna(value):
+            return False, f"missing_{field}"
+
+    checks = {
+        "close_above_150": last["close"] > last["sma150"],
+        "close_above_200": last["close"] > last["sma200"],
+        "150_above_200": last["sma150"] > last["sma200"],
+        "200_rising": last["sma200_slope25"] > 0,
+        "50_above_150": last["sma50"] > last["sma150"],
+        "50_above_200": last["sma50"] > last["sma200"],
+        "close_above_50": last["close"] > last["sma50"],
+        "30pct_above_52w_low": last["close"] >= float(last["low52"]) * 1.30,
+        "within_25pct_of_52w_high": last["close"] >= float(last["high52"]) * 0.75,
+    }
+    if rs_rank_pct is not None:
+        checks["rs_rank_above_floor"] = rs_rank_pct >= MINERVINI_RS_FLOOR
+    for name, ok in checks.items():
+        if not ok:
+            return False, name
+    return True, None
+
+
 def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
                 rs126: float | None, snap=None, transition: bool = False,
                 last_bar_incomplete: bool = False,
-                base_strategy: str = "best_quality") -> Setup:
+                base_strategy: str = DEFAULT_BASE_STRATEGY,
+                rs_rank_pct: float | None = None) -> Setup:
     """
     transition=True applies the Stage 1->2 profile: a longer base and a
     heavier volume break. The trend filter is looser on that path, so the
@@ -1426,6 +1603,31 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     base_strategy is measurement-only — see detect_base. The live engine
     never passes anything but the default.
     """
+    last_bar = df.iloc[-1]
+
+    # Gates run BEFORE any detection — a stock failing the trend template
+    # should never reach pattern detection at all, and running detection
+    # first wastes the work and muddies attribution.
+    #
+    # RS floor: rs_quintile q4 was sign-stable negative, and RS was computed
+    # on every signal but gated on nowhere.
+    # `or`, not `and`: rejecting only when BOTH metrics were weak let a
+    # setup through on one strong timeframe while the other sat far below
+    # floor. The bottom RS quintile was sign-stable negative.
+    if RS_MIN_GATE:
+        if ((rs63 is None or rs63 < RS63_FLOOR)
+                or (rs126 is None or rs126 < RS126_FLOOR)):
+            raise Rejected("gate3", "rs_too_low",
+                           {"rs63": rs63, "rs126": rs126,
+                            "floors": [RS63_FLOOR, RS126_FLOOR]})
+
+    if MINERVINI_GATE:
+        # rs_rank_pct is a true universe percentile, computed cross-
+        # sectionally by the caller. rs126 is NOT interchangeable with it.
+        ok, failed = _minervini_ok(last_bar, rs_rank_pct)
+        if not ok:
+            raise Rejected("gate3", "minervini_template_failed",
+                           {"failed_rule": failed})
     # Breakout retest is tried FIRST, not as a fallback after the standard
     # search. It needs its own wider exclusion window from the very start —
     # trying it only after detect_base has already run would be too late,
@@ -1441,6 +1643,11 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
             levels = derive_levels(df, base, setup_type, last_bar_incomplete)
             total, breakdown = score_setup(df, base, setup_type, levels,
                                            rs63, rs126, snap)
+            # Retest gets the SAME score floor as every other setup — it
+            # previously bypassed all downstream gating entirely.
+            if total < SETUP_MIN_SCORE:
+                raise Rejected("gate8", "score_below_minimum",
+                               {"score": total, "floor": SETUP_MIN_SCORE})
             extension = extension_metrics(df, levels["entry"])
             provisional = last_bar_incomplete   # trigger bar is today either way
             return Setup(
@@ -1509,6 +1716,17 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     levels = derive_levels(df, base, setup_type, last_bar_incomplete)
     total, breakdown = score_setup(df, base, setup_type, levels, rs63, rs126, snap)
 
+    # OBV was computed and stored but read by nothing. Applied only to the
+    # ACCUMULATION patterns — a flag or high-tight-flag is momentum, where
+    # demanding a rising OBV over the base makes no sense.
+    if REJECT_NEGATIVE_PATTERNS and base.pattern in NEGATIVE_PATTERNS:
+        raise Rejected("gate6", "pattern_currently_negative",
+                       {"pattern": base.pattern})
+
+    if OBV_GATE and base.pattern in ("vcp", "flat_base", "ascending_base"):
+        if not base.obv_rising:
+            raise Rejected("gate5", "obv_not_rising", {"pattern": base.pattern})
+
     extension = extension_metrics(df, levels["entry"])
 
     # Levels are never provisional intraday: with last_bar_incomplete set,
@@ -1517,6 +1735,12 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     # half of its range, or the volume pace can fade. So this flags an
     # unconfirmed TRIGGER, not an unreliable level, which is what the
     # earlier "provisional" naming wrongly implied.
+    # Nothing gated on the score before this: a 20/100 setup was published
+    # identically to an 80/100 one.
+    if total < SETUP_MIN_SCORE:
+        raise Rejected("gate8", "score_below_minimum",
+                       {"score": total, "floor": SETUP_MIN_SCORE})
+
     provisional = last_bar_incomplete and not setup_type.startswith("armed")
 
     return Setup(

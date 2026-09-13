@@ -570,7 +570,12 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                                                         <= df["trade_date"].iloc[i]], 63),
                         relative_strength(window, nifty[nifty["trade_date"]
                                                         <= df["trade_date"].iloc[i]], 126),
-                        None)
+                        None,
+                        # A true cross-sectional percentile. The Minervini
+                        # gate needs this, not rs126 (which is percentage-
+                        # point outperformance vs the index — different
+                        # units entirely).
+                        rs_rank_pct=rs_pct.get((sym, d)))
                 except Rejected:
                     continue
 
