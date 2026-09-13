@@ -341,6 +341,165 @@ def _first(row: dict, keys: tuple[str, ...]):
     return None
 
 
+# ---------------------------------------------------------------------
+# Upstox ingestion — replaces the NSE path
+#
+# UNITS: Upstox reports in CRORE (confirmed by data.units_in). The NSE path
+# received LAKHS and divided by LAKHS_TO_CRORES before storing, so
+# fundamentals_quarterly is ALREADY in crore. No conversion is applied here
+# and none should be — adding one would be wrong by 100x, and the two
+# sources would silently disagree by two orders of magnitude in the same
+# column. Rows are tagged source='upstox' so mixed-source data stays
+# attributable.
+# ---------------------------------------------------------------------
+UPSTOX_FUNDAMENTALS_ENABLED = os.environ.get(
+    "UPSTOX_FUNDAMENTALS_ENABLED", "true").lower() == "true"
+
+
+def _isin_map(conn, symbols: list[str] | None = None) -> dict[str, str]:
+    """symbol -> ISIN. The Upstox fundamentals API keys on ISIN, not symbol."""
+    with conn.cursor() as cur:
+        if symbols:
+            cur.execute("select symbol, isin from symbols "
+                        "where symbol = any(%s) and isin is not null", (symbols,))
+        else:
+            cur.execute("select symbol, isin from symbols where is_active "
+                        "and coalesce(series,'') <> 'INDEX' and isin is not null "
+                        "order by symbol")
+        return {sym: isin for sym, isin in cur.fetchall()}
+
+
+def sync_shareholding_upstox(conn, client, symbols: list[str] | None = None) -> dict:
+    """
+    Promoter / FII / DII / public by quarter, from Upstox.
+
+    FII and DII have been NULL since this engine was built — the NSE
+    endpoint never carried them, which is why CANSLIM's "I" (institutional
+    sponsorship) has been unimplementable. This is the first source that
+    supplies them.
+    """
+    isins = _isin_map(conn, symbols)
+    if not isins:
+        return {"written": 0, "failed": 0, "empty": 0,
+                "error": "no ISINs stored — run sync_universe first"}
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select count(*) from information_schema.columns
+            where table_schema = 'swing' and table_name = 'shareholding'
+              and column_name in ('fii_pct', 'dii_pct')
+        """)
+        has_inst_cols = cur.fetchone()[0] >= 2
+    if not has_inst_cols:
+        log.warning("shareholding.fii_pct/dii_pct missing — promoter data will "
+                    "ingest, institutional holdings will not")
+
+    written = failed = empty = 0
+    for sym, isin in isins.items():
+        try:
+            rows = parse_share_holdings(client.share_holdings(isin))
+        except Exception as exc:
+            failed += 1
+            log.debug("upstox share_holdings failed for %s (%s): %s", sym, isin, exc)
+            continue
+        if not rows:
+            empty += 1
+            continue
+
+        for row in rows:
+            period = row.get("period_end")
+            promoter = row.get("promoter_pct")
+            if period is None or promoter is None:
+                continue
+            with conn.cursor() as cur:
+                if has_inst_cols:
+                    cur.execute("""
+                        insert into shareholding
+                            (symbol, period_end, promoter_pct, fii_pct,
+                             dii_pct, public_pct, source)
+                        values (%s,%s,%s,%s,%s,%s,'upstox')
+                        on conflict (symbol, period_end) do update set
+                            promoter_pct = excluded.promoter_pct,
+                            fii_pct      = excluded.fii_pct,
+                            dii_pct      = excluded.dii_pct,
+                            public_pct   = excluded.public_pct,
+                            source       = excluded.source
+                    """, (sym, period, promoter, row.get("fii_pct"),
+                          row.get("dii_pct"), row.get("public_pct")))
+                else:
+                    cur.execute("""
+                        insert into shareholding
+                            (symbol, period_end, promoter_pct, source)
+                        values (%s,%s,%s,'upstox')
+                        on conflict (symbol, period_end) do update set
+                            promoter_pct = excluded.promoter_pct,
+                            source       = excluded.source
+                    """, (sym, period, promoter))
+                written += cur.rowcount
+        conn.commit()
+
+    log.info("Upstox shareholding: %d rows, %d failed, %d empty (of %d symbols)",
+             written, failed, empty, len(isins))
+    return {"written": written, "failed": failed, "empty": empty,
+            "symbols": len(isins), "institutional_columns": has_inst_cols}
+
+
+def sync_quarterly_results_upstox(conn, client,
+                                  symbols: list[str] | None = None) -> dict:
+    """
+    Quarterly revenue / operating profit / PAT / EPS, from Upstox.
+
+    Values are stored in CRORE, matching what the NSE path wrote after its
+    lakhs conversion. Operating margin comes from the reported
+    operating_profit rather than being reconstructed as
+    PBT + interest - other income, which is what the NSE path had to do
+    because no operating line existed there.
+    """
+    isins = _isin_map(conn, symbols)
+    if not isins:
+        return {"written": 0, "failed": 0, "empty": 0,
+                "error": "no ISINs stored — run sync_universe first"}
+
+    written = failed = empty = 0
+    for sym, isin in isins.items():
+        try:
+            rows = parse_income_statement(
+                client.income_statement(isin, time_period="quarterly"))
+        except Exception as exc:
+            failed += 1
+            log.debug("upstox income_statement failed for %s (%s): %s", sym, isin, exc)
+            continue
+        if not rows:
+            empty += 1
+            continue
+
+        for row in rows:
+            period = row.get("period_end")
+            revenue, pat = row.get("revenue"), row.get("pat")
+            if period is None or (revenue is None and pat is None):
+                continue
+            with conn.cursor() as cur:
+                cur.execute("""
+                    insert into fundamentals_quarterly
+                        (symbol, period_end, revenue, pat, eps, opm_pct, source)
+                    values (%s,%s,%s,%s,%s,%s,'upstox')
+                    on conflict (symbol, period_end) do update set
+                        revenue = excluded.revenue,
+                        pat     = excluded.pat,
+                        eps     = excluded.eps,
+                        opm_pct = excluded.opm_pct,
+                        source  = excluded.source
+                """, (sym, period, revenue, pat,
+                      row.get("eps"), row.get("opm_pct")))
+                written += cur.rowcount
+        conn.commit()
+
+    log.info("Upstox quarterly results: %d rows, %d failed, %d empty (of %d)",
+             written, failed, empty, len(isins))
+    return {"written": written, "failed": failed, "empty": empty,
+            "symbols": len(isins)}
+
+
 def sync_shareholding(conn, symbols: list[str] | None = None) -> dict:
     """
     Promoter holding by quarter.
