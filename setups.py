@@ -28,6 +28,10 @@ from gates import (WEEKLY_VOL_CHECK_ENABLED, WEEKLY_VOL_MULT,
 
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
 MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "4"))
+# Spec (Prompt 7): VCP's final contraction should be tightest, under ~8%.
+VCP_FINAL_CONTRACTION_PCT = float(os.environ.get("VCP_FINAL_CONTRACTION_PCT", "8"))
+# Rounding bottom is a LONG base by definition — 8-30 weeks per spec.
+ROUNDING_MIN_SESSIONS = int(os.environ.get("ROUNDING_MIN_SESSIONS", "40"))
 
 # Flag/pennant: a genuinely different animal from the 15-120 session bases
 # above. A short, tight consolidation (1-3 weeks) immediately after a
@@ -441,6 +445,118 @@ def _is_cup_and_handle(seg_high, seg_low, duration: int,
     return True
 
 
+def _count_contractions(seg_high, seg_low, duration: int) -> list[float]:
+    """
+    Depths of each successive pullback inside the base, oldest first.
+
+    Spec (Prompt 7) defines a VCP as >=2 contractions, each under 0.7x the
+    prior one, with the final contraction tightest. The engine only ever
+    computed a single first-third vs last-third range ratio and exposed it
+    as a boolean `contracting` flag — that cannot tell a genuine stepwise
+    volatility contraction from a base that merely happens to end quieter
+    than it started, and VCP never existed as a pattern LABEL at all.
+    """
+    span = max(2, duration // 12)
+    troughs = _find_local_minima(seg_low, span)
+    if len(troughs) < 2:
+        return []
+
+    # Merge adjacent near-duplicate troughs (same reason as the H&S detector:
+    # a discretized dip commonly registers two adjacent local minima).
+    merged = [troughs[0]]
+    for idx in troughs[1:]:
+        if idx - merged[-1] <= span:
+            if seg_low[idx] < seg_low[merged[-1]]:
+                merged[-1] = idx
+        else:
+            merged.append(idx)
+
+    depths = []
+    for i, t in enumerate(merged):
+        # Peak preceding this trough, back to the previous trough.
+        start = merged[i - 1] if i else 0
+        if t <= start:
+            continue
+        peak = float(seg_high[start:t + 1].max())
+        low = float(seg_low[t])
+        if peak > 0:
+            depths.append((peak - low) / peak * 100)
+    return depths
+
+
+def _is_vcp(seg_high, seg_low, depth, duration: int) -> bool:
+    """Spec: >=2 contractions, each < 0.7x the prior, final tightest (<8%)."""
+    depths = _count_contractions(seg_high, seg_low, duration)
+    if len(depths) < 2:
+        return False
+    for prev, nxt in zip(depths, depths[1:]):
+        if prev <= 0 or nxt > prev * 0.7:
+            return False
+    return depths[-1] < VCP_FINAL_CONTRACTION_PCT
+
+
+def _is_double_bottom(seg_high, seg_low, duration: int) -> bool:
+    """
+    Spec: two lows within 2% of each other, separated in time, with a
+    meaningful peak between them. Previously fell into `consolidation`.
+    """
+    span = max(2, duration // 12)
+    troughs = _find_local_minima(seg_low, span)
+    if len(troughs) < 2:
+        return False
+
+    for i in range(len(troughs) - 1):
+        for j in range(i + 1, len(troughs)):
+            a, b = troughs[i], troughs[j]
+            if b - a < max(5, duration // 6):
+                continue                       # too close together in time
+            low_a, low_b = float(seg_low[a]), float(seg_low[b])
+            if low_a <= 0:
+                continue
+            if abs(low_b - low_a) / low_a > 0.02:
+                continue                       # lows not within 2%
+            mid_peak = float(seg_high[a:b + 1].max())
+            # A real W needs a genuine recovery between the two feet.
+            if mid_peak > max(low_a, low_b) * 1.05:
+                return True
+    return False
+
+
+def _is_rounding_bottom(seg_high, seg_low, depth, duration: int) -> bool:
+    """
+    Spec: a slow, smooth U over a long base, depth 20-40%, low in the middle.
+
+    Distinguished from a cup by having NO handle — the right side runs
+    straight up into the pivot without a final shallow pullback.
+    """
+    if not (20 <= depth <= 40) or duration < ROUNDING_MIN_SESSIONS:
+        return False
+
+    low_idx = int(seg_low.argmin())
+    # Low must sit in the middle half of the base, not at either edge.
+    if not (duration * 0.25 <= low_idx <= duration * 0.75):
+        return False
+
+    # Smoothness: both sides should descend/ascend without a deep spike
+    # against the trend. Measured as the worst counter-move on each side
+    # relative to that side's own range.
+    left, right = seg_low[:low_idx + 1], seg_low[low_idx:]
+    if len(left) < 3 or len(right) < 3:
+        return False
+    for side in (left, right[::-1]):
+        rng = float(side.max() - side.min())
+        if rng <= 0:
+            return False
+        worst = 0.0
+        running = float(side[0])
+        for v in side:
+            worst = max(worst, float(v) - running) if v > running else worst
+            running = min(running, float(v))
+        if worst / rng > 0.4:
+            return False
+    return True
+
+
 def _is_ascending_triangle(seg_high, seg_low, duration: int,
                            highs_first: float, highs_last: float,
                            lows_first: float, lows_last: float) -> bool:
@@ -499,16 +615,28 @@ def _classify(seg_high, seg_low, depth, duration, contraction) -> str:
     # the flat-resistance-plus-rising-lows test — tested directly, a
     # constructed textbook cup was swallowed by asc_triangle when that ran
     # first, and the specific test never got a chance to fire.
+    # Ordered most-specific first. Each test below is a harder claim than the
+    # ones after it, so it gets first refusal — the same precedence rule that
+    # had to be applied when a genuine cup was being swallowed by the looser
+    # ascending-triangle test.
     if depth <= 15:
         return "flat_base"
+    if _is_vcp(seg_high, seg_low, depth, duration):
+        # A real stepwise volatility contraction: >=2 pullbacks, each under
+        # 0.7x the prior. Previously VCP existed only as a boolean flag
+        # derived from a single first-third vs last-third range ratio, and
+        # never as a pattern label — so it could not be measured at all.
+        return "vcp"
     if _is_inverse_head_shoulders(seg_high, seg_low, duration):
-        # Tried before cup_and_handle: three well-formed troughs is a more
-        # specific, harder-to-satisfy claim than a single dip, so it gets
-        # first refusal the same way cup_and_handle gets first refusal over
-        # the looser asc_triangle test below.
         return "inverse_head_shoulders"
+    if _is_double_bottom(seg_high, seg_low, duration):
+        return "double_bottom"
     if _is_cup_and_handle(seg_high, seg_low, duration, highs_first, highs_last):
         return "cup_handle"
+    if _is_rounding_bottom(seg_high, seg_low, depth, duration):
+        # Checked AFTER cup_handle: a rounding bottom is a cup without a
+        # handle, so anything with a valid handle should be labelled a cup.
+        return "rounding_bottom"
     if flat_resistance and rising_lows:
         return "asc_triangle" if _is_ascending_triangle(
             seg_high, seg_low, duration, highs_first, highs_last,

@@ -119,12 +119,20 @@ def _band(score: float) -> str:
 # stop at 40 sessions. Trend systems earn from a few very large winners, and
 # breakouts here show a 40.1% hit rate with only 1.48R average wins — high
 # accuracy, small payoff, which is what cutting winners looks like.
+# t2_exit is explicit per variant. It used to be inferred inside the
+# simulator as `not cfg["trail"] and not scale_pct`, which for the baseline
+# (scale_pct=50) silently evaluated False — so the baseline variant never
+# took its T2 exit while the separate _simulate() function did. Two code
+# paths both labelled "baseline" were modelling different policies, and the
+# entire +0.058R vs +0.016R discrepancy between exit_variants.baseline and
+# metrics.overall came from exactly that. Inferring behaviour from unrelated
+# flags is how that hid; naming it prevents a repeat.
 EXIT_VARIANTS = {
-    "baseline":        {"scale_pct": 50, "breakeven": True,  "trail": False, "max_hold": 40},
-    "no_scale_out":    {"scale_pct": 0,  "breakeven": True,  "trail": False, "max_hold": 40},
-    "no_breakeven":    {"scale_pct": 50, "breakeven": False, "trail": True,  "max_hold": 40},
-    "let_it_run":      {"scale_pct": 0,  "breakeven": False, "trail": True,  "max_hold": 120},
-    "trail_only_long": {"scale_pct": 33, "breakeven": False, "trail": True,  "max_hold": 120},
+    "baseline":        {"scale_pct": 50, "breakeven": True,  "trail": False, "max_hold": 40,  "t2_exit": True},
+    "no_scale_out":    {"scale_pct": 0,  "breakeven": True,  "trail": False, "max_hold": 40,  "t2_exit": True},
+    "no_breakeven":    {"scale_pct": 50, "breakeven": False, "trail": True,  "max_hold": 40,  "t2_exit": False},
+    "let_it_run":      {"scale_pct": 0,  "breakeven": False, "trail": True,  "max_hold": 120, "t2_exit": False},
+    "trail_only_long": {"scale_pct": 33, "breakeven": False, "trail": True,  "max_hold": 120, "t2_exit": False},
 }
 
 
@@ -193,7 +201,7 @@ def _simulate_variant(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
             if sl and sl > live_stop:
                 live_stop = sl
 
-        if not cfg["trail"] and not scale_pct and t2 and high >= t2:
+        if cfg.get("t2_exit") and t2 and high >= t2 and (scaled or not scale_pct):
             realised += remaining * (t2 - filled_at) / risk
             return _close(fwd, entry_idx, i, filled_at, t2, realised,
                           "target2", mfe, mae)
@@ -210,74 +218,18 @@ def _simulate_variant(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
 def _simulate(fwd: pd.DataFrame, entry: float, stop: float, t1: float,
               t2: float | None) -> dict | None:
     """
-    Walk forward bar by bar from the session after the signal.
+    The headline simulation, now a thin wrapper over _simulate_variant.
 
-    fwd columns: trade_date, open, high, low, close.
-    Returns None if the trigger was never reached before expiry.
+    This was previously a SECOND full implementation of the same walk-forward
+    logic, kept in parallel with _simulate_variant. The two drifted: the T2
+    exit fired here but not in the baseline variant, so metrics.overall and
+    exit_variants.baseline reported different results for identical trades
+    and the exit comparison could not be trusted.
+
+    One code path removes that entire class of bug rather than patching this
+    instance of it.
     """
-    filled_at = None
-    entry_idx = None
-
-    for i in range(min(EXPIRY_SESSIONS, len(fwd))):
-        bar = fwd.iloc[i]
-        if bar["high"] >= entry:
-            # Gap through the trigger fills at the open, not the trigger.
-            filled_at = max(float(entry), float(bar["open"]))
-            entry_idx = i
-            break
-
-    if filled_at is None:
-        return None
-
-    risk = filled_at - stop
-    if risk <= 0:
-        return None
-
-    mfe = mae = 0.0
-    scaled = False
-    realised_r = 0.0
-    remaining = 1.0
-
-    for i in range(entry_idx, min(entry_idx + MAX_HOLD_SESSIONS, len(fwd))):
-        bar = fwd.iloc[i]
-        high, low = float(bar["high"]), float(bar["low"])
-        mfe = max(mfe, (high - filled_at) / risk)
-        mae = min(mae, (low - filled_at) / risk)
-
-        hit_stop = low <= stop
-        hit_t1 = high >= t1
-
-        # Both in one session: intraday order is unknown, so assume the
-        # worse. Assuming the target came first is how backtests lie.
-        if hit_stop:
-            exit_px = min(float(bar["open"]), stop) if float(bar["open"]) < stop else stop
-            realised_r += remaining * (exit_px - filled_at) / risk
-            return _close(fwd, entry_idx, i, filled_at, exit_px, realised_r,
-                          "stop" if not scaled else "trail_stop", mfe, mae)
-
-        if hit_t1 and not scaled:
-            portion = SCALE_OUT_PCT / 100.0
-            realised_r += portion * (t1 - filled_at) / risk
-            remaining -= portion
-            scaled = True
-            stop = filled_at          # runner rides from the fill onward
-            if remaining <= 0:
-                return _close(fwd, entry_idx, i, filled_at, t1, realised_r,
-                              "target", mfe, mae)
-
-        if scaled and t2 and high >= t2:
-            realised_r += remaining * (t2 - filled_at) / risk
-            return _close(fwd, entry_idx, i, filled_at, t2, realised_r,
-                          "target2", mfe, mae)
-
-    # Time exit at the last close available.
-    last_i = min(entry_idx + MAX_HOLD_SESSIONS, len(fwd)) - 1
-    if last_i < entry_idx:
-        return None
-    exit_px = float(fwd.iloc[last_i]["close"])
-    realised_r += remaining * (exit_px - filled_at) / risk
-    return _close(fwd, entry_idx, last_i, filled_at, exit_px, realised_r,
-                  "time", mfe, mae)
+    return _simulate_variant(fwd, entry, stop, t1, t2, EXIT_VARIANTS["baseline"])
 
 
 def _close(fwd, entry_idx, exit_idx, filled_at, exit_px, realised_r,
