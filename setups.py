@@ -896,6 +896,33 @@ def _classify(seg_high, seg_low, depth, duration,
 # ---------------------------------------------------------------------
 def detect_trigger(df: pd.DataFrame, base: Base,
                    last_bar_incomplete: bool = False) -> str:
+    """
+    Classify the trigger on the most recent bar: breakout, pullback, or armed.
+
+    INTRADAY BAR POLICY — deliberate, and not a hybrid accident.
+
+    When last_bar_incomplete is True, the volume test reads the FORMING bar
+    while the RSI test reads the last CLOSED bar. That looks inconsistent
+    but follows one rule: a gate may read a forming bar only if the quantity
+    it tests is MONOTONIC within the bar.
+
+      * Volume only accumulates. A forming bar already at 2x its average
+        will still be at or above 2x when the session closes, so a pass
+        cannot later become a fail. Reading it early is safe and is
+        genuinely current information.
+
+      * RSI is not monotonic. It can read 75 at 14:00 and close at 62. A
+        gate acting on that decides on a number that never existed at any
+        close — so it reads the last confirmed bar instead.
+
+    The alternative of reading the closed bar for BOTH would test yesterday's
+    volume against a breakout that happened today, which is meaningless. The
+    alternative of reading the forming bar for both re-admits the RSI
+    problem that provisional=True warns about but does not prevent.
+
+    This is the same monotonicity argument weekly_volume_surge() uses for
+    partial weeks, applied at the daily scale.
+    """
     last = df.iloc[-1]
     rng = float(last["high"] - last["low"])
     atr = float(last["atr14"])
@@ -922,14 +949,14 @@ def detect_trigger(df: pd.DataFrame, base: Base,
         # was undifferentiated.
         if BREAKOUT_RSI_GATE:
             # Same reasoning as the retest path: gate on a closed bar's RSI.
-            rsi_bar = (df.iloc[-2] if (last_bar_incomplete and len(df) >= 2)
-                       else df.iloc[-1])
+            use_closed = last_bar_incomplete and len(df) >= 2
+            rsi_bar = df.iloc[-2] if use_closed else df.iloc[-1]
             rsi = float(rsi_bar["rsi14"]) if pd.notna(rsi_bar.get("rsi14")) else None
             if rsi is None or not (BREAKOUT_RSI_LO <= rsi <= BREAKOUT_RSI_HI):
                 raise Rejected("gate5", "breakout_rsi_outside_band",
                                {"rsi14": round(rsi, 1) if rsi is not None else None,
                                 "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI],
-                                "used_closed_bar": bool(last_bar_incomplete)})
+                                "used_closed_bar": use_closed})
 
         if DELIVERY_GATE:
             dp = last.get("delivery_pct")
@@ -1444,13 +1471,16 @@ def detect_breakout_retest(df: pd.DataFrame, exclude_last: int = 1,
         # and finish outside it — the gate would be deciding on a value
         # that never existed at any close. provisional=True warns the
         # consumer, but a gate should not act on an unconfirmed number.
-        rsi_bar = df.iloc[-2] if (last_bar_incomplete and len(df) >= 2) else df.iloc[-1]
+        use_closed = last_bar_incomplete and len(df) >= 2
+        rsi_bar = df.iloc[-2] if use_closed else df.iloc[-1]
         rsi = float(rsi_bar["rsi14"]) if pd.notna(rsi_bar.get("rsi14")) else None
         if rsi is None or not (BREAKOUT_RSI_LO <= rsi <= BREAKOUT_RSI_HI):
             raise Rejected("gate5", "retest_rsi_outside_band",
                            {"rsi14": round(rsi, 1) if rsi is not None else None,
                             "band": [BREAKOUT_RSI_LO, BREAKOUT_RSI_HI],
-                            "used_closed_bar": bool(last_bar_incomplete)})
+                            # Reports what was ACTUALLY read, not what was
+                            # requested — the two diverge if len(df) < 2.
+                            "used_closed_bar": use_closed})
 
     # The base's SHAPE is whatever detect_base found (flat_base, cup_handle,
     # VCP, ...) — retest describes how we are entering, not what the
@@ -1628,13 +1658,21 @@ def _minervini_ok(last, rs_rank_pct: float | None) -> tuple[bool, str | None]:
     # asymmetric though: freshly-listed names without 127 bars of history
     # bypass the RS component entirely. Reported so a suspiciously high
     # pass-rate on new listings is traceable rather than mysterious.
-    if rs_rank_pct is not None:
+    rs_skipped = rs_rank_pct is None
+    if not rs_skipped:
         checks["rs_rank_above_floor"] = rs_rank_pct >= MINERVINI_RS_FLOOR
-    else:
-        _MINERVINI_NO_RS.append(1)
+
     for name, ok in checks.items():
         if not ok:
             return False, name
+
+    # Counted AFTER the checks loop. It previously incremented at the point
+    # the RS check was skipped — before any rule had been evaluated — so
+    # every stock that later failed on close_above_50 or any other rule was
+    # counted as a "pass without RS". The summary key promises passes; it
+    # was reporting arrivals.
+    if rs_skipped:
+        _MINERVINI_NO_RS.append(1)
     return True, None
 
 
@@ -1721,19 +1759,15 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
             # became the live default that condition inverted: the live path
             # started raising instead of falling back, and every flag and
             # pennant setup was silently lost.
-            if base_strategy == "fixed_window":
+            # `or transition`: a flag can never be valid for the Stage 1->2
+            # path, so running the detector there produced a flag_pennant
+            # that was immediately rejected below. Skipping it outright is
+            # cheaper and states the intent at the point of decision.
+            if base_strategy == "fixed_window" or transition:
                 raise
             base = detect_flag_pennant(df)
 
         if transition:
-            # A flag is 5-15 sessions, so the duration check below would
-            # ALWAYS fire for one — rejecting correctly but reporting
-            # "base too short", as though a base had been found and
-            # measured. It is a different pattern type that should never
-            # have been considered for this path at all.
-            if base.pattern == "flag_pennant":
-                raise Rejected("gate4", "flag_not_valid_for_transition_path",
-                               {"pattern": base.pattern})
             if base.duration < TRANSITION_MIN_BASE_SESSIONS:
                 raise Rejected("gate4", "transition_base_too_short",
                                {"duration": base.duration,
