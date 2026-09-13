@@ -1429,6 +1429,69 @@ def fundamentals_probe(request: Request, symbol: str = Query("RELIANCE")):
         raise HTTPException(500, f"Probe failed: {exc}")
 
 
+@app.get("/jobs/fundamentals/upstox-probe")
+def upstox_fundamentals_probe(request: Request, symbol: str = Query("RELIANCE")):
+    """
+    Fetch one symbol from every Upstox fundamentals endpoint and report the
+    ACTUAL response shape — keys, row counts, period ranges, a sample row.
+
+    Nothing is written. This exists because the same exercise on NSE found
+    three wrong field mappings before they could write hundreds of null rows
+    that would have looked like real data: revenue was being read from
+    re_total_inc (which includes other income, so a one-off asset sale reads
+    as revenue growth and clears the declining-revenue veto on exactly the
+    company it should catch), EPS from a field that comes back null, and
+    'operating margin' was actually net margin.
+
+    Run this and confirm the field names before any bulk ingestion.
+    """
+    require_internal_key(request)
+    from ingest import connect
+    from upstox_client import UpstoxClient
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select isin from symbols where symbol = %s", (symbol,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row or not row[0]:
+        raise HTTPException(404, f"No ISIN stored for {symbol}")
+    isin = row[0]
+
+    client = UpstoxClient(store=store)
+    out = {"symbol": symbol, "isin": isin}
+
+    def describe(name, fn):
+        try:
+            payload = fn()
+        except Exception as exc:
+            out[f"{name}_error"] = str(exc)[:300]
+            return
+        data = payload.get("data", payload)
+        out[f"{name}_top_level_keys"] = sorted(payload.keys())
+        if isinstance(data, list):
+            out[f"{name}_rows"] = len(data)
+            out[f"{name}_row_keys"] = sorted(data[0].keys()) if data else []
+            out[f"{name}_sample"] = data[0] if data else None
+        elif isinstance(data, dict):
+            out[f"{name}_keys"] = sorted(data.keys())
+            out[f"{name}_sample"] = {k: data[k] for k in list(data)[:25]}
+        else:
+            out[f"{name}_raw"] = str(data)[:400]
+
+    describe("profile", lambda: client.company_profile(isin))
+    describe("income_quarterly", lambda: client.income_statement(isin, "quarterly"))
+    describe("balance_annual", lambda: client.balance_sheet(isin, "annual"))
+    describe("cash_flow_annual", lambda: client.cash_flow(isin, "annual"))
+    describe("share_holdings", lambda: client.share_holdings(isin))
+    describe("key_ratios", lambda: client.key_ratios(isin))
+
+    return out
+
+
 @app.post("/jobs/delivery")
 def delivery_job(request: Request):
     """

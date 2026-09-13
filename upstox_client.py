@@ -405,6 +405,48 @@ class UpstoxClient:
         payload = self._get(f"/v3/historical-candle/intraday/{instrument_key}/days/1")
         return payload.get("data", {}).get("candles", [])
 
+    # -- fundamentals -------------------------------------------------
+    #
+    # Upstox publishes company fundamentals keyed by ISIN. This replaces the
+    # NSE scraping path for fundamentals, which had two problems this fixes
+    # outright: its newest quarterly period was 2024-12-31 (21 months stale,
+    # so Gate 2 was vetoing on 2024 accounts), and it returned NO
+    # institutional holdings at all (fii_pct/dii_pct sat null, leaving
+    # CANSLIM's "I" unimplementable).
+    #
+    # Endpoint paths follow the documented Fundamentals API. Response
+    # SCHEMAS are not guessed anywhere — every consumer goes through
+    # fundamentals_probe() first, because writing 500 rows against invented
+    # field names produces nulls that look exactly like real data.
+    def company_profile(self, isin: str) -> dict:
+        return self._get("/v3/fundamentals/company-profile", {"isin": isin})
+
+    def income_statement(self, isin: str, period: str = "quarterly",
+                         statement: str = "consolidated") -> dict:
+        return self._get("/v3/fundamentals/income-statement",
+                         {"isin": isin, "period": period,
+                          "statement_type": statement})
+
+    def balance_sheet(self, isin: str, period: str = "annual",
+                      statement: str = "consolidated") -> dict:
+        return self._get("/v3/fundamentals/balance-sheet",
+                         {"isin": isin, "period": period,
+                          "statement_type": statement})
+
+    def cash_flow(self, isin: str, period: str = "annual",
+                  statement: str = "consolidated") -> dict:
+        return self._get("/v3/fundamentals/cash-flow",
+                         {"isin": isin, "period": period,
+                          "statement_type": statement})
+
+    def share_holdings(self, isin: str) -> dict:
+        """Promoter, FII, DII, public — the institutional data NSE never gave us."""
+        return self._get("/v3/fundamentals/share-holdings", {"isin": isin})
+
+    def key_ratios(self, isin: str) -> dict:
+        """P/E, P/B, ROA, ROE, ROCE, EV/EBITDA. Supplies CANSLIM's ROE and D/E."""
+        return self._get("/v3/fundamentals/key-ratios", {"isin": isin})
+
     def quotes(self, instrument_keys: list[str]) -> dict:
         result: dict = {}
         for i in range(0, len(instrument_keys), 100):
