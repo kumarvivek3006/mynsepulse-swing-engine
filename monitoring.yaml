@@ -1,0 +1,108 @@
+# Live monitoring thresholds — read by the daily summary job.
+# NOT hardcoded anywhere. Edit here, no deploy needed beyond a restart.
+#
+# When any threshold fires the engine does not stop trading by itself; it
+# raises a PAUSE flag in the daily summary. Automatic halting on a
+# statistical threshold is how a system stops during exactly the drawdown
+# it was designed to trade through. A human decides.
+
+version: 1
+frozen_at: "2026-09-13"
+applies_to_code_state: "freeze-2026-09-13"
+
+pause_triggers:
+
+  walk_forward_gate:
+    metric: positive_windows
+    operator: "<"
+    threshold: 4
+    action: pause
+    note: >
+      The framework's own pass criterion. Evaluated on the rolling
+      backtest, not on live trades.
+
+  expectancy_trailing_30:
+    metric: expectancy_r
+    window_trades: 30
+    operator: "<"
+    threshold: 0.10
+    action: pause
+
+  expectancy_trailing_20:
+    metric: expectancy_r
+    window_trades: 20
+    operator: "<"
+    threshold: 0.0
+    action: pause
+    note: >
+      Tighter window, harder floor. Fires earlier than the 30-trade rule
+      on a sharp deterioration.
+
+  drawdown_from_peak:
+    metric: drawdown_pct
+    operator: ">"
+    threshold: 15.0
+    action: pause
+
+  consecutive_losing_weeks:
+    metric: losing_weeks_consecutive
+    operator: ">="
+    threshold: 3
+    action: pause
+
+retirement_triggers:
+
+  low_win_rate_finding:
+    metric: win_rate
+    min_trades: 50
+    operator: "<"
+    threshold: 0.45
+    action: mark_for_retirement
+    note: >
+      Applies to an individual finding or bucket, not the engine. 50
+      trades is the floor at which a win rate is worth acting on.
+
+  sign_stable_flip:
+    metric: sign_stability
+    condition: positive_to_negative
+    action: remove_from_profitable_set_and_reevaluate
+    note: >
+      A bucket that was sign-stable positive at freeze and becomes
+      sign-stable negative has changed behaviour, not merely underperformed.
+
+review_flags:
+
+  # Informational. Does NOT pause. Added because a 4/6 pass carried by
+  # thin windows is indistinguishable from a solid one in the plain count.
+  inadequate_sample:
+    metric: adequate_positive_windows
+    operator: "<"
+    threshold: 4
+    action: flag_for_review
+    note: >
+      Fires even when passed=true. Run #35 reported positive_windows=4 but
+      adequate_positive_windows=3.
+
+baselines_at_freeze:
+  walk_forward:
+    positive_windows: 4
+    adequate_positive_windows: 3
+    underpowered_positive_windows: 1
+  aggregate:
+    expectancy_r: 0.388
+    total_r: 51.2
+    fills: 132
+    window_years: 3
+  exit_reason_distribution:
+    stop: 80
+    trail_stop: 65
+    time: 8
+    never_triggered: 86
+    note: >
+      From Run #34. Revert any change that pushes trail_stop below 60 or
+      stop above 100 — that distribution protects the exit reporting.
+
+next_review:
+  whichever_first:
+    - paper_trading_weeks: 4
+    - live_trades: 20

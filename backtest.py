@@ -48,7 +48,7 @@ from gates import (
 )
 from ingest import connect
 from setups import (BASE_SELECTION_STRATEGIES, DEFAULT_BASE_STRATEGY,
-                    Rejected, build_setup)
+                    ENTRY_BUFFER, Rejected, build_setup)
 
 log = logging.getLogger(__name__)
 
@@ -1168,6 +1168,14 @@ def compare_base_strategies(main_trades: list[dict],
     # working and this line discarded the result.
     ADOPT_EXPECTANCY_MARGIN_R = float(
         os.environ.get("ADOPT_EXPECTANCY_MARGIN_R", "0.02"))
+    # A strategy winning on expectancy by a hair while giving up a third of
+    # the fills is not an improvement: Run #35's best_quality led by 0.025R
+    # but cost 10R of total return and 35 fills. Expectancy alone ranked it
+    # first, which is the wrong answer for a book that has to compound.
+    ADOPT_STRONG_MARGIN_R = float(
+        os.environ.get("ADOPT_STRONG_MARGIN_R", "0.05"))
+    ADOPT_MIN_FILL_RETENTION = float(
+        os.environ.get("ADOPT_MIN_FILL_RETENTION", "0.90"))
 
     adopt, tie, reason = None, [], None
     strict = [n for n in winners
@@ -1178,23 +1186,41 @@ def compare_base_strategies(main_trades: list[dict],
         adopt = strict[0]
         reason = "sole strategy beating strictly in both halves"
     elif winners:
-        ranked = sorted(
-            winners,
-            key=lambda n: (out[n].get("full", {}).get("expectancy_r") or -99),
-            reverse=True)
-        best = out[ranked[0]].get("full", {}).get("expectancy_r")
-        rest = [out[n].get("full", {}).get("expectancy_r") or -99
-                for n in ranked[1:]]
-        if not rest or best - max(rest) >= ADOPT_EXPECTANCY_MARGIN_R:
-            adopt = ranked[0]
-            reason = (f"leads full-period expectancy by >= "
-                      f"{ADOPT_EXPECTANCY_MARGIN_R}R")
+        def _exp(n):
+            return out[n].get("full", {}).get("expectancy_r") or -99
+
+        def _total(n):
+            return out[n].get("full", {}).get("total_r") or -99
+
+        def _fills(n):
+            return out[n].get("full", {}).get("filled") or 0
+
+        # Default preference is TOTAL R, not expectancy. Expectancy ranks a
+        # strategy that takes 10 excellent trades above one that takes 100
+        # good ones — fine as a per-trade statistic, wrong as a choice of
+        # what to run.
+        by_total = sorted(winners, key=_total, reverse=True)
+        top_total = by_total[0]
+        max_fills = max(_fills(n) for n in winners) or 1
+
+        # An expectancy winner overrides only if the edge is STRONG and it
+        # has not thrown away the fills to get there.
+        override = [
+            n for n in winners
+            if _exp(n) - _exp(top_total) >= ADOPT_STRONG_MARGIN_R
+            and _fills(n) / max_fills >= ADOPT_MIN_FILL_RETENTION]
+
+        if override:
+            adopt = max(override, key=_exp)
+            reason = (f"beats on expectancy by >= {ADOPT_STRONG_MARGIN_R}R "
+                      f"while retaining >= {ADOPT_MIN_FILL_RETENTION:.0%} of fills")
         else:
-            tie = [n for n in ranked
-                   if abs((out[n].get("full", {}).get("expectancy_r") or -99)
-                          - best) < ADOPT_EXPECTANCY_MARGIN_R]
-            reason = (f"tie within {ADOPT_EXPECTANCY_MARGIN_R}R — "
-                      "keeping live default rather than choosing silently")
+            adopt = top_total
+            reason = (f"highest total R ({_total(top_total)}) among strategies "
+                      f"beating within {ADOPT_TOLERANCE_R}R in both halves; "
+                      "no rival cleared the strong-margin + fill-retention test")
+            tie = [n for n in winners
+                   if abs(_total(n) - _total(top_total)) < 1.0 and n != top_total]
     else:
         reason = "no strategy qualified"
 
@@ -1378,8 +1404,18 @@ def never_triggered_whatif(conn, run_id: int, extended_expiry: int = 20,
         for c in ("open", "high", "low", "close"):
             fwd[c] = pd.to_numeric(fwd[c])
 
-        # Which session would it have triggered on?
-        hit = fwd.index[fwd["high"] >= float(entry)]
+        # Search for the trigger ONLY within the extended window.
+        #
+        # This previously searched the whole frame, which holds
+        # extended_expiry + max_hold bars (140 with the defaults) because
+        # the simulator needs the tail to run the exit. A signal first
+        # touching its trigger on session 87 was therefore counted as
+        # "would fill" and bucketed day_11_20. That is the 36-vs-25
+        # discrepancy against the SQL, which correctly limits to 20: the
+        # endpoint was under-reporting never-triggered and over-reporting
+        # late fills, with some "late fills" months away.
+        search = fwd.iloc[:extended_expiry]
+        hit = search.index[search["high"] >= float(entry)]
         if len(hit) == 0:
             never += 1
             continue
@@ -1437,6 +1473,127 @@ def never_triggered_whatif(conn, run_id: int, extended_expiry: int = 20,
         "note": ("Hypothetical. These trades were never taken. A positive "
                  "expectancy here means the 5-session expiry is discarding "
                  "edge; a negative one means it is working as intended."),
+    }
+
+
+def anchor_whatif(conn, run_id: int, entry_buffer: float = 0.0,
+                  max_miss_pct: float = 1.0, lookahead: int = 20,
+                  variant: str | None = None) -> dict:
+    """
+    Would the NARROW MISSES have filled and paid at a tighter anchor?
+
+    A disjoint question from never_triggered_whatif: that one asks whether
+    a LONGER WINDOW helps signals that eventually reached their trigger.
+    This asks whether a CLOSER ENTRY helps signals that never reached it
+    but came within max_miss_pct.
+
+    WHAT IS ACTUALLY RECOMPUTED — and it is not the pivot.
+
+    pivot is not stored in backtest_trades. What IS exactly recoverable is
+    the ANCHOR:  anchor = entry_trigger / (1 + ENTRY_BUFFER).
+
+    For a breakout the anchor is max(pivot, trigger_bar_high), so it can
+    sit ABOVE the pivot; for a pullback it is the trigger bar's high and
+    is unrelated to the pivot. Calling this a pivot test would overstate
+    it. entry_buffer=0.0 therefore means "enter AT the anchor instead of
+    0.25% above it" — which is the honest form of the question and still
+    the right one, since the buffer is the part under our control.
+
+    Nothing is written and no engine parameter changes.
+    """
+    cfg = EXIT_VARIANTS.get(variant or EXIT_VARIANT, EXIT_VARIANTS["let_it_run"])
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select symbol, signal_date, setup_type, pattern,
+                   entry_trigger, stop_loss, t1, t2
+            from backtest_trades
+            where run_id = %s and r_realised is null
+              and entry_trigger is not null and stop_loss is not null
+            order by signal_date
+        """, (run_id,))
+        rows = cur.fetchall()
+
+    if not rows:
+        return {"error": "no never-triggered signals with levels", "run_id": run_id}
+
+    per_signal, filled = [], []
+    examined = skipped_not_narrow = 0
+
+    for sym, sig_date, setup_type, pattern, entry, stop, t1, t2 in rows:
+        entry = float(entry)
+        with conn.cursor() as cur:
+            cur.execute("""
+                select trade_date, adj_open, adj_high, adj_low, adj_close
+                from ohlcv_daily
+                where symbol = %s and trade_date > %s
+                order by trade_date limit %s
+            """, (sym, sig_date, lookahead + cfg["max_hold"]))
+            bars = cur.fetchall()
+        if len(bars) < 2:
+            continue
+
+        fwd = pd.DataFrame(bars, columns=["trade_date", "open", "high",
+                                          "low", "close"])
+        for c in ("open", "high", "low", "close"):
+            fwd[c] = pd.to_numeric(fwd[c])
+
+        window = fwd.iloc[:lookahead]
+        best_high = float(window["high"].max())
+        if best_high >= entry:
+            continue                     # reached the original trigger; not a miss
+        miss_pct = (best_high / entry - 1) * 100
+        examined += 1
+        if miss_pct < -abs(max_miss_pct):
+            skipped_not_narrow += 1
+            continue                     # not a NARROW miss
+
+        anchor = entry / (1 + ENTRY_BUFFER)
+        new_trigger = anchor * (1 + entry_buffer)
+        would_fill = best_high >= new_trigger
+
+        rec = {"symbol": sym, "signal_date": str(sig_date),
+               "setup_type": setup_type, "pattern": pattern,
+               "original_trigger": round(entry, 2),
+               "anchor": round(anchor, 2),
+               "new_trigger": round(new_trigger, 2),
+               "best_high_in_window": round(best_high, 2),
+               "miss_pct": round(miss_pct, 3),
+               "would_fill": bool(would_fill), "exit_r": None}
+
+        if would_fill:
+            res = _simulate_variant(fwd, new_trigger, float(stop),
+                                    float(t1) if t1 else new_trigger * 1.05,
+                                    float(t2) if t2 else None, cfg,
+                                    expiry_sessions=lookahead)
+            if res and res.get("r_realised") is not None:
+                rec["exit_r"] = res["r_realised"]
+                rec["exit_reason"] = res["exit_reason"]
+                filled.append(res["r_realised"])
+        per_signal.append(rec)
+
+    wins = [r for r in filled if r > 0]
+    return {
+        "run_id": run_id,
+        "entry_buffer_tested": entry_buffer,
+        "current_entry_buffer": ENTRY_BUFFER,
+        "narrow_miss_threshold_pct": max_miss_pct,
+        "exit_variant": variant or EXIT_VARIANT,
+        "never_triggered_examined": examined,
+        "excluded_not_narrow": skipped_not_narrow,
+        "narrow_misses": len(per_signal),
+        "signals_that_would_fill": sum(1 for r in per_signal if r["would_fill"]),
+        "hypothetical_expectancy_r": (round(sum(filled) / len(filled), 3)
+                                      if filled else None),
+        "hypothetical_total_r": round(sum(filled), 2) if filled else None,
+        "hypothetical_hit_rate": (round(len(wins) / len(filled), 3)
+                                  if filled else None),
+        "per_signal": per_signal,
+        "caveat": ("Recomputed from the ANCHOR, not the pivot — pivot is not "
+                   "stored. For breakouts anchor = max(pivot, trigger_bar_high) "
+                   "and can exceed the pivot; for pullbacks it is the trigger "
+                   "bar high. So this measures removing the 0.25% buffer, not "
+                   "entering at the pivot."),
     }
 
 
@@ -1746,11 +1903,25 @@ def walk_forward(trades: list[dict], windows: int = 6) -> dict:
         })
 
     underpowered = [w["window"] for w in out if (w["n"] or 0) < 15]
+    # Positive windows that also have adequate sample. The plain count
+    # cannot distinguish a pass carried by n=13 windows from one carried
+    # by n=30 windows, and the sample is thinning as losing patterns are
+    # disabled — so the two numbers are diverging precisely when the
+    # distinction matters most.
+    adequate_positive = sum(
+        1 for w in out
+        if (w.get("expectancy_r") or 0) > 0 and (w.get("n") or 0) >= 15)
+    fully_dependent = (positive >= 4 and adequate_positive < 4)
+
     return {
         "windows": out,
         "positive_windows": positive,
+        "adequate_positive_windows": adequate_positive,
+        "min_n_for_adequate": 15,
+        "pass_depends_on_underpowered_windows": fully_dependent,
         "required": 4,
         "passed": positive >= 4,
+        "passed_on_adequate_sample": adequate_positive >= 4,
         "underpowered_windows": underpowered,
         "note": ("Pass needs 4 of 6 windows positive. Windows with n<15 are "
                  "flagged: a positive sign on a handful of trades is not "
