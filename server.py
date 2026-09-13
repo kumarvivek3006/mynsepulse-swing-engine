@@ -1483,11 +1483,34 @@ def upstox_fundamentals_probe(request: Request, symbol: str = Query("RELIANCE"))
             out[f"{name}_raw"] = str(data)[:400]
 
     describe("profile", lambda: client.company_profile(isin))
-    describe("income_quarterly", lambda: client.income_statement(isin, "quarterly"))
-    describe("balance_annual", lambda: client.balance_sheet(isin, "annual"))
-    describe("cash_flow_annual", lambda: client.cash_flow(isin, "annual"))
+    describe("income_quarterly",
+             lambda: client.income_statement(isin, time_period="quarterly"))
+    describe("balance_sheet", lambda: client.balance_sheet(isin))
+    describe("cash_flow", lambda: client.cash_flow(isin))
     describe("share_holdings", lambda: client.share_holdings(isin))
     describe("key_ratios", lambda: client.key_ratios(isin))
+
+    # Run the income-statement parser on the live payload. Its schema is
+    # verified against the API reference, so this proves the wiring end to
+    # end rather than only that the endpoint answered.
+    try:
+        from fundamentals import parse_income_statement, parse_key_ratios, parse_share_holdings
+        raw = client.income_statement(isin, time_period="quarterly")
+        parsed = parse_income_statement(raw)
+        out["parsed_income_rows"] = len(parsed)
+        out["parsed_income_sample"] = (
+            {k: (str(v) if hasattr(v, "isoformat") else v)
+             for k, v in parsed[0].items()} if parsed else None)
+        out["parsed_income_periods"] = [str(r["period_end"]) for r in parsed[:8]]
+
+        # These two parsers are NOT schema-verified. A zero here with a
+        # non-empty raw response means the shape differs from what was
+        # guessed — which is the point of running this before any bulk
+        # ingestion writes hundreds of null rows that look like real data.
+        out["parsed_holdings_rows"] = len(parse_share_holdings(client.share_holdings(isin)))
+        out["parsed_ratios"] = parse_key_ratios(client.key_ratios(isin))
+    except Exception as exc:
+        out["parse_error"] = str(exc)[:300]
 
     return out
 

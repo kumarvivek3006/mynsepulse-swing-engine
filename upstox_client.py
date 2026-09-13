@@ -407,45 +407,71 @@ class UpstoxClient:
 
     # -- fundamentals -------------------------------------------------
     #
-    # Upstox publishes company fundamentals keyed by ISIN. This replaces the
-    # NSE scraping path for fundamentals, which had two problems this fixes
+    # Verified against the published API reference, not guessed. My first
+    # attempt had the path shape wrong three ways: /v3/ not /v2/, the ISIN
+    # as a query parameter rather than a path segment, and the resource
+    # named "income-statement" not "income_statement". Those would have
+    # 404'd on every call.
+    #
+    #   GET /v2/fundamentals/{isin}/income-statement?type=&time_period=&fs=
+    #
+    # This replaces the NSE scraping path, which had two defects this fixes
     # outright: its newest quarterly period was 2024-12-31 (21 months stale,
     # so Gate 2 was vetoing on 2024 accounts), and it returned NO
-    # institutional holdings at all (fii_pct/dii_pct sat null, leaving
-    # CANSLIM's "I" unimplementable).
+    # institutional holdings at all, leaving CANSLIM's "I" unimplementable.
     #
-    # Endpoint paths follow the documented Fundamentals API. Response
-    # SCHEMAS are not guessed anywhere — every consumer goes through
-    # fundamentals_probe() first, because writing 500 rows against invented
-    # field names produces nulls that look exactly like real data.
+    # Monetary values are in CRORE — confirmed by `units_in` in the
+    # response. NSE returned lakhs, so anything reusing the old conversion
+    # would be out by 100x.
+    FUNDAMENTALS_BASE = "/v2/fundamentals"
+
     def company_profile(self, isin: str) -> dict:
-        return self._get("/v3/fundamentals/company-profile", {"isin": isin})
+        return self._get(f"{self.FUNDAMENTALS_BASE}/{isin}/profile")
 
-    def income_statement(self, isin: str, period: str = "quarterly",
-                         statement: str = "consolidated") -> dict:
-        return self._get("/v3/fundamentals/income-statement",
-                         {"isin": isin, "period": period,
-                          "statement_type": statement})
+    def income_statement(self, isin: str, time_period: str = "quarterly",
+                         statement_type: str = "consolidated",
+                         full: bool = True) -> dict:
+        """
+        Revenue / operating_profit / net_profit, newest period first.
 
-    def balance_sheet(self, isin: str, period: str = "annual",
-                      statement: str = "consolidated") -> dict:
-        return self._get("/v3/fundamentals/balance-sheet",
-                         {"isin": isin, "period": period,
-                          "statement_type": statement})
+        full=True adds `full_statement` with the line items CANSLIM needs —
+        EPS - Basic, Profit Before Tax, Total Revenue — which the summary
+        categories do not carry.
+        """
+        return self._get(
+            f"{self.FUNDAMENTALS_BASE}/{isin}/income-statement",
+            {"type": statement_type, "time_period": time_period,
+             "fs": "true" if full else "false"})
 
-    def cash_flow(self, isin: str, period: str = "annual",
-                  statement: str = "consolidated") -> dict:
-        return self._get("/v3/fundamentals/cash-flow",
-                         {"isin": isin, "period": period,
-                          "statement_type": statement})
+    def balance_sheet(self, isin: str, statement_type: str = "consolidated",
+                      full: bool = True) -> dict:
+        return self._get(
+            f"{self.FUNDAMENTALS_BASE}/{isin}/balance-sheet",
+            {"type": statement_type, "fs": "true" if full else "false"})
+
+    def cash_flow(self, isin: str, time_period: str = "yearly",
+                  statement_type: str = "consolidated",
+                  full: bool = True) -> dict:
+        return self._get(
+            f"{self.FUNDAMENTALS_BASE}/{isin}/cash-flow",
+            {"type": statement_type, "time_period": time_period,
+             "fs": "true" if full else "false"})
+
+    def corporate_actions(self, isin: str) -> dict:
+        """Dividends, bonuses, splits, rights with announcement/ex/record
+        dates. A second source for the corporate_actions table, which
+        currently comes from NSE."""
+        return self._get(f"{self.FUNDAMENTALS_BASE}/{isin}/corporate-actions")
 
     def share_holdings(self, isin: str) -> dict:
-        """Promoter, FII, DII, public — the institutional data NSE never gave us."""
-        return self._get("/v3/fundamentals/share-holdings", {"isin": isin})
+        """Promoters / FII / DII / Public by quarter — the institutional
+        data the NSE path never supplied."""
+        return self._get(f"{self.FUNDAMENTALS_BASE}/{isin}/share-holdings")
 
     def key_ratios(self, isin: str) -> dict:
-        """P/E, P/B, ROA, ROE, ROCE, EV/EBITDA. Supplies CANSLIM's ROE and D/E."""
-        return self._get("/v3/fundamentals/key-ratios", {"isin": isin})
+        """P/E, P/B, ROA, ROE, ROCE, EV/EBITDA, each with a sector
+        benchmark. Supplies CANSLIM's ROE requirement."""
+        return self._get(f"{self.FUNDAMENTALS_BASE}/{isin}/key-ratios")
 
     def quotes(self, instrument_keys: list[str]) -> dict:
         result: dict = {}

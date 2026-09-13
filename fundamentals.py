@@ -31,7 +31,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from ingest import connect
 
@@ -41,6 +41,186 @@ log = logging.getLogger(__name__)
 NSE_SERVER_MODE = os.environ.get("NSE_SERVER_MODE", "true").lower() == "true"
 NSE_THROTTLE_SEC = float(os.environ.get("NSE_THROTTLE_SEC", "0.4"))
 LAKHS_TO_CRORES = 100.0
+
+
+# ---------------------------------------------------------------------
+# Upstox fundamentals — parsers for the VERIFIED income-statement schema
+# ---------------------------------------------------------------------
+UPSTOX_PERIOD_FMTS = ("%b %Y", "%B %Y")
+
+
+def parse_upstox_period(label: str) -> date | None:
+    """
+    "Mar 2025" -> 2025-03-31. Upstox labels a period by its END month, so
+    the stored date is that month's last day — matching how the NSE path
+    stored period_end, so both sources remain comparable.
+    """
+    if not label:
+        return None
+    for fmt in UPSTOX_PERIOD_FMTS:
+        try:
+            d = datetime.strptime(str(label).strip(), fmt).date()
+            nxt = date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+            return nxt - timedelta(days=1)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_income_statement(payload: dict) -> list[dict]:
+    """
+    Upstox income-statement -> one row per period.
+
+    Schema confirmed from the API reference:
+      data.income_statement[] = {category, history[{value, period, change}]}
+      data.full_statement[]   = {particular, history[{period, value}]}
+
+    Values are in CRORE (data.units_in). The NSE path returned LAKHS and
+    divided by 100 — reusing that conversion here would be wrong by 100x,
+    which is exactly the kind of silent unit error that makes a veto fire
+    on the wrong companies.
+    """
+    data = (payload or {}).get("data") or {}
+    by_period: dict[date, dict] = {}
+
+    def touch(period_label):
+        d = parse_upstox_period(period_label)
+        if d is None:
+            return None
+        return by_period.setdefault(d, {"period_end": d})
+
+    for block in data.get("income_statement") or []:
+        category = (block.get("category") or "").lower()
+        field = {"revenue": "revenue",
+                 "operating_profit": "operating_profit",
+                 "net_profit": "pat"}.get(category)
+        if not field:
+            continue
+        for point in block.get("history") or []:
+            row = touch(point.get("period"))
+            if row is not None and point.get("value") is not None:
+                row[field] = float(point["value"])
+
+    # full_statement carries EPS and PBT, which the summary categories omit.
+    wanted = {"eps - basic": "eps",
+              "profit before tax": "pbt",
+              "total revenue": "total_revenue"}
+    for block in data.get("full_statement") or []:
+        field = wanted.get((block.get("particular") or "").strip().lower())
+        if not field:
+            continue
+        for point in block.get("history") or []:
+            row = touch(point.get("period"))
+            if row is not None and point.get("value") is not None:
+                row[field] = float(point["value"])
+
+    rows = []
+    for d in sorted(by_period, reverse=True):
+        row = by_period[d]
+        rev, op = row.get("revenue"), row.get("operating_profit")
+        # Operating margin computed from operating_profit directly — the
+        # NSE path had to reconstruct it as PBT + interest - other income
+        # because no operating line existed. Here it is reported.
+        row["opm_pct"] = round(op / rev * 100, 2) if rev and op is not None and rev > 0 else None
+        rows.append(row)
+    return rows
+
+
+def parse_share_holdings(payload: dict) -> list[dict]:
+    """
+    Promoter / FII / DII / public by quarter.
+
+    Schema NOT yet verified against the reference — the published example
+    was not retrievable. Parsed defensively across the plausible shapes and
+    returns [] rather than guessing when none match, so a shape change
+    surfaces as "no data" rather than as a table of nulls that reads like
+    real data. Confirm with /jobs/fundamentals/upstox-probe first.
+    """
+    data = (payload or {}).get("data") or {}
+    holdings = (data.get("share_holdings") or data.get("shareholding")
+                or data.get("holdings") or [])
+    if not isinstance(holdings, list):
+        return []
+
+    label_map = {
+        "promoters": "promoter_pct", "promoter": "promoter_pct",
+        "promoter and promoter group": "promoter_pct",
+        "fii": "fii_pct", "fiis": "fii_pct", "foreign institutions": "fii_pct",
+        "dii": "dii_pct", "diis": "dii_pct", "domestic institutions": "dii_pct",
+        "public": "public_pct",
+    }
+
+    by_period: dict[date, dict] = {}
+    for block in holdings:
+        if not isinstance(block, dict):
+            continue
+        raw = (block.get("category") or block.get("holder_type")
+               or block.get("particular") or block.get("type") or "")
+        field = label_map.get(str(raw).strip().lower())
+        if not field:
+            continue
+        for point in block.get("history") or []:
+            d = parse_upstox_period(point.get("period"))
+            if d is None or point.get("value") is None:
+                continue
+            by_period.setdefault(d, {"period_end": d})[field] = float(point["value"])
+
+    return [by_period[d] for d in sorted(by_period, reverse=True)]
+
+
+def _ratio_value(raw) -> float | None:
+    """
+    Key-ratio values arrive as STRINGS, and percentages carry a '%' suffix:
+    "8.94%", "20.15". A bare float() throws on the former, which in the
+    earlier draft was swallowed by a try/except — so every percentage ratio
+    (ROA, ROE, ROCE) would have silently come back missing while P/E and
+    P/B parsed fine. Exactly the kind of partial success that reads as
+    working.
+    """
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).strip().rstrip("%").replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_key_ratios(payload: dict) -> dict:
+    """
+    ROE / ROCE / P/E / P/B / ROA / EV-EBITDA plus sector benchmarks.
+
+    Schema VERIFIED against the API reference:
+      data = [ {name, company_value, sector_value}, ... ]
+
+    Note `data` is a BARE ARRAY, not an object with a "key_ratios" key —
+    the earlier draft looked for data["key_ratios"] and would have found
+    nothing on every call. ROE here supplies CANSLIM's return requirement,
+    and sector_value gives relative context the NSE path never had.
+
+    Debt/Equity is NOT in this response despite being a CANSLIM input; it
+    has to come from the balance sheet.
+    """
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
+        return {}
+
+    wanted = {"p/e": "pe", "p/b": "pb", "roa": "roa",
+              "roe": "roe", "roce": "roce", "ev/ebitda": "ev_ebitda"}
+
+    out: dict = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        field = wanted.get(str(item.get("name") or "").strip().lower())
+        if not field:
+            continue
+        v = _ratio_value(item.get("company_value"))
+        if v is not None:
+            out[field] = v
+        sv = _ratio_value(item.get("sector_value"))
+        if sv is not None:
+            out[f"{field}_sector"] = sv
+    return out
 
 
 class FundamentalsUnavailable(RuntimeError):
@@ -148,6 +328,17 @@ def sync_shareholding(conn, symbols: list[str] | None = None) -> dict:
                         "and coalesce(series,'') <> 'INDEX' order by symbol")
             symbols = [r[0] for r in cur.fetchall()]
 
+    with conn.cursor() as cur:
+        cur.execute("""
+            select count(*) from information_schema.columns
+            where table_schema = 'swing' and table_name = 'shareholding'
+              and column_name = 'xbrl_url'
+        """)
+        _has_xbrl_column = cur.fetchone()[0] > 0
+    if not _has_xbrl_column:
+        log.warning("shareholding.xbrl_url missing (migration 002 not applied); "
+                    "promoter data will ingest, filing URLs will not")
+
     written = failed = empty = 0
     unknown_shape: list[str] = []
 
@@ -178,14 +369,28 @@ def sync_shareholding(conn, symbols: list[str] | None = None) -> dict:
                 # which this summary endpoint does not carry. Stored now so a
                 # later parser has it without re-crawling.
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        insert into shareholding
-                            (symbol, period_end, promoter_pct, fii_pct, dii_pct, xbrl_url)
-                        values (%s, %s, %s, null, null, %s)
-                        on conflict (symbol, period_end) do update set
-                            promoter_pct = excluded.promoter_pct,
-                            xbrl_url = coalesce(excluded.xbrl_url, shareholding.xbrl_url)
-                    """, (sym, period, promoter, row.get("xbrl")))
+                    if _has_xbrl_column:
+                        cur.execute("""
+                            insert into shareholding
+                                (symbol, period_end, promoter_pct, fii_pct, dii_pct, xbrl_url)
+                            values (%s, %s, %s, null, null, %s)
+                            on conflict (symbol, period_end) do update set
+                                promoter_pct = excluded.promoter_pct,
+                                xbrl_url = coalesce(excluded.xbrl_url,
+                                                    shareholding.xbrl_url)
+                        """, (sym, period, promoter, row.get("xbrl")))
+                    else:
+                        # Migration 002 not applied. Promoter data is the part
+                        # Gate 2 actually reads, so ingest it rather than
+                        # failing the whole run over a column that only a
+                        # future pledge parser needs.
+                        cur.execute("""
+                            insert into shareholding
+                                (symbol, period_end, promoter_pct, fii_pct, dii_pct)
+                            values (%s, %s, %s, null, null)
+                            on conflict (symbol, period_end) do update set
+                                promoter_pct = excluded.promoter_pct
+                        """, (sym, period, promoter))
                     written += cur.rowcount
             conn.commit()
             time.sleep(NSE_THROTTLE_SEC)
