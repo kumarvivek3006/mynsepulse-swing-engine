@@ -1381,7 +1381,8 @@ def scan_job(request: Request):
 def fundamentals_job(request: Request):
     """
     Ingest promoter holding and quarterly P&L. Weekly cadence — the data
-    changes once a quarter and it is ~1000 calls through NSE's fragile path.
+    changes once a quarter and it is ~1000 calls through Upstox now, not
+    the dead NSE endpoint.
     """
     require_internal_key(request)
     with _job_lock:
@@ -1391,7 +1392,7 @@ def fundamentals_job(request: Request):
                           started_at=datetime.now(IST).isoformat(),
                           finished_at=None, error=None)
 
-        def run():
+    def run():
         from fundamentals import (sync_shareholding_upstox,
                                   sync_quarterly_results_upstox)
         from ingest import _run_log, connect as _connect
@@ -1418,9 +1419,6 @@ def fundamentals_job(request: Request):
 
     threading.Thread(target=_run_job, args=("fundamentals", run),
                      daemon=True).start()
-    return {"ok": True, "started": True}
-
-    threading.Thread(target=_run_job, args=("fundamentals", run), daemon=True).start()
     return {"ok": True, "started": True}
 
 
