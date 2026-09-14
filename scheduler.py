@@ -209,3 +209,37 @@ def status() -> dict:
         "jobs": jobs,
         "last_runs": _last_runs,
     }
+
+def _sync_holidays_guarded():
+    """First-Monday monthly guard: fetch and upsert the holiday calendar."""
+    from datetime import date
+    from ingest import connect, _run_log
+    from market_calendar import sync_holidays
+
+    today = date.today()
+    # 1-7 inclusive of any month, when the day is Monday
+    if not (today.day <= 7 and today.weekday() == 0):
+        return
+
+    conn = connect()
+    try:
+        result = sync_holidays(conn)
+        _run_log(conn, "sync_holidays", "success", result.get("fetched", 0))
+        log.info("Holiday sync: %s", result)
+    except Exception as exc:
+        conn.rollback()
+        _run_log(conn, "sync_holidays", "failed", 0, str(exc)[:500])
+        log.exception("Holiday sync failed")
+    finally:
+        conn.close()
+
+
+# Register with the scheduler (adapt to your existing pattern)
+scheduler.add_job(
+    _sync_holidays_guarded,
+    "cron",
+    hour=6, minute=0,
+    day_of_week="mon",
+    id="sync_holidays",
+    replace_existing=True,
+)
