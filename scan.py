@@ -132,7 +132,7 @@ class ScanAborted(RuntimeError):
 _last_refresh_attempt: dict = {"for_session": None, "at": None, "gained": 0}
 
 
-def expected_last_session(now: datetime | None = None) -> date:
+def expected_last_session(conn, now: datetime | None = None) -> date:
     """
     The most recent session whose CLOSING bar should exist.
 
@@ -147,10 +147,11 @@ def expected_last_session(now: datetime | None = None) -> date:
     # it made the freshness gate conclude the data was current and skip the
     # refresh — hiding the very staleness it exists to catch.
     if now.weekday() < 5 and (now.hour * 60 + now.minute) >= 18 * 60:
-        return day
+        if not is_trading_holiday(conn, day):
+            return day
     while True:
         day -= timedelta(days=1)
-        if day.weekday() < 5:
+        if day.weekday() < 5 and not is_trading_holiday(conn, day):
             return day
 
 
@@ -173,7 +174,7 @@ def ensure_bars_current(conn) -> dict:
         """)
         latest = cur.fetchone()[0]
 
-    expected = expected_last_session()
+    expected = expected_last_session(conn)
     if latest is not None and latest >= expected:
         return {"refreshed": False, "latest_bar": str(latest),
                 "expected": str(expected), "reason": "already_current"}
