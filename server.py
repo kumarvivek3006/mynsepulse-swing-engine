@@ -1381,8 +1381,7 @@ def scan_job(request: Request):
 def fundamentals_job(request: Request):
     """
     Ingest promoter holding and quarterly P&L. Weekly cadence — the data
-    changes once a quarter and it is ~1000 calls through Upstox now, not
-    the dead NSE endpoint.
+    changes once a quarter and it is ~1000 calls through NSE's fragile path.
     """
     require_internal_key(request)
     with _job_lock:
@@ -1393,22 +1392,16 @@ def fundamentals_job(request: Request):
                           finished_at=None, error=None)
 
     def run():
-        from fundamentals import (sync_shareholding_upstox,
-                                  sync_quarterly_results_upstox)
+        from fundamentals import sync_quarterly_results, sync_shareholding
         from ingest import _run_log, connect as _connect
-        from upstox_client import UpstoxClient
 
         conn = _connect()
-        client = UpstoxClient(store=store)
         try:
-            for name, fn in (("sync_shareholding_upstox",
-                              sync_shareholding_upstox),
-                             ("sync_quarterly_results_upstox",
-                              sync_quarterly_results_upstox)):
+            for name, fn in (("sync_shareholding", sync_shareholding),
+                             ("sync_quarterly_results", sync_quarterly_results)):
                 try:
-                    result = fn(conn, client)
-                    _run_log(conn, name, "success",
-                             result.get("written", 0))
+                    result = fn(conn)
+                    _run_log(conn, name, "success", result.get("written", 0))
                     log.info("%s: %s", name, result)
                 except Exception as exc:
                     conn.rollback()
@@ -1417,8 +1410,7 @@ def fundamentals_job(request: Request):
         finally:
             conn.close()
 
-    threading.Thread(target=_run_job, args=("fundamentals", run),
-                     daemon=True).start()
+    threading.Thread(target=_run_job, args=("fundamentals", run), daemon=True).start()
     return {"ok": True, "started": True}
 
 

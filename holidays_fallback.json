@@ -1,0 +1,67 @@
+{
+  "_README": [
+    "INCOMPLETE BY DESIGN — read before relying on this file.",
+    "",
+    "This contains ONLY the fixed-date NSE holidays, which fall on the same",
+    "calendar date every year and can be stated without a source.",
+    "",
+    "It deliberately OMITS every lunar/luni-solar holiday: Holi, Mahashivratri,",
+    "Id-ul-Fitr, Bakri Id, Muharram, Ganesh Chaturthi, Dussehra, Diwali,",
+    "Laxmi Puja / Muhurat, Guru Nanak Jayanti, and Good Friday. Those dates",
+    "move every year and are set by NSE circular. Writing plausible-looking",
+    "dates here would produce a calendar that is confidently wrong — the",
+    "engine would trade on a closed day or skip an open one, and nothing in",
+    "the data would reveal it.",
+    "",
+    "CONSEQUENCE: a year populated only from this file will hold ~5 rows, not",
+    "the 12-18 a real NSE year has. The calendar_health alert for '<10",
+    "holidays loaded' is EXPECTED to fire until the Upstox API has run once.",
+    "That alert is doing its job.",
+    "",
+    "TO COMPLETE: run POST /jobs/holidays once. Upstox returns the full",
+    "current-year list including the moving dates and the Muhurat session,",
+    "and those rows overwrite these by trade_date. For 2023-2025 backfill,",
+    "paste the dates from the NSE holiday circular into the years below.",
+    "",
+    "Muhurat is intentionally absent: its date moves and its session window",
+    "comes from /v2/market/timings. It must never be hardcoded."
+  ],
+  "_fixed_date_holidays": {
+    "01-26": "Republic Day",
+    "05-01": "Maharashtra Day",
+    "08-15": "Independence Day",
+    "10-02": "Mahatma Gandhi Jayanti",
+    "12-25": "Christmas"
+  },
+  "years": {
+    "2023": [
+      {"date": "2023-01-26", "description": "Republic Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2023-05-01", "description": "Maharashtra Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2023-08-15", "description": "Independence Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2023-10-02", "description": "Mahatma Gandhi Jayanti", "type": "TRADING_HOLIDAY"},
+      {"date": "2023-12-25", "description": "Christmas", "type": "TRADING_HOLIDAY"}
+    ],
+    "2024": [
+      {"date": "2024-01-26", "description": "Republic Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2024-05-01", "description": "Maharashtra Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2024-08-15", "description": "Independence Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2024-10-02", "description": "Mahatma Gandhi Jayanti", "type": "TRADING_HOLIDAY"},
+      {"date": "2024-12-25", "description": "Christmas", "type": "TRADING_HOLIDAY"}
+    ],
+    "2025": [
+      {"date": "2025-01-26", "description": "Republic Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2025-05-01", "description": "Maharashtra Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2025-08-15", "description": "Independence Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2025-10-02", "description": "Mahatma Gandhi Jayanti", "type": "TRADING_HOLIDAY"},
+      {"date": "2025-12-25", "description": "Christmas", "type": "TRADING_HOLIDAY"}
+    ],
+    "2026": [
+      {"date": "2026-01-26", "description": "Republic Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2026-05-01", "description": "Maharashtra Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2026-08-15", "description": "Independence Day", "type": "TRADING_HOLIDAY"},
+      {"date": "2026-10-02", "description": "Mahatma Gandhi Jayanti", "type": "TRADING_HOLIDAY"},
+      {"date": "2026-12-25", "description": "Christmas", "type": "TRADING_HOLIDAY"}
+    ],
+    "2027": []
+  }
+}
