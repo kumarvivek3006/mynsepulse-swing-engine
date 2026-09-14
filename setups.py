@@ -392,12 +392,27 @@ CUP_ROUNDING_V_MAX_BARS = int(os.environ.get("CUP_ROUNDING_V_MAX_BARS", "2"))
 # band) and has been rebuilt to band-scoring — but until a re-run shows the
 # inversion is actually gone, the live path should not use the selector that
 # produced it. best_quality stays available for A/B measurement.
-# Run #31: first_valid_quality_gated is the ONLY strategy positive in both
-# halves (+0.006 / +0.420). first_valid is second and also beats
-# best_quality, which produces MORE signals at WORSE expectancy — the
-# aggregate-vs-walk-forward trap this whole sequence exists to avoid.
-# Reverted from best_quality accordingly.
-DEFAULT_BASE_STRATEGY = os.environ.get("BASE_STRATEGY", "first_valid_quality_gated")
+# Live default: first_valid.
+#
+# Switched from first_valid_quality_gated at the 2026-09-13 freeze, BY THE
+# AMENDED ADOPT RULE rather than by judgement:
+#
+#   "prefer the one with higher TOTAL R unless another beats by >0.05R
+#    expectancy AND retains at least 90% of the fills"
+#
+#   first_valid                +52.1R total, +0.416R exp, 125 fills, 4/6 WF
+#   first_valid_quality_gated  +51.2R total, +0.388R exp, 132 fills, 4/6 WF
+#
+# first_valid has the higher total R and nothing overrides it: the only
+# rival, first_valid_quality_gated, is 0.028R LOWER on expectancy, so the
+# >0.05R override clause cannot fire. Cost is 7 fewer fills over 3 years.
+#
+# (An earlier reading treated the 0.05R clause as a bar the total-R winner
+# must itself clear. It is not — it is the condition under which a
+# DIFFERENT strategy displaces the total-R winner.)
+#
+# All four strategies remain available via BASE_STRATEGY.
+DEFAULT_BASE_STRATEGY = os.environ.get("BASE_STRATEGY", "first_valid")
 FIXED_BASE_WINDOW = int(os.environ.get("FIXED_BASE_WINDOW", "45"))
 
 
