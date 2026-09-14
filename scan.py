@@ -35,6 +35,8 @@ from gates import (
     gate3_trend_structure,
     relative_strength,
 )
+from market_calendar import (calendar_health, holiday_description,
+                             is_muhurat, is_trading_holiday)
 from ingest import connect
 from upstox_client import IST
 from fundamentals import load_snapshots
@@ -359,6 +361,28 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
     conn = connect()
 
     try:
+        # Holiday guard — BEFORE ensure_bars_current. On a holiday that
+        # function waits for a bar that will never arrive and triggers a
+        # 500-symbol backfill looking for it. Applies to intraday too: a
+        # closed market has no intraday session either.
+        if is_trading_holiday(conn, as_of):
+            desc = holiday_description(conn, as_of) or "market holiday"
+            log.info("Holiday %s (%s) — no scan", as_of, desc)
+            return {"as_of": str(as_of), "mode": mode,
+                    "status": "skipped_holiday", "reason": desc,
+                    "signals": 0, "universe": 0}
+
+        # Muhurat is a real session, but a single ~1 hour evening one. An
+        # intraday slot against that window would score a forming bar
+        # minutes old against 50-day averages.
+        if is_muhurat(conn, as_of):
+            if mode == "intraday":
+                log.info("Muhurat %s — intraday slot skipped", as_of)
+                return {"as_of": str(as_of), "mode": mode,
+                        "status": "skipped_muhurat_intraday",
+                        "signals": 0, "universe": 0}
+            log.info("Muhurat session detected — single post-close run")
+
         # Intraday runs fetch their own forming bars, so they neither need
         # nor want the end-of-day refresh.
         freshness = ({"refreshed": False, "reason": "intraday_mode"}
@@ -1094,7 +1118,21 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "gate2_enforced": fundamentals_ready,
             "regime_gate": "passed" if regime_gate_ok else "skipped",
             "regime_gate_detail": regime_gate_detail,
+            # A COUNT, not a percentage. The UI was rendering this as
+            # "497.0% of the universe" because the label said percent and
+            # the value was a symbol count. Both are reported now so the
+            # field cannot be misread either way.
+            "calendar": calendar_health(conn),
             "gate2_coverage": len(snapshots),
+            "gate2_coverage_pct": (round(len(snapshots) / len(universe) * 100, 1)
+                                   if universe else None),
+            # WHY gate 2 is or is not enforced. Coverage being healthy while
+            # enforcement is off looks like a contradiction without this.
+            "gate2_blocked_by": (
+                None if fundamentals_ready
+                else "stale_data" if not fundamentals_fresh
+                else "insufficient_coverage"),
+            "gate2_latest_period": str(latest_period) if latest_period else None,
             # Stocks that cleared Minervini without an RS percentile —
             # typically fresh listings lacking 127 bars. A high number here
             # explains an unexpected pass-rate on new names.

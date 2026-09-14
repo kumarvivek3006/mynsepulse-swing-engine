@@ -1534,6 +1534,44 @@ def upstox_fundamentals_probe(request: Request, symbol: str = Query("RELIANCE"))
     return out
 
 
+@app.post("/jobs/holidays")
+def sync_holidays_job(request: Request, year: int | None = Query(None)):
+    """
+    Fetch and upsert the market holiday calendar.
+
+    Upstox returns the CURRENT YEAR ONLY, which is why the monthly job and
+    the January startup check both exist — on 1 January the table holds
+    last year's list and nothing else.
+    """
+    require_internal_key(request)
+    from ingest import connect as _connect, _run_log
+    from market_calendar import sync_holidays
+
+    conn = _connect()
+    try:
+        result = sync_holidays(conn, year)
+        _run_log(conn, "sync_holidays", "success", result.get("fetched", 0))
+        return result
+    except Exception as exc:
+        conn.rollback()
+        _run_log(conn, "sync_holidays", "failed", str(exc)[:500])
+        raise HTTPException(500, str(exc)[:300])
+    finally:
+        conn.close()
+
+
+@app.get("/jobs/holidays")
+def holidays_status(request: Request):
+    require_internal_key(request)
+    from ingest import connect as _connect
+    from market_calendar import calendar_health
+    conn = _connect()
+    try:
+        return calendar_health(conn)
+    finally:
+        conn.close()
+
+
 @app.post("/jobs/delivery")
 def delivery_job(request: Request):
     """
@@ -1779,6 +1817,27 @@ def never_triggered_whatif_endpoint(request: Request,
     conn = connect()
     try:
         return never_triggered_whatif(conn, run_id, expiry)
+    finally:
+        conn.close()
+
+
+@app.get("/jobs/anchor-whatif")
+def anchor_whatif_endpoint(request: Request,
+                           run_id: int = Query(35),
+                           entry_buffer: float = Query(0.0),
+                           max_miss_pct: float = Query(1.0)):
+    """
+    Would the narrow misses have filled and paid at a tighter anchor?
+
+    Read-only. Changes no engine parameter and writes nothing.
+    """
+    require_internal_key(request)
+    from backtest import anchor_whatif
+    from ingest import connect
+
+    conn = connect()
+    try:
+        return anchor_whatif(conn, run_id, entry_buffer, max_miss_pct)
     finally:
         conn.close()
 
