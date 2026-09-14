@@ -1391,27 +1391,34 @@ def fundamentals_job(request: Request):
                           started_at=datetime.now(IST).isoformat(),
                           finished_at=None, error=None)
 
-    def run():
-    from fundamentals import (sync_shareholding_upstox,
-                              sync_quarterly_results_upstox)
-    from ingest import _run_log, connect as _connect
-    from upstox_client import UpstoxClient
+        def run():
+        from fundamentals import (sync_shareholding_upstox,
+                                  sync_quarterly_results_upstox)
+        from ingest import _run_log, connect as _connect
+        from upstox_client import UpstoxClient
 
-    conn = _connect()
-    client = UpstoxClient(store=store)
-    try:
-        for name, fn in (("sync_shareholding_upstox", sync_shareholding_upstox),
-                         ("sync_quarterly_results_upstox", sync_quarterly_results_upstox)):
-            try:
-                result = fn(conn, client)
-                _run_log(conn, name, "success", result.get("written", 0))
-                log.info("%s: %s", name, result)
-            except Exception as exc:
-                conn.rollback()
-                _run_log(conn, name, "failed", 0, str(exc)[:500])
-                raise
-    finally:
-        conn.close()
+        conn = _connect()
+        client = UpstoxClient(store=store)
+        try:
+            for name, fn in (("sync_shareholding_upstox",
+                              sync_shareholding_upstox),
+                             ("sync_quarterly_results_upstox",
+                              sync_quarterly_results_upstox)):
+                try:
+                    result = fn(conn, client)
+                    _run_log(conn, name, "success",
+                             result.get("written", 0))
+                    log.info("%s: %s", name, result)
+                except Exception as exc:
+                    conn.rollback()
+                    _run_log(conn, name, "failed", 0, str(exc)[:500])
+                    raise
+        finally:
+            conn.close()
+
+    threading.Thread(target=_run_job, args=("fundamentals", run),
+                     daemon=True).start()
+    return {"ok": True, "started": True}
 
     threading.Thread(target=_run_job, args=("fundamentals", run), daemon=True).start()
     return {"ok": True, "started": True}
