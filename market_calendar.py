@@ -277,7 +277,9 @@ def sync_holidays(conn, year: int | None = None) -> dict:
              year, written, source, muhurat_detected)
     return {"fetched": written, "source": source, "year": year,
             "muhurat_detected": muhurat_detected}
-
+    if result["source"] == "upstox_api" and result["fetched"] > 0:
+        _write_fallback_from_rows(fetched_rows)
+        
 
 # ---------------------------------------------------------------------
 # Lookups
@@ -401,3 +403,47 @@ def calendar_health(conn, year: int | None = None) -> dict:
         "next_holiday": next_holiday(conn),
         "alerts": alerts,
     }
+
+import json
+from pathlib import Path
+
+FALLBACK_PATH = Path(__file__).parent / "holidays_fallback.json"
+
+
+def _write_fallback_from_rows(rows: list[dict]) -> None:
+    """
+    Persist the fetched rows to holidays_fallback.json so the next cold
+    start has a real fallback. Preserves manual entries for other years.
+    """
+    if not rows:
+        return
+
+    existing = {"years": {}}
+    if FALLBACK_PATH.exists():
+        try:
+            existing = json.loads(FALLBACK_PATH.read_text())
+        except json.JSONDecodeError:
+            pass
+
+    years = existing.setdefault("years", {})
+    by_year: dict[str, list] = {}
+    for r in rows:
+        d = r["trade_date"]
+        year = str(d.year if hasattr(d, "year") else int(str(d)[:4]))
+        by_year.setdefault(year, []).append({
+            "date": str(d),
+            "description": r.get("description", ""),
+            "type": r.get("holiday_type", "TRADING_HOLIDAY"),
+            "is_muhurat": bool(r.get("is_muhurat", False)),
+        })
+
+    for year, entries in by_year.items():
+        existing_count = len(years.get(year, []))
+        if len(entries) < existing_count:
+            log.warning("fallback: refusing to shrink %s from %d to %d",
+                        year, existing_count, len(entries))
+            continue
+        years[year] = sorted(entries, key=lambda e: e["date"])
+
+    FALLBACK_PATH.write_text(json.dumps(existing, indent=2))
+    
