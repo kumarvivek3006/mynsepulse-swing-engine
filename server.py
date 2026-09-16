@@ -47,37 +47,9 @@ store = TokenStore()
 
 @app.on_event("startup")
 def _start_scheduler() -> None:
-    # January check: if the current year has no holiday rows, fetch them
-    # synchronously before the scheduler starts. The first scan on 1 Jan
-    # must not run against a stale calendar.
-    try:
-        from datetime import date as _d
-        today = _d.today()
-        if today.month == 1 and today.day <= 7:
-            from ingest import connect as _conn, _run_log
-            from market_calendar import sync_holidays
-            conn = _conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "select count(*) from trading_holidays where year = %s",
-                        (today.year,))
-                    n = cur.fetchone()[0]
-                if n == 0:
-                    result = sync_holidays(conn)
-                    _run_log(conn, "sync_holidays_startup", "success",
-                             result.get("fetched", 0))
-                    log.info("January startup holiday sync: %s", result)
-            finally:
-                conn.close()
-    except Exception:
-        log.exception("January holiday sync failed — continuing startup")
-
     try:
         import scheduler
         scheduler.start()
-    except Exception:
-        log.exception("Scheduler failed to start")
     except Exception:
         # A broken scheduler must not stop the auth server from serving —
         # without it you cannot log in to fix anything.
@@ -1409,8 +1381,7 @@ def scan_job(request: Request):
 def fundamentals_job(request: Request):
     """
     Ingest promoter holding and quarterly P&L. Weekly cadence — the data
-    changes once a quarter and it is ~1000 calls through Upstox now, not
-    the dead NSE endpoint.
+    changes once a quarter and it is ~1000 calls through NSE's fragile path.
     """
     require_internal_key(request)
     with _job_lock:
@@ -1421,22 +1392,16 @@ def fundamentals_job(request: Request):
                           finished_at=None, error=None)
 
     def run():
-        from fundamentals import (sync_shareholding_upstox,
-                                  sync_quarterly_results_upstox)
+        from fundamentals import sync_quarterly_results, sync_shareholding
         from ingest import _run_log, connect as _connect
-        from upstox_client import UpstoxClient
 
         conn = _connect()
-        client = UpstoxClient(store=store)
         try:
-            for name, fn in (("sync_shareholding_upstox",
-                              sync_shareholding_upstox),
-                             ("sync_quarterly_results_upstox",
-                              sync_quarterly_results_upstox)):
+            for name, fn in (("sync_shareholding", sync_shareholding),
+                             ("sync_quarterly_results", sync_quarterly_results)):
                 try:
-                    result = fn(conn, client)
-                    _run_log(conn, name, "success",
-                             result.get("written", 0))
+                    result = fn(conn)
+                    _run_log(conn, name, "success", result.get("written", 0))
                     log.info("%s: %s", name, result)
                 except Exception as exc:
                     conn.rollback()
@@ -1445,9 +1410,9 @@ def fundamentals_job(request: Request):
         finally:
             conn.close()
 
-    threading.Thread(target=_run_job, args=("fundamentals", run),
-                     daemon=True).start()
+    threading.Thread(target=_run_job, args=("fundamentals", run), daemon=True).start()
     return {"ok": True, "started": True}
+
 
 @app.get("/jobs/fundamentals/probe")
 def fundamentals_probe(request: Request, symbol: str = Query("RELIANCE")):
@@ -1940,15 +1905,37 @@ def jobs_status(request: Request):
                             "(select count(distinct symbol) from shareholding), "
                             "(select max(period_end) from fundamentals_quarterly), "
                             "(select max(trade_date) from ohlcv_daily), "
-                            "(select max(as_of_date) from signals)")
-                s, o, c, v, sh, fq, shs, latest, last_bar, last_scan = cur.fetchone()
+                            "(select max(as_of_date) from signals), "
+                            # ADDITIVE: when did the engine last RUN, as
+                            # opposed to last_scan (below), which is the
+                            # newest date with a SIGNAL row. The two answer
+                            # different questions and were previously
+                            # sharing one label. Verified from Railway logs:
+                            # 15-16 Sept both ran and completed cleanly with
+                            # 0 signals (risk_off regime, Gate 2 vetoing) —
+                            # last_scan_summary is written unconditionally
+                            # after every run_scan() call regardless of
+                            # signal count, so its updated_at is the
+                            # reliable "last run" timestamp. Existing
+                            # last_scan (last_scan_date below) is completely
+                            # unchanged.
+                            "(select updated_at from engine_settings "
+                            " where key = 'last_scan_summary')")
+                (s, o, c, v, sh, fq, shs, latest, last_bar, last_scan,
+                 last_run) = cur.fetchone()
                 counts = {"symbols": s, "ohlcv_daily": o,
                           "corporate_actions": c, "surveillance": v,
                           "shareholding": sh, "fundamentals_quarterly": fq,
                           "fundamentals_symbols": shs,
                           "fundamentals_latest_period": str(latest) if latest else None,
                           "latest_bar_date": str(last_bar) if last_bar else None,
-                          "last_scan_date": str(last_scan) if last_scan else None}
+                          "last_scan_date": str(last_scan) if last_scan else None,
+                          # New field. last_scan_date (above) is unchanged —
+                          # it is still max(as_of_date) from signals, exactly
+                          # as before this edit.
+                          "last_run_date": (str(last_run.date())
+                                            if last_run else None),
+                          "last_run_at": str(last_run) if last_run else None}
         finally:
             conn.close()
     except Exception as exc:
