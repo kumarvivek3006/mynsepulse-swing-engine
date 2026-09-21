@@ -1159,6 +1159,16 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "floor_boost_pct": COOLDOWN_FLOOR_BOOST if cooldown_active else 0,
             },
             "freshness": freshness,
+            # Promoted to top level, not buried inside freshness. Premarket
+            # running on yesterday's stored close is correct on EVERY
+            # normal day ("prices are not re-fetched" — see _premarket's
+            # docstring). This specifically flags the abnormal case: bars
+            # were already stale entering the run AND the catch-up refresh
+            # also failed, so signals below may reflect data older than
+            # the routine one-day lag. Without this, that distinction only
+            # existed in a log line and a field three levels deep that
+            # nothing reads before publishing.
+            "data_possibly_stale": freshness.get("reason") == "token_invalid",
             "invalidated": invalidated,
             "new_opportunities": new_opportunities,
             "suppressed_already_taken": already_taken,

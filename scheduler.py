@@ -73,6 +73,19 @@ def _guarded(slot: str, fn) -> None:
     except Exception as exc:
         _record(slot, "failed", {"error": str(exc)[:400]})
         log.exception("Slot %s failed", slot)
+        # _last_runs is memory-only — a restart clears it, and this was
+        # the only record of the failure existing anywhere. A short-lived
+        # connection opened only on this (rare) path persists it to
+        # ingestion_runs, visible in the DB rather than stderr alone.
+        try:
+            from ingest import connect, _run_log
+            conn = connect()
+            try:
+                _run_log(conn, slot, "failed", 0, str(exc)[:500])
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("Also failed to persist %s failure to ingestion_runs", slot)
 
 
 # ---------------------------------------------------------------------
@@ -176,6 +189,50 @@ SLOTS = {
 }
 
 
+# ---------------------------------------------------------------------
+# Kill switch
+#
+# Persistent via a row in engine_settings, not a flag file. engine_settings
+# is already the established pattern in this codebase for exactly this
+# kind of small persistent engine state (last_scan_summary uses it the
+# same way) — queryable through the same Supabase interface already used
+# for everything else here, and introduces no new dependency: the kill
+# endpoint already needs DB access to do anything.
+#
+# DB read failure at start() defaults to STARTING, not staying killed.
+# The DB being briefly unreachable at boot must not silently leave the
+# whole engine dark with no scan running and no visible reason — that is
+# a worse failure mode than the rare case of an intended kill not
+# surviving a startup race with a DB outage.
+# ---------------------------------------------------------------------
+def _kill_switch_active(conn=None) -> bool:
+    own_conn = conn is None
+    try:
+        # Connection acquisition moved INSIDE the try. It was outside on
+        # the first pass — tested directly, and a connect() failure
+        # propagated straight out uncaught instead of degrading to "not
+        # killed", which is the entire point of this function on a DB
+        # outage.
+        if own_conn:
+            from ingest import connect
+            conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("select value from engine_settings "
+                       "where key = 'kill_switch'")
+            row = cur.fetchone()
+        return bool(row and row[0] and row[0].get("active"))
+    except Exception:
+        log.exception("Kill-switch check failed — defaulting to NOT killed "
+                      "(starting the scheduler rather than staying dark)")
+        return False
+    finally:
+        if own_conn and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def start() -> BackgroundScheduler | None:
     global _scheduler
     if not SCHEDULER_ENABLED:
@@ -183,6 +240,10 @@ def start() -> BackgroundScheduler | None:
         return None
     if _scheduler is not None:
         return _scheduler
+    if _kill_switch_active():
+        log.warning("Kill switch active — scheduler NOT started. "
+                   "POST /jobs/kill-switch/reset to clear.")
+        return None
 
     _scheduler = BackgroundScheduler(timezone=IST)
     for slot, (hhmm, fn) in SLOTS.items():

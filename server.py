@@ -1572,6 +1572,90 @@ def holidays_status(request: Request):
         conn.close()
 
 
+@app.post("/jobs/kill-switch")
+async def kill_switch(request: Request):
+    """
+    Stop the engine from generating and publishing new signals.
+
+    SCOPE CORRECTION (from the proposal round): this does NOT cancel
+    orders or flatten positions — grep confirms zero order-placement code
+    exists anywhere in this codebase. The engine only ever computes
+    signals; a human executes manually via "Mark as taken". So this
+    switch means exactly one thing: stop producing new signals.
+
+    Requires the internal key header AND a confirmation token in the
+    body — a single authenticated call being enough to silence the
+    engine was judged too easy to fire by accident.
+    """
+    require_internal_key(request)
+    body = await request.json()
+    if body.get("confirm") != "STOP":
+        raise HTTPException(400, 'Body must include {"confirm": "STOP"}')
+
+    from ingest import connect
+    import scheduler
+
+    stopped_jobs = []
+    if scheduler._scheduler is not None:
+        stopped_jobs = [j.id for j in scheduler._scheduler.get_jobs()]
+        scheduler._scheduler.remove_all_jobs()
+        scheduler._scheduler.shutdown(wait=False)
+        scheduler._scheduler = None
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                insert into engine_settings (key, value, updated_at)
+                values ('kill_switch', %s::jsonb, now())
+                on conflict (key) do update set
+                    value = excluded.value, updated_at = now()
+            """, (json.dumps({"active": True,
+                              "at": datetime.now(IST).isoformat(),
+                              "reason": body.get("reason")}),))
+        conn.commit()
+    finally:
+        conn.close()
+
+    log.warning("KILL SWITCH FIRED. Jobs removed: %s", stopped_jobs)
+    return {"stopped": True, "jobs_removed": stopped_jobs,
+            "abort_requested": True,
+            "note": "In-flight scans check this before writing further "
+                    "signal rows; already-computed signals for this run "
+                    "are not retroactively removed."}
+
+
+@app.post("/jobs/kill-switch/reset")
+async def kill_switch_reset(request: Request):
+    """Clear the flag and re-register jobs immediately in this running
+    process — undoing a kill must not itself require a redeploy."""
+    require_internal_key(request)
+    body = await request.json()
+    if body.get("confirm") != "RESUME":
+        raise HTTPException(400, 'Body must include {"confirm": "RESUME"}')
+
+    from ingest import connect
+    import scheduler
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                insert into engine_settings (key, value, updated_at)
+                values ('kill_switch', '{"active": false}'::jsonb, now())
+                on conflict (key) do update set
+                    value = excluded.value, updated_at = now()
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    resumed = scheduler.start()
+    log.warning("Kill switch cleared. Scheduler restarted: %s",
+               resumed is not None)
+    return {"cleared": True, "scheduler_restarted": resumed is not None}
+
+
 @app.post("/jobs/delivery")
 def delivery_job(request: Request):
     """
