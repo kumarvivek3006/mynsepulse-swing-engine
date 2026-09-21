@@ -1117,6 +1117,26 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                         "where status = 'pending' and expires_on < %s", (as_of,))
         conn.commit()
 
+        # Premarket running on yesterday's stored close is correct on
+        # EVERY normal day ("prices are not re-fetched" — see
+        # _premarket's docstring). This flags only the abnormal case:
+        # bars were already stale entering the run AND the catch-up
+        # refresh also failed, so signals below may reflect data older
+        # than the routine one-day lag.
+        #
+        # Logged distinctly here, at the point this run's summary is
+        # actually assembled — not only at the earlier, upstream
+        # detection point inside ensure_bars_current. Traced: this flag
+        # previously reached engine_settings.last_scan_summary and
+        # _last_runs (via /jobs/schedule) but nothing surfaced it — one
+        # key among many in a JSON blob nobody was prompted to open.
+        data_possibly_stale = freshness.get("reason") == "token_invalid"
+        if data_possibly_stale:
+            log.warning("Scan %s (%s): publishing signals on data that "
+                       "may be more than one day stale — token was "
+                       "invalid when the catch-up refresh was attempted.",
+                       as_of, mode)
+
         summary = {
             "as_of": str(as_of),
             "regime": regime["state"],
@@ -1159,16 +1179,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "floor_boost_pct": COOLDOWN_FLOOR_BOOST if cooldown_active else 0,
             },
             "freshness": freshness,
-            # Promoted to top level, not buried inside freshness. Premarket
-            # running on yesterday's stored close is correct on EVERY
-            # normal day ("prices are not re-fetched" — see _premarket's
-            # docstring). This specifically flags the abnormal case: bars
-            # were already stale entering the run AND the catch-up refresh
-            # also failed, so signals below may reflect data older than
-            # the routine one-day lag. Without this, that distinction only
-            # existed in a log line and a field three levels deep that
-            # nothing reads before publishing.
-            "data_possibly_stale": freshness.get("reason") == "token_invalid",
+            "data_possibly_stale": data_possibly_stale,
             "invalidated": invalidated,
             "new_opportunities": new_opportunities,
             "suppressed_already_taken": already_taken,
