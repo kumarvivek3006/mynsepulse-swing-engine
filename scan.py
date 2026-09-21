@@ -132,7 +132,7 @@ class ScanAborted(RuntimeError):
 _last_refresh_attempt: dict = {"for_session": None, "at": None, "gained": 0}
 
 
-def expected_last_session(conn, now: datetime | None = None) -> date:
+def expected_last_session(now: datetime | None = None) -> date:
     """
     The most recent session whose CLOSING bar should exist.
 
@@ -147,11 +147,10 @@ def expected_last_session(conn, now: datetime | None = None) -> date:
     # it made the freshness gate conclude the data was current and skip the
     # refresh — hiding the very staleness it exists to catch.
     if now.weekday() < 5 and (now.hour * 60 + now.minute) >= 18 * 60:
-        if not is_trading_holiday(conn, day):
-            return day
+        return day
     while True:
         day -= timedelta(days=1)
-        if day.weekday() < 5 and not is_trading_holiday(conn, day):
+        if day.weekday() < 5:
             return day
 
 
@@ -174,7 +173,7 @@ def ensure_bars_current(conn) -> dict:
         """)
         latest = cur.fetchone()[0]
 
-    expected = expected_last_session(conn)
+    expected = expected_last_session()
     if latest is not None and latest >= expected:
         return {"refreshed": False, "latest_bar": str(latest),
                 "expected": str(expected), "reason": "already_current"}
@@ -197,9 +196,21 @@ def ensure_bars_current(conn) -> dict:
     # that as "no_data_for_session" hid the real cause, and the hour-long memo
     # then suppressed retries even after a fresh login.
     if TokenStore().valid_token() is None:
+        # Escalated to ERROR. Previously silent: the result dict is only
+        # ever written into the final summary as a nested field
+        # (freshness.reason), which _guarded() never inspects — a scan
+        # blocked entirely on an expired token still recorded status
+        # "success" in _last_runs. This does not change control flow:
+        # premarket still degrades gracefully here (correct, since it
+        # reaches this path only on the rare day bars are already stale
+        # entering the morning). Postclose and intraday get their own
+        # RAISING checks instead — see scheduler.py — since neither has
+        # a sensible "proceed on stale data" mode.
+        log.error("Upstox token invalid — bars stale (latest %s, expected %s) "
+                 "cannot be refreshed", latest, expected)
         return {"refreshed": False, "latest_bar": str(latest) if latest else None,
                 "expected": str(expected),
-                "reason": "upstox_token_expired",
+                "reason": "token_invalid",
                 "action": "Log in to Upstox, then re-run the scan."}
 
     log.info("Bars stale (latest %s, expected %s) — refreshing", latest, expected)

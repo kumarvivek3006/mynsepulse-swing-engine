@@ -18,7 +18,7 @@ Three slots, each with a different job:
                      now can be acted on in the last half hour, rather
                      than a day late.
 
-  18:30  postclose   Definitive scan on the completed daily bar. Supersedes
+  15:45  postclose   Definitive scan on the completed daily bar. Supersedes
                      the day's earlier runs and arms tomorrow.
 
 Weekends are skipped. Exchange holidays are not enumerated — on a holiday
@@ -107,6 +107,20 @@ def _premarket() -> dict:
 
 def _intraday() -> dict:
     from scan import run_scan
+    from upstox_client import TokenStore
+
+    # Intraday's Upstox dependency is entirely inside _forming_bar()
+    # (scan.py) via client.intraday_today() — a path ensure_bars_current()
+    # never touches, since intraday explicitly skips it. Without this,
+    # an expired token here failed per-symbol inside the scan with no
+    # upfront signal, and _guarded() recorded the slot "success" regardless.
+    #
+    # RAISES rather than degrading gracefully: unlike premarket, intraday
+    # has no meaningful fallback — its entire purpose is today's forming
+    # bar. Caught by _guarded(), which correctly marks the slot "failed".
+    if TokenStore().valid_token() is None:
+        raise RuntimeError("token_invalid")
+
     return run_scan(mode="intraday")
 
 
@@ -123,8 +137,17 @@ def _postclose() -> dict:
     from ingest import (backfill_prices, connect, sync_delivery, sync_indices,
                         sync_today_from_intraday)
     from nse_client import NSEClient
-    from upstox_client import InstrumentMaster, UpstoxClient
+    from upstox_client import InstrumentMaster, TokenStore, UpstoxClient
     from scan import run_scan
+
+    # Checked BEFORE sync_indices/backfill_prices — both run ahead of
+    # run_scan() and are entirely Upstox-dependent. Without this, a dead
+    # token meant backfill_prices caught each of 500 per-symbol failures
+    # and continued (documented in ensure_bars_current's own comment),
+    # returning silently with zero bars gained — indistinguishable from a
+    # quiet day. RAISES: postclose has no meaningful fallback either.
+    if TokenStore().valid_token() is None:
+        raise RuntimeError("token_invalid")
 
     client, master = UpstoxClient(), InstrumentMaster()
     conn = connect()
@@ -189,18 +212,9 @@ def start() -> BackgroundScheduler | None:
         log.info("Scheduled intraday hourly at %s:00 IST (Mon-Fri)",
                  ", ".join(hours))
 
-    # Holiday sync: first Monday of month, 06:00 IST. _sync_holidays_guarded
-    # itself re-checks the day-of-month guard, so this fires monthly.
-    _scheduler.add_job(
-        _sync_holidays_guarded,
-        CronTrigger(day_of_week="mon", hour=6, minute=0, timezone=IST),
-        id="sync_holidays", replace_existing=True,
-        misfire_grace_time=3600, coalesce=True, max_instances=1,
-    )
-    log.info("Scheduled sync_holidays for first Monday of month at 06:00 IST")
-
     _scheduler.start()
     return _scheduler
+
 
 def status() -> dict:
     jobs = []
@@ -218,30 +232,3 @@ def status() -> dict:
         "jobs": jobs,
         "last_runs": _last_runs,
     }
-
-def _sync_holidays_guarded():
-    """First-Monday monthly guard: fetch and upsert the holiday calendar."""
-    from datetime import date
-    from ingest import connect, _run_log
-    from market_calendar import sync_holidays
-
-    today = date.today()
-    # 1-7 inclusive of any month, when the day is Monday
-    if not (today.day <= 7 and today.weekday() == 0):
-        return
-
-    conn = connect()
-    try:
-        result = sync_holidays(conn)
-        _run_log(conn, "sync_holidays", "success", result.get("fetched", 0))
-        log.info("Holiday sync: %s", result)
-    except Exception as exc:
-        conn.rollback()
-        _run_log(conn, "sync_holidays", "failed", 0, str(exc)[:500])
-        log.exception("Holiday sync failed")
-    finally:
-        conn.close()
-
-
-
-
