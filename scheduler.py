@@ -18,7 +18,7 @@ Three slots, each with a different job:
                      now can be acted on in the last half hour, rather
                      than a day late.
 
-  15:45  postclose   Definitive scan on the completed daily bar. Supersedes
+  18:30  postclose   Definitive scan on the completed daily bar. Supersedes
                      the day's earlier runs and arms tomorrow.
 
 Weekends are skipped. Exchange holidays are not enumerated — on a holiday
@@ -189,9 +189,18 @@ def start() -> BackgroundScheduler | None:
         log.info("Scheduled intraday hourly at %s:00 IST (Mon-Fri)",
                  ", ".join(hours))
 
+    # Holiday sync: first Monday of month, 06:00 IST. _sync_holidays_guarded
+    # itself re-checks the day-of-month guard, so this fires monthly.
+    _scheduler.add_job(
+        _sync_holidays_guarded,
+        CronTrigger(day_of_week="mon", hour=6, minute=0, timezone=IST),
+        id="sync_holidays", replace_existing=True,
+        misfire_grace_time=3600, coalesce=True, max_instances=1,
+    )
+    log.info("Scheduled sync_holidays for first Monday of month at 06:00 IST")
+
     _scheduler.start()
     return _scheduler
-
 
 def status() -> dict:
     jobs = []
@@ -234,12 +243,5 @@ def _sync_holidays_guarded():
         conn.close()
 
 
-# Register with the scheduler (adapt to your existing pattern)
-scheduler.add_job(
-    _sync_holidays_guarded,
-    "cron",
-    hour=6, minute=0,
-    day_of_week="mon",
-    id="sync_holidays",
-    replace_existing=True,
-)
+
+
