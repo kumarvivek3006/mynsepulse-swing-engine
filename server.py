@@ -1656,6 +1656,33 @@ async def kill_switch_reset(request: Request):
     return {"cleared": True, "scheduler_restarted": resumed is not None}
 
 
+@app.get("/jobs/base-rejection-whatif")
+def base_rejection_whatif(request: Request, as_of: str = Query(...)):
+    """
+    Retrospectively recover the base-search rejection reason for symbols
+    that fell through to the flag/pennant fallback on a past scan date —
+    reason discarded at the time, now recoverable because it depends only
+    on price history, which is permanently stored.
+
+    Read-only. Reconstructs, writes nothing, changes no live behaviour.
+    """
+    require_internal_key(request)
+    from datetime import date as _date
+    from ingest import connect
+    from setups import reconstruct_base_rejections
+
+    try:
+        as_of_date = _date.fromisoformat(as_of)
+    except ValueError:
+        raise HTTPException(400, "as_of must be YYYY-MM-DD")
+
+    conn = connect()
+    try:
+        return reconstruct_base_rejections(conn, as_of_date)
+    finally:
+        conn.close()
+
+
 @app.post("/jobs/delivery")
 def delivery_job(request: Request):
     """

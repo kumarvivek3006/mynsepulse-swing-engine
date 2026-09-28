@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # cycle. weekly_volume_surge lives there because that is where the other
 # weekly/indicator logic already sits.
 from gates import (WEEKLY_VOL_CHECK_ENABLED, WEEKLY_VOL_MULT,
-                   weekly_volume_surge)
+                   add_indicators, weekly_volume_surge)
 
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
 MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "6"))
@@ -2188,3 +2188,100 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
               + ([f"T2 from {levels['t2_basis']}"] if levels.get('t2_basis') else
                  ["no second target — no overhead level beyond the measured move"]),
     )
+
+# ---------------------------------------------------------------------
+# Retrospective diagnostic — reconstructs a past day's base_rejection
+# without touching live scan behaviour.
+#
+# Not part of build_setup's call graph. Reads gate_log for the symbols
+# that hit a no_flag_* rejection on a given historical date, rebuilds each
+# one's price window AS IT STOOD ON THAT DATE (explicit trade_date <=
+# as_of bound — ohlcv_daily has no such cutoff on its own, and calling
+# _load_symbol's "latest 800 rows" logic today would silently pull in
+# every session since, shifting which window detect_base treats as most
+# recent), and re-runs detect_base / detect_flag_pennant directly.
+#
+# Deliberately bypasses the rest of build_setup (RS floor, Minervini,
+# score floors): these symbols already passed those gates on the
+# original day, and this question is purely about base-detection shape,
+# which depends only on price/volume history, not RS or fundamentals.
+#
+# Uses the CURRENT live base_strategy and thresholds. If either changed
+# between as_of and now this is "today's rules on that day's prices," not
+# a byte-identical replay — stated in the returned payload, not hidden.
+# ---------------------------------------------------------------------
+def reconstruct_base_rejections(conn, as_of, symbols: list[str] | None = None) -> dict:
+    with conn.cursor() as cur:
+        if symbols:
+            cur.execute("""
+                select symbol, reason_code, detail from gate_log
+                where as_of_date = %s and reason_code like 'no_flag_%%'
+                  and symbol = any(%s)
+            """, (as_of, symbols))
+        else:
+            cur.execute("""
+                select symbol, reason_code, detail from gate_log
+                where as_of_date = %s and reason_code like 'no_flag_%%'
+            """, (as_of,))
+        original_rows = cur.fetchall()
+
+    if not original_rows:
+        return {"as_of": str(as_of), "n": 0,
+                "note": "no no_flag_* rejections found for this date"}
+
+    results = []
+    for sym, orig_reason, orig_detail in original_rows:
+        with conn.cursor() as cur:
+            cur.execute("""
+                select trade_date, adj_open, adj_high, adj_low, adj_close, volume
+                from ohlcv_daily
+                where symbol = %s and trade_date <= %s
+                order by trade_date desc limit 800
+            """, (sym, as_of))
+            rows = cur.fetchall()
+
+        # 210, mirroring scan.py's MIN_BARS ("enough for a 200 DMA plus
+        # slope") — not imported cross-module for one diagnostic function.
+        if len(rows) < 210:
+            results.append({"symbol": sym, "error": f"only {len(rows)} bars as of {as_of}"})
+            continue
+
+        # Column handling matched exactly to _load_symbol (scan.py), not
+        # reinvented: trade_date to real datetime (mixing datetime.date
+        # with pandas Timestamp elsewhere breaks sorting), float64 for
+        # OHLC, int64 for volume. A near-miss here would not crash — it
+        # would silently feed indicators slightly different dtypes than
+        # the live path ever does.
+        df = pd.DataFrame(
+            rows[::-1],  # desc -> ascending, matching _load_symbol's own reversal
+            columns=["trade_date", "open", "high", "low", "close", "volume"])
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        for c in ("open", "high", "low", "close"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype("int64")
+        df = add_indicators(df)
+
+        entry = {"symbol": sym,
+                 "original_logged_reason": orig_reason,
+                 "original_logged_detail": orig_detail}
+        try:
+            detect_base(df, strategy=DEFAULT_BASE_STRATEGY)
+            entry["base_now_succeeds"] = True  # config/data drift since as_of
+        except Rejected as base_rej:
+            entry["base_rejection_reason"] = base_rej.reason
+            entry["base_rejection_detail"] = base_rej.detail
+        results.append(entry)
+
+    reasons = [r["base_rejection_reason"] for r in results if "base_rejection_reason" in r]
+    from collections import Counter
+    return {
+        "as_of": str(as_of),
+        "base_strategy_used": DEFAULT_BASE_STRATEGY,
+        "note": ("Reconstructed using CURRENT live base_strategy and "
+                "thresholds against price history bounded to trade_date <= "
+                "as_of. Not necessarily byte-identical to as_of's own run "
+                "if config changed since."),
+        "n": len(results),
+        "base_rejection_reason_counts": dict(Counter(reasons)),
+        "symbols": results,
+    }
