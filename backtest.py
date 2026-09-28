@@ -517,7 +517,8 @@ def simulate_portfolio(trades: list[dict], max_positions: int = 8,
 
 
 def run_backtest(from_date: date, to_date: date, step: int = 1,
-                 min_score_pct: float | None = None) -> dict:
+                 min_score_pct: float | None = None,
+                 pivot_recency_max_frac: float | None = None) -> dict:
     """
     Replay the pipeline day by day.
 
@@ -724,7 +725,10 @@ def run_backtest(from_date: date, to_date: date, step: int = 1,
                         # gate needs this, not rs126 (which is percentage-
                         # point outperformance vs the index — different
                         # units entirely).
-                        rs_rank_pct=rs_pct.get((sym, d)))
+                        rs_rank_pct=rs_pct.get((sym, d)),
+                        # None for every real run — only the pivot-recency
+                        # what-if analysis passes a value here.
+                        pivot_recency_max_frac=pivot_recency_max_frac)
                 except Rejected:
                     continue
 

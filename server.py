@@ -1737,6 +1737,10 @@ def backtest_job(request: Request):
 
     years = float(request.query_params.get("years", "2"))
     step = int(request.query_params.get("step", "1"))
+    # None (default) -> run_backtest forwards None -> detect_base uses the
+    # live PIVOT_RECENCY_MAX_FRAC (0.7). Only set to run the what-if.
+    _pivot_param = request.query_params.get("pivot_recency_max_frac")
+    pivot_recency_max_frac = float(_pivot_param) if _pivot_param is not None else None
     to_date = _date.today()
     from_date = to_date - timedelta(days=int(365 * years))
 
@@ -1758,14 +1762,16 @@ def backtest_job(request: Request):
                     insert into backtest_runs (from_date, to_date, status, params)
                     values (%s, %s, 'running', %s) returning id
                 """, (from_date, to_date,
-                      json.dumps({"years": years, "step": step})))
+                      json.dumps({"years": years, "step": step,
+                                 "pivot_recency_max_frac": pivot_recency_max_frac})))
                 run_id = cur.fetchone()[0]
             conn.commit()
         finally:
             conn.close()
 
         try:
-            result = run_backtest(from_date, to_date, step=step)
+            result = run_backtest(from_date, to_date, step=step,
+                                  pivot_recency_max_frac=pivot_recency_max_frac)
             from backtest import (compare_base_strategies, compare_exits,
                                  diagnose_quality_quartile, simulate_portfolio,
                                  classifier_attribution, split_sample,

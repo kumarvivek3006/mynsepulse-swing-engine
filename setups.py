@@ -30,6 +30,14 @@ from gates import (WEEKLY_VOL_CHECK_ENABLED, WEEKLY_VOL_MULT,
                    add_indicators, weekly_volume_surge)
 
 BASE_MIN_SESSIONS = int(os.environ.get("BASE_MIN_SESSIONS", "15"))
+# The pivot must sit in the OLDER part of the window it is tested against —
+# a high made in the most recent (1 - this) fraction of the window is not
+# a level the stock has been coiling beneath, just recent price action.
+# Named rather than left as a bare literal, matching every other threshold
+# here. detect_base() also accepts a per-call override (default None,
+# meaning "use this") for the pivot-recency what-if analysis — the live
+# default is untouched unless this env var itself is changed.
+PIVOT_RECENCY_MAX_FRAC = float(os.environ.get("PIVOT_RECENCY_MAX_FRAC", "0.7"))
 MIN_BASE_DEPTH_PCT = float(os.environ.get("MIN_BASE_DEPTH_PCT", "6"))
 # Spec (Prompt 7): VCP's final contraction should be tightest, under ~8%.
 VCP_FINAL_CONTRACTION_PCT = float(os.environ.get("VCP_FINAL_CONTRACTION_PCT", "8"))
@@ -417,7 +425,8 @@ FIXED_BASE_WINDOW = int(os.environ.get("FIXED_BASE_WINDOW", "45"))
 
 
 def detect_base(df: pd.DataFrame, exclude_last: int = 1,
-                strategy: str = DEFAULT_BASE_STRATEGY) -> Base:
+                strategy: str = DEFAULT_BASE_STRATEGY,
+                pivot_recency_max_frac: float | None = None) -> Base:
     """
     The base is formed by the bars BEFORE the trigger.
 
@@ -469,6 +478,11 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
     def _note(reason: str) -> None:
         fail_counts[reason] = fail_counts.get(reason, 0) + 1
 
+    # None means "use the live default" — every existing caller passes
+    # nothing here, so this resolves to PIVOT_RECENCY_MAX_FRAC exactly as
+    # before this parameter existed. Only the what-if analysis overrides it.
+    _pivot_max_frac = (pivot_recency_max_frac if pivot_recency_max_frac is not None
+                       else PIVOT_RECENCY_MAX_FRAC)
     max_lookback = min(BASE_MAX_SESSIONS, n - PRIOR_UPTREND_WINDOW // 2)
     if strategy == "fixed_window":
         lookback_values = [FIXED_BASE_WINDOW] if FIXED_BASE_WINDOW <= max_lookback else []
@@ -486,7 +500,7 @@ def detect_base(df: pd.DataFrame, exclude_last: int = 1,
         # The pivot is resistance to break out THROUGH, so it must sit in
         # the older part of the base. A high made yesterday is not a level
         # the stock has been coiling under.
-        if pivot_rel > lookback * 0.7:
+        if pivot_rel > lookback * _pivot_max_frac:
             _note("pivot_too_recent")
             continue
 
@@ -1971,7 +1985,8 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
                 rs126: float | None, snap=None, transition: bool = False,
                 last_bar_incomplete: bool = False,
                 base_strategy: str = DEFAULT_BASE_STRATEGY,
-                rs_rank_pct: float | None = None) -> Setup:
+                rs_rank_pct: float | None = None,
+                pivot_recency_max_frac: float | None = None) -> Setup:
     """
     transition=True applies the Stage 1->2 profile: a longer base and a
     heavier volume break. The trend filter is looser on that path, so the
@@ -2039,7 +2054,14 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
         setup_type = "breakout_retest"
     else:
         try:
-            base = detect_base(df, strategy=base_strategy)
+            # Forwarded ONLY here, not into detect_breakout_retest above —
+            # the pivot_too_recent question is specifically about the
+            # standard base search, and retest presupposes an already-
+            # confirmed breakout, a structurally different question. None
+            # (every existing caller) resolves to the live default inside
+            # detect_base, unchanged.
+            base = detect_base(df, strategy=base_strategy,
+                               pivot_recency_max_frac=pivot_recency_max_frac)
         except Rejected as base_rejected:
             # The flag fallback is blocked only for fixed_window, which
             # exists purely to measure ONE lookback and would be corrupted
