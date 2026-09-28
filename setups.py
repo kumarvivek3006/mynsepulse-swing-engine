@@ -2040,7 +2040,7 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
     else:
         try:
             base = detect_base(df, strategy=base_strategy)
-        except Rejected:
+        except Rejected as base_rejected:
             # The flag fallback is blocked only for fixed_window, which
             # exists purely to measure ONE lookback and would be corrupted
             # by a fallback firing underneath it.
@@ -2056,7 +2056,30 @@ def build_setup(symbol: str, df: pd.DataFrame, rs63: float | None,
             # cheaper and states the intent at the point of decision.
             if base_strategy == "fixed_window" or transition:
                 raise
-            base = detect_flag_pennant(df)
+            try:
+                base = detect_flag_pennant(df)
+            except Rejected as flag_rejected:
+                # Diagnostic only — changes no threshold, no accept/reject
+                # outcome. detect_base already computes and raises the
+                # dominant failure reason across every window it tried
+                # (no_base_<reason>, with the full fail_counts breakdown as
+                # detail) when it exhausts its search. That exception was
+                # being caught here and silently discarded the moment the
+                # flag fallback was attempted — so when the fallback ALSO
+                # failed, gate_log only ever recorded "the flag didn't work
+                # either," never the original, usually more informative
+                # reason the proper base search failed first. Over half of
+                # a sample rejection funnel landed in this fallback path
+                # with the primary reason invisible.
+                #
+                # Both reasons are now attached. flag_rejected's own
+                # reason/gate still determines the outcome (unchanged
+                # behaviour); base_rejected's is carried alongside it.
+                flag_rejected.detail["base_rejection"] = {
+                    "reason": base_rejected.reason,
+                    "detail": base_rejected.detail,
+                }
+                raise flag_rejected
 
         if transition:
             if base.duration < TRANSITION_MIN_BASE_SESSIONS:
