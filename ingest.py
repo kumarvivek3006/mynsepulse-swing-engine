@@ -73,6 +73,61 @@ def _run_log(conn, job: str, status: str, rows: int = 0, error: str | None = Non
 # ---------------------------------------------------------------------
 # 1. Universe
 # ---------------------------------------------------------------------
+MAX_UNIVERSE_RETIREMENTS = int(os.environ.get("MAX_UNIVERSE_RETIREMENTS", "5"))
+
+
+def _plan_universe_collisions(rows: list[tuple], owner: dict[str, str]):
+    """
+    Resolve unique-key collisions BEFORE writing the universe.
+
+    symbols has symbol as its primary key and upstox_instrument_key as a
+    second, separate unique column. The insert's ON CONFLICT (symbol) covers
+    "same ticker, attributes changed". It does NOT cover an incoming
+    (new_ticker, K) where K already belongs to a different row — which is
+    exactly what an NSE ticker rename looks like, since the ISIN-based
+    instrument key survives the rename (the reason keys are stored at all).
+    That raised UniqueViolation on symbols_upstox_instrument_key_key and made
+    cold_start fail at its first step, despite being documented as idempotent.
+
+    rows:  (symbol, key, isin, name, type, industry, True) per constituent
+    owner: {key: symbol currently holding it in the table}
+
+    Returns (kept, retire, dropped):
+      kept    rows safe to upsert (one per key)
+      retire  {old_symbol: (key, new_symbol)} rows whose key must be freed
+      dropped [(symbol, key, kept_symbol)] intra-batch duplicates
+
+    Deliberately NOT done: changing a symbol's primary key. Every history
+    table references symbols(symbol) with no ON UPDATE CASCADE, so a rename
+    would either fail on any symbol with history or rewrite it wholesale.
+    The old row is retired instead and its history stays put under it.
+    """
+    by_key: dict[str, list[tuple]] = {}
+    for r in rows:
+        by_key.setdefault(r[1], []).append(r)
+
+    kept, dropped = [], []
+    for r in rows:                            # constituent order preserved
+        key, group = r[1], by_key[r[1]]
+        if len(group) == 1:
+            kept.append(r)
+            continue
+        # Two constituents resolved to one instrument. Keep the one that
+        # already owns the key (stable identity); otherwise the first.
+        winner = next((g for g in group if g[0] == owner.get(key)), group[0])
+        if r is winner:
+            kept.append(r)
+        elif r[0] != winner[0]:
+            dropped.append((r[0], key, winner[0]))
+
+    retire: dict[str, tuple[str, str]] = {}
+    for sym, key, *_ in kept:
+        holder = owner.get(key)
+        if holder is not None and holder != sym:
+            retire[holder] = (key, sym)
+    return kept, retire, dropped
+
+
 def sync_universe(conn, nse: NSEClient, master: InstrumentMaster) -> int:
     """
     NSE index constituents joined to Upstox instrument keys.
@@ -110,7 +165,38 @@ def sync_universe(conn, nse: NSEClient, master: InstrumentMaster) -> int:
         )
 
     with conn.cursor() as cur:
+        cur.execute("select upstox_instrument_key, symbol from symbols "
+                    "where upstox_instrument_key = any(%s)",
+                    ([r[1] for r in rows],))
+        owner = dict(cur.fetchall())
+
+    rows, retire, dropped = _plan_universe_collisions(rows, owner)
+
+    for sym, key, kept_sym in dropped:
+        log.warning("Instrument %s resolved for both %s and %s; keeping %s, "
+                    "skipping %s", key, kept_sym, sym, kept_sym, sym)
+
+    # A rename is rare — a handful a year. Many in one sync means the
+    # instrument master or the constituent feed is wrong, and retiring
+    # that many rows would quietly gut the universe. Same philosophy as the
+    # 90%-resolved guard above: refuse rather than write a degraded universe.
+    if len(retire) > MAX_UNIVERSE_RETIREMENTS:
+        raise NSEUnavailable(
+            f"{len(retire)} instrument keys changed owner in one sync "
+            f"(limit {MAX_UNIVERSE_RETIREMENTS}): "
+            f"{sorted(retire)[:10]}. Refusing to write a degraded universe.")
+
+    with conn.cursor() as cur:
         cur.execute("update symbols set in_nifty500 = false")
+        for old_sym, (key, new_sym) in sorted(retire.items()):
+            # Non-destructive. History stays under old_sym; the new symbol
+            # is backfilled by instrument key straight afterwards.
+            log.warning("Instrument %s moved %s -> %s: retiring %s "
+                        "(history kept, key freed)", key, old_sym, new_sym, old_sym)
+            cur.execute(
+                "update symbols set upstox_instrument_key = null, "
+                "is_active = false, in_nifty500 = false, updated_at = now() "
+                "where symbol = %s", (old_sym,))
         cur.executemany(
             """
             insert into symbols
@@ -129,7 +215,9 @@ def sync_universe(conn, nse: NSEClient, master: InstrumentMaster) -> int:
             rows,
         )
     conn.commit()
-    log.info("Universe synced: %d symbols (%d unresolved)", len(rows), len(unresolved))
+    log.info("Universe synced: %d symbols (%d unresolved, %d retired, "
+             "%d duplicate-skipped)", len(rows), len(unresolved),
+             len(retire), len(dropped))
     return len(rows)
 
 
