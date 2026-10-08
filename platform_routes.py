@@ -158,6 +158,12 @@ def register(app, *, require_internal_key, ist):
             token_valid = None
         conn = connect()
         try:
-            return SS.build(conn, next_runs=next_runs, token_valid=token_valid, env=dict(os.environ))
+            out = SS.build(conn, next_runs=next_runs, token_valid=token_valid, env=dict(os.environ))
+            try:
+                import e2_service
+                out["engine2"] = e2_service.status_brief(conn)
+            except Exception as e:                        # noqa: BLE001 — a failure here is shown, not hidden
+                out["engine2"] = {"error": f"{type(e).__name__}: {e}"[:300]}
+            return out
         finally:
             conn.close()

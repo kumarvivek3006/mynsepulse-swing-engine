@@ -2005,6 +2005,13 @@ def backtest_results(request: Request):
 import platform_routes
 platform_routes.register(app, require_internal_key=require_internal_key, ist=IST)
 
+# Engine 2 (shadow-mode research engine). Isolated: its failure to load cannot affect the live service.
+try:
+    import e2_service
+    e2_service.register(app, require_internal_key=require_internal_key, ist=IST)
+except Exception:                                    # noqa: BLE001
+    logging.getLogger("engine2").exception("Engine 2 routes not registered (live service unaffected)")
+
 
 @app.get("/jobs/status")
 def jobs_status(request: Request):

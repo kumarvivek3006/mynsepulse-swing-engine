@@ -641,6 +641,12 @@ def start() -> BackgroundScheduler | None:
         log.info("Scheduled refresh_fundamentals Fridays %s IST, months %s",
                  FUNDAMENTALS_REFRESH_TIME, FUNDAMENTALS_REFRESH_MONTHS)
 
+    try:                                              # Engine 2 jobs; must never be able to stop the live scheduler
+        import e2_service
+        e2_service.schedule(_scheduler, _guarded, IST)
+    except Exception:                                 # noqa: BLE001
+        log.exception("Engine 2 scheduling not registered (live scheduler unaffected)")
+
     _scheduler.start()
     return _scheduler
 
