@@ -38,7 +38,9 @@ import pandas as pd
 log = logging.getLogger("engine2.diagnosis")
 
 KEY = "engine2_diagnosis"
-PATTERNS = ("cup_handle", "ascending_base", "flag_pennant", "asc_triangle")
+PATTERNS = ("cup_handle", "ascending_base", "flag_pennant", "asc_triangle", "vcp")
+# vcp is not a disabled pattern: it was ARMED in the old engine. It is here so the old engine's vcp trades are replayed through the
+# Engine 2 definition and every setup the new definition rejects carries the clause that stopped it (e2_defdiag.vcp_trace).
 PRE_BARS, POST_BARS = 3, 3
 HISTORY_DAYS = 900                      # calendar days of bars before the earliest signal (features need ~250)
 
@@ -175,6 +177,12 @@ def replay(conn, pattern: str, df: pd.DataFrame) -> dict:
         hit = [c for c in cands if lo <= c.idx < hi]
         rec = {"symbol": t.symbol, "signal_date": str(t.signal_date), "old_r": _f(t.r_realised), "old_exit": t.exit_reason,
                "kept": bool(hit)}
+        if pattern == "vcp" and not hit:
+            try:
+                import e2_defdiag
+                rec["reject_clause"] = e2_defdiag.trace_window(b, lo, hi)
+            except Exception as e:                                  # noqa: BLE001 — the trace must never hide the replay
+                rec["reject_clause"] = f"trace_error: {type(e).__name__}"
         if hit:
             c = min(hit, key=lambda c: abs(c.idx - i_end))
             tr = MG.simulate(b, c, None)
@@ -191,7 +199,12 @@ def replay(conn, pattern: str, df: pd.DataFrame) -> dict:
                 "engine2_avg_r": _f(np.mean(e2)) if e2 else None, "engine2_n": len(e2)}
     kept, rej = group(lambda r: r["kept"]), group(lambda r: not r["kept"])
     tot = kept["n"] + rej["n"]
-    return {"window": f"signal date - {PRE_BARS} bars .. entry date + {POST_BARS} bars", "n_replayed": tot, "not_replayed": dict(skipped),
+    clauses = {}
+    if pattern == "vcp":
+        for cl in sorted({r["reject_clause"] for r in rows if r.get("reject_clause")}):
+            g = group(lambda r, cl=cl: r.get("reject_clause") == cl)
+            clauses[cl] = {"n": g["n"], "old_avg_r": g["old_avg_r"], "old_winners": g["old_winners"], "old_losers": g["old_losers"]}
+    return {"reject_clauses": clauses, "window": f"signal date - {PRE_BARS} bars .. entry date + {POST_BARS} bars", "n_replayed": tot, "not_replayed": dict(skipped),
             "kept_by_corrected_definition": kept, "rejected_by_corrected_definition": rej,
             "rejected_pct": _f(100 * rej["n"] / tot, 1) if tot else None,
             "trades": rows}
@@ -213,6 +226,10 @@ def reading(p: str, old: dict, rp: dict) -> list[str]:
         L.append(f"Corrected definition on the same setups: rejects {r['n']} of {rp['n_replayed']} ({rp['rejected_pct']}%). "
                  f"Rejected group: old avg {r['old_avg_r']}R ({r['old_winners']} winners / {r['old_losers']} losers). "
                  f"Kept group: old avg {k['old_avg_r']}R ({k['old_winners']} / {k['old_losers']}), Engine 2 management avg {k['engine2_avg_r']}R on {k['engine2_n']}.")
+        if rp.get("reject_clauses"):
+            L.append("Clause that stopped each rejected setup (the furthest the Engine 2 definition got on the bars around it): " +
+                     "; ".join(f"{c}: {v['n']} (old avg {v['old_avg_r']}R, {v['old_winners']}W/{v['old_losers']}L)"
+                               for c, v in sorted(rp["reject_clauses"].items(), key=lambda kv: -kv[1]["n"])) + ".")
     return L
 
 
@@ -255,7 +272,7 @@ def run(conn=None, trigger: str = "manual") -> dict:
 
 
 def render_markdown(d: dict) -> str:
-    L = ["## Disabled-pattern diagnosis (old engine vs corrected definition)", "", d.get("note", ""), ""]
+    L = ["## Pattern diagnosis (old engine vs Engine 2 definition)", "", d.get("note", ""), ""]
     for p, v in (d.get("patterns") or {}).items():
         L.append(f"### {p}")
         if "error" in v:
