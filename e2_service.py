@@ -455,6 +455,12 @@ def render_markdown(rep: dict) -> str:
     for k, v in (rep.get("portfolio") or {}).items():
         if isinstance(v, dict) and "metrics" in v:
             L.append(f"- **{k}**: {v['metrics']}  (rejected: {v.get('rejected')}; halts: {v.get('drawdown_halts')})")
+    att = (rep.get("portfolio") or {}).get("attribution") or {}
+    for label, a in att.items():
+        L += ["", f"## Portfolio attribution — {label} ({a.get('closed_trades')} closed trades)", "",
+              "| detector | trades | avg R | total R | win % |", "|---|---|---|---|---|"]
+        L += [f"| {k} | {v['n']} | {v['avg_r']} | {v['total_r']} | {v['win_rate_pct']} |" for k, v in a.get("by_detector", {}).items()]
+        L += ["", "By regime at signal: " + "; ".join(f"{k}: {v['n']} trades, {v['avg_r']}R avg, {v['total_r']}R total" for k, v in a.get("by_regime", {}).items())]
     cal = (rep.get("scoring") or {}).get("calibration") or {}
     L += ["", "## Scoring", f"Calibration adopted: {cal.get('adopted')} — {cal.get('reason')}",
           f"Spearman(score, R) test half: spec {cal.get('spearman_test_spec')}, calibrated {cal.get('spearman_test_cal')}"]

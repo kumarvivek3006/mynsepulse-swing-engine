@@ -38,7 +38,7 @@ from e2_manage import Trade, simulate
 
 log = logging.getLogger("engine2")
 
-CODE_VERSION = "e2.1.0"
+CODE_VERSION = "e2.1.1"      # 1.1: + portfolio_attribution (measurement only; no detector, score or portfolio rule changed)
 MIN_TURNOVER_CR = float(os.environ.get("MIN_TURNOVER_CR", "5"))      # same floor as the live engine's gate 0
 WINDOW_BARS = int(os.environ.get("E2_WINDOW_BARS", "756"))           # ~3 years of sessions
 EXTRA_DAYS = 620                                                      # calendar days of history before the window
@@ -325,6 +325,23 @@ def run_study(data: Data, progress=None, window_bars: int = WINDOW_BARS) -> dict
                 "avg_exposure_pct": round(100 * float(res.daily["exposure"].mean()), 1) if len(res.daily) else None,
                 "equity_monthly": [[str(d.date()), round(float(v), 0)] for d, v in mo.items()]}
 
+    def attribution(res: PF.Result) -> dict:
+        """Which detectors / regimes the portfolio's trades actually came from, and what each contributed. Measurement only."""
+        def agg(rs: list[float]) -> dict:
+            a = np.asarray(rs, float)
+            return {"n": len(rs), "avg_r": round(float(a.mean()), 3), "total_r": round(float(a.sum()), 2),
+                    "win_rate_pct": round(100 * float((a > 0).mean()), 1)}
+        det, reg = defaultdict(list), defaultdict(list)
+        for x in res.taken:
+            if "pnl" not in x:
+                continue
+            t = x["trade"]
+            det[t.detector].append(t.r)
+            reg[str(t.regime_state)].append(t.r)
+        return {"by_detector": {k: agg(v) for k, v in sorted(det.items(), key=lambda kv: -len(kv[1]))},
+                "by_regime": {k: agg(v) for k, v in sorted(reg.items())},
+                "closed_trades": sum(len(v) for v in det.values())}
+
     ix_ret = None
     if data.index_close is not None:
         ic = data.index_close.reindex(pn.cal).ffill()
@@ -391,6 +408,7 @@ def run_study(data: Data, progress=None, window_bars: int = WINDOW_BARS) -> dict
         "portfolio": {"full_window_spec_weights": book(full), "full_window_no_regime_modulation": book(no_regime),
                       "test_half_spec_weights": book(test_spec),
                       "test_half_calibrated_weights": book(test_cal),
+                      "attribution": {"full_window_spec_weights": attribution(full), "test_half_spec_weights": attribution(test_spec)},
                       "note": "full_window uses the spec's weights: nothing in it was fitted. test_half_* start at the split date with a fresh book."},
         "caveats": CAVEATS,
         "runtime_sec": round(time.time() - t0, 1),
