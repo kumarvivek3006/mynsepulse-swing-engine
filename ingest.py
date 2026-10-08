@@ -70,6 +70,37 @@ def _run_log(conn, job: str, status: str, rows: int = 0, error: str | None = Non
     conn.commit()
 
 
+def kill_switch_active(conn) -> bool:
+    """
+    True if engine_settings.kill_switch is {"active": true}.
+
+    ONE implementation, shared by scheduler.start() and run_scan(). Until now
+    only start() read the flag, so the switch stopped scheduled jobs and
+    nothing else: a scan already running finished and published, and a manual
+    POST /jobs/scan still ran and published while "stopped".
+
+    FAILS OPEN on a read error (returns False). A scan that cannot read the
+    flag is a scan that is probably about to fail on its own queries; refusing
+    to run on a transient hiccup would leave the engine dark with no visible
+    reason, the failure mode start() already avoids for the same reason. The
+    transaction is rolled back so a failed read cannot leave the connection
+    in an aborted state that makes the NEXT, unrelated query fail confusingly.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select value from engine_settings "
+                        "where key = 'kill_switch'")
+            row = cur.fetchone()
+        return bool(row and row[0] and row[0].get("active"))
+    except Exception:
+        log.exception("Kill-switch read failed — treating as NOT killed")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
 # ---------------------------------------------------------------------
 # 1. Universe
 # ---------------------------------------------------------------------

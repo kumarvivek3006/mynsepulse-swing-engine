@@ -55,6 +55,29 @@ POSTCLOSE_TIME = os.environ.get("POSTCLOSE_SCAN_IST", "18:30")
 UNIVERSE_SYNC_ENABLED = os.environ.get("UNIVERSE_SYNC_ENABLED", "true").lower() == "true"
 HOLIDAY_SYNC_ENABLED = os.environ.get("HOLIDAY_SYNC_ENABLED", "true").lower() == "true"
 
+# Fundamentals refresh. Indian companies file quarterly results over the ~45
+# days after quarter end (60 for the March quarter), so new data arrives
+# staggered across five-odd weeks in Jan-Feb, Apr-May, Jul-Aug and Oct-Nov. A
+# single quarterly run would catch only the early filers; a weekly Saturday run
+# inside those months picks up the rest and does nothing useful (and costs
+# nothing important) outside them.
+# Data-quality report, weekdays after postclose (18:30 scan finishes ~18:40).
+# Needs no Upstox token: it only reads what is already stored.
+DATA_QUALITY_ENABLED = os.environ.get("DATA_QUALITY_ENABLED", "true").lower() == "true"
+DATA_QUALITY_TIME = os.environ.get("DATA_QUALITY_TIME_IST", "19:00")
+
+FUNDAMENTALS_REFRESH_ENABLED = os.environ.get(
+    "FUNDAMENTALS_REFRESH_ENABLED", "true").lower() == "true"
+FUNDAMENTALS_REFRESH_MONTHS = os.environ.get(
+    "FUNDAMENTALS_REFRESH_MONTHS", "1,2,4,5,7,8,10,11")
+# Friday evening, not Saturday morning: the Upstox path needs a valid token,
+# which exists only after the daily manual login (it expires 03:30 IST), and
+# 19:30 is an hour after postclose, when one is known to be valid on a working
+# day. A missing token fails the slot loudly, exactly as the scans do.
+FUNDAMENTALS_REFRESH_TIME = os.environ.get("FUNDAMENTALS_REFRESH_TIME_IST", "19:30")
+# More than this share of the universe failing is a broken source, not noise.
+FUNDAMENTALS_MAX_FAIL_PCT = float(os.environ.get("FUNDAMENTALS_MAX_FAIL_PCT", "20"))
+
 _scheduler: BackgroundScheduler | None = None
 _last_runs: dict[str, dict] = {}
 
@@ -287,6 +310,143 @@ def _sync_universe_job() -> dict:
         conn.close()
 
 
+def _fundamentals_problem(name: str, result: dict, n_symbols: int,
+                          max_fail_pct: float = FUNDAMENTALS_MAX_FAIL_PCT) -> str | None:
+    """
+    Why a sync that returned normally should still count as a failure, or None.
+
+    The underlying syncs raise when they write NOTHING, but a source that
+    degrades to answering 30% of symbols writes plenty and reports success,
+    which is how stale Gate 2 data goes unnoticed. Pure function so the rule
+    is testable.
+    """
+    if result.get("error"):
+        return f"{name}: {result['error']}"
+    if not result.get("written"):
+        return f"{name}: wrote no rows"
+    failed = int(result.get("failed", 0))
+    if n_symbols and 100.0 * failed / n_symbols > max_fail_pct:
+        return (f"{name}: {failed}/{n_symbols} symbols failed "
+                f"({100.0 * failed / n_symbols:.0f}% > {max_fail_pct:.0f}%)")
+    return None
+
+
+def _refresh_fundamentals_job() -> dict:
+    """
+    Results-season fundamentals refresh, Fridays 19:30 IST in Jan, Feb, Apr,
+    May, Jul, Aug, Oct, Nov.
+
+    Until now NOTHING refreshed fundamentals: no scheduled path existed. Gate 2
+    vetoed ~29 names a day on whatever the last manual run left, and 13 names
+    reached it with no fundamentals at all.
+
+    SOURCE follows the existing UPSTOX_FUNDAMENTALS_ENABLED switch (live: true).
+    That flag was defined but read by nothing; this is its first consumer.
+      true  -> Upstox (the intended source: the NSE path's newest quarter was
+               21 months stale and carried no FII/DII). Needs a valid token.
+      false -> the NSE path, which needs none.
+    The source is never chosen automatically and never switched silently: a
+    quiet fall-back from one source to the other is how two data definitions
+    end up mixed under one column. A dead token raises.
+
+    Both syncs always run. Failures are collected and raised together at the
+    end so _guarded records the slot as failed and persists it to
+    ingestion_runs; a refresh that half-worked must not report success.
+    """
+    # Holiday guard FIRST, before the token check: a Friday market holiday has
+    # no daily login, so the token check would report a false failure. See
+    # _skip_today (2 Oct 2026: seven false token_invalid failures).
+    skipped = _skip_today("refresh_fundamentals")
+    if skipped is not None:
+        log.info("Fundamentals refresh skipped: %s", skipped.get("reason") or skipped["status"])
+        return skipped
+
+    import fundamentals as F
+    from ingest import _run_log, connect
+
+    use_upstox = F.UPSTOX_FUNDAMENTALS_ENABLED
+    if use_upstox:
+        from upstox_client import TokenStore, UpstoxClient
+        if TokenStore().valid_token() is None:
+            raise RuntimeError("token_invalid")
+        client = UpstoxClient()
+        jobs = (("sync_shareholding_upstox", lambda c: F.sync_shareholding_upstox(c, client)),
+                ("sync_quarterly_results_upstox", lambda c: F.sync_quarterly_results_upstox(c, client)))
+    else:
+        jobs = (("sync_shareholding", F.sync_shareholding),
+                ("sync_quarterly_results", F.sync_quarterly_results))
+
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select count(*) from symbols where is_active "
+                        "and coalesce(series,'') <> 'INDEX'")
+            n_symbols = int(cur.fetchone()[0])
+
+        out, problems = {"symbols": n_symbols,
+                         "source": "upstox" if use_upstox else "nse"}, []
+        for name, fn in jobs:
+            try:
+                res = fn(conn)
+            except Exception as exc:
+                conn.rollback()
+                _run_log(conn, name, "failed", 0, str(exc)[:500])
+                problems.append(f"{name}: {str(exc)[:200]}")
+                continue
+            problem = _fundamentals_problem(name, res, n_symbols)
+            _run_log(conn, name, "failed" if problem else "success",
+                     res.get("written", 0), problem)
+            out[name] = {k: res.get(k) for k in ("written", "failed", "empty")}
+            if problem:
+                problems.append(problem)
+        if problems:
+            raise RuntimeError("fundamentals_refresh_degraded: " + "; ".join(problems))
+        return out
+    finally:
+        conn.close()
+
+
+def _data_quality_job() -> dict:
+    """
+    Weekdays 19:00 IST: stale bars, interior gaps, bad ticks, per-symbol
+    fundamentals staleness, over the scan universe. REPORT-ONLY: it never
+    filters or blocks a scan.
+
+    The full report is stored (engine_settings.data_quality_latest) BEFORE any
+    raise, so the detail is readable the moment the slot is marked failed.
+    A CRITICAL finding raises, which _guarded records as a failed slot and
+    persists to ingestion_runs (it does the logging, so this job does not log
+    the failure a second time). Warnings return normally with the counts.
+    """
+    skipped = _skip_today("data_quality")
+    if skipped is not None:
+        log.info("Data-quality slot skipped: %s", skipped.get("reason") or skipped["status"])
+        return skipped
+
+    import json
+    import data_quality
+    from ingest import _run_log, connect
+
+    conn = connect()
+    try:
+        rep = data_quality.run_checks(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "insert into engine_settings (key, value, updated_at) values "
+                "('data_quality_latest', %s::jsonb, now()) "
+                "on conflict (key) do update set value = excluded.value, updated_at = now()",
+                (json.dumps(rep, default=str),))
+        conn.commit()
+        if rep["severity"] == "critical":
+            raise RuntimeError("data_quality_critical: " + "; ".join(rep["critical"])[:400])
+        _run_log(conn, "data_quality", "success", rep["universe"],
+                 "; ".join(rep["warnings"])[:500] or None)
+        return {"severity": rep["severity"], "universe": rep["universe"],
+                "warnings": rep["warnings"]}
+    finally:
+        conn.close()
+
+
 def _sync_holidays_job() -> dict:
     """
     Monthly market-holiday refresh, first Monday 06:00 IST.
@@ -353,11 +513,10 @@ def _kill_switch_active(conn=None) -> bool:
         if own_conn:
             from ingest import connect
             conn = connect()
-        with conn.cursor() as cur:
-            cur.execute("select value from engine_settings "
-                       "where key = 'kill_switch'")
-            row = cur.fetchone()
-        return bool(row and row[0] and row[0].get("active"))
+        # The read itself lives in ingest.kill_switch_active so scan.py and
+        # this module cannot drift apart. Only connection handling stays here.
+        from ingest import kill_switch_active
+        return kill_switch_active(conn)
     except Exception:
         log.exception("Kill-switch check failed — defaulting to NOT killed "
                       "(starting the scheduler rather than staying dark)")
@@ -436,6 +595,28 @@ def start() -> BackgroundScheduler | None:
             coalesce=True, max_instances=1,
         )
         log.info("Scheduled sync_holidays first Monday 06:00 IST")
+
+    if DATA_QUALITY_ENABLED:
+        dh, dm = (int(x) for x in DATA_QUALITY_TIME.split(":"))
+        _scheduler.add_job(
+            _guarded, CronTrigger(day_of_week="mon-fri", hour=dh, minute=dm, timezone=IST),
+            args=["data_quality", _data_quality_job], id="data_quality",
+            replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1,
+        )
+        log.info("Scheduled data_quality at %s IST (Mon-Fri)", DATA_QUALITY_TIME)
+
+    if FUNDAMENTALS_REFRESH_ENABLED:
+        fh, fm = (int(x) for x in FUNDAMENTALS_REFRESH_TIME.split(":"))
+        _scheduler.add_job(
+            _guarded,
+            CronTrigger(month=FUNDAMENTALS_REFRESH_MONTHS, day_of_week="fri",
+                        hour=fh, minute=fm, timezone=IST),
+            args=["refresh_fundamentals", _refresh_fundamentals_job],
+            id="refresh_fundamentals", replace_existing=True,
+            misfire_grace_time=21600, coalesce=True, max_instances=1,
+        )
+        log.info("Scheduled refresh_fundamentals Fridays %s IST, months %s",
+                 FUNDAMENTALS_REFRESH_TIME, FUNDAMENTALS_REFRESH_MONTHS)
 
     _scheduler.start()
     return _scheduler

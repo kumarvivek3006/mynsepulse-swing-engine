@@ -37,7 +37,8 @@ from gates import (
 )
 from market_calendar import (calendar_health, holiday_description,
                              is_muhurat, is_trading_holiday)
-from ingest import connect
+from ingest import connect, kill_switch_active
+from universe import load_scan_universe
 from upstox_client import IST
 from fundamentals import load_snapshots
 from setups import (Rejected, build_setup, minervini_no_rs_count,
@@ -61,6 +62,13 @@ DRAWDOWN_LOOKBACK = int(os.environ.get("DRAWDOWN_LOOKBACK", "20"))
 DRAWDOWN_MIN_TRADES = int(os.environ.get("DRAWDOWN_MIN_TRADES", "10"))
 DRAWDOWN_THRESHOLD_R = float(os.environ.get("DRAWDOWN_THRESHOLD_R", "-0.15"))
 COOLDOWN_FLOOR_BOOST = float(os.environ.get("COOLDOWN_FLOOR_BOOST", "10"))
+
+# Floor under the scan universe. The universe query now filters on
+# in_nifty500; if that flag were ever cleared or mis-set the scan would
+# silently run on a handful of names and report "0 signals" as success, which
+# is indistinguishable from a quiet market. Nifty 500 syncs refuse below 90%
+# resolved (450), so 400 never trips on a legitimate universe.
+UNIVERSE_MIN_SYMBOLS = int(os.environ.get("UNIVERSE_MIN_SYMBOLS", "400"))
 # An intraday run that cannot see the market must not conclude the market
 # is empty. On a holiday, or with a dead token, the forming-bar fetch
 # returns nothing for every symbol — and writing that result would erase
@@ -373,6 +381,17 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
     conn = connect()
 
     try:
+        # Kill switch, FIRST. Checked before anything else so a stopped
+        # engine does no work at all: no freshness fetch, no universe read.
+        # This blocks MANUAL scans as well as scheduled ones — a kill switch
+        # a manual trigger can bypass is not a kill switch; RESUME clears it.
+        if kill_switch_active(conn):
+            log.warning("Kill switch active — %s scan skipped", mode)
+            return {"as_of": str(as_of), "mode": mode,
+                    "status": "skipped_kill_switch",
+                    "reason": "kill_switch_active",
+                    "signals": 0, "universe": 0}
+
         # Holiday guard — BEFORE ensure_bars_current. On a holiday that
         # function waits for a bar that will never arrive and triggers a
         # 500-symbol backfill looking for it. Applies to intraday too: a
@@ -400,23 +419,23 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
         freshness = ({"refreshed": False, "reason": "intraday_mode"}
                      if mode == "intraday" else ensure_bars_current(conn))
 
-        with conn.cursor() as cur:
-            cur.execute("""
-                select s.symbol,
-                       coalesce(bool_or(v.symbol is not null), false) as flagged
-                from symbols s
-                left join surveillance v
-                       on v.symbol = s.symbol
-                      and v.as_of >= current_date - 5
-                where s.is_active
-                  and coalesce(s.series, '') <> 'INDEX'
-                group by s.symbol
-                order by s.symbol
-            """)
-            rows = cur.fetchall()
-
-        universe = [r[0] for r in rows]
-        flagged = {r[0] for r in rows if r[1]}
+        # The universe is defined in universe.py and nowhere else: active AND
+        # in the current Nifty 500 AND not on the exclusion list (REITs).
+        # Before this, run_scan read only is_active, so index exits kept being
+        # scanned (527, not 500) and breadth, which feeds the regime, was
+        # computed over the wrong set.
+        scan_universe = load_scan_universe(conn)
+        universe = scan_universe.symbols
+        flagged = scan_universe.flagged
+        universe_detail = scan_universe.detail
+        # A degraded universe must fail loudly: a scan over a handful of names
+        # reports "0 signals" exactly as a quiet market does.
+        if len(universe) < UNIVERSE_MIN_SYMBOLS:
+            raise ScanAborted(
+                f"Universe is {len(universe)} symbols (minimum "
+                f"{UNIVERSE_MIN_SYMBOLS}). Refusing to scan a degraded "
+                f"universe; check symbols.in_nifty500 / sync_universe. "
+                f"Breakdown: {universe_detail}")
 
         # Symbols already held. A stock you are in should not reappear as a
         # fresh recommendation — the position is managed on My Trades, and
@@ -526,6 +545,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "as_of": str(as_of), "mode": mode,
                 "regime": regime["state"],
                 "universe": len(universe),
+                "universe_detail": universe_detail,
                 "signals": 0,
                 "regime_gate": "skipped",
                 "regime_gate_detail": regime_gate_detail,
@@ -850,6 +870,24 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
 
         signals.sort(key=lambda s: -s["score_total"])
 
+        # Kill switch, AGAIN, immediately before anything is published. A scan
+        # is minutes long; the switch can be fired while it is mid-loop. Every
+        # write from here to the single commit at the end of this block is one
+        # transaction (gate_log, supersede, signals, invalidate, expire), so
+        # aborting here publishes NOTHING. Consequence worth knowing: the
+        # early block above has already deleted and committed this date's
+        # gate_log, so an aborted scan leaves it empty until the next scan
+        # rewrites it. A scan already past this point has published; the
+        # window is the length of one transaction.
+        if kill_switch_active(conn):
+            log.warning("Kill switch fired mid-scan — aborting before "
+                        "publishing (%d signals discarded)", len(signals))
+            return {"as_of": str(as_of), "mode": mode,
+                    "status": "aborted_kill_switch",
+                    "reason": "kill_switch_fired_mid_scan",
+                    "signals": 0, "signals_discarded": len(signals),
+                    "universe": len(universe)}
+
         with conn.cursor() as cur:
             cur.executemany(
                 "insert into gate_log (as_of_date, symbol, failed_gate, reason_code, detail) "
@@ -1144,6 +1182,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
             "vix": regime["vix"],
             "distribution_days": regime["distribution_days"],
             "universe": len(universe),
+            "universe_detail": universe_detail,
             "passed_structure": counts.get("passed_gates_0_3", 0),
             "signals": len(signals),
             "rejections": dict(sorted(counts.items(), key=lambda kv: -kv[1])),

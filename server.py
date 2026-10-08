@@ -1577,11 +1577,22 @@ async def kill_switch(request: Request):
     """
     Stop the engine from generating and publishing new signals.
 
-    SCOPE CORRECTION (from the proposal round): this does NOT cancel
-    orders or flatten positions — grep confirms zero order-placement code
-    exists anywhere in this codebase. The engine only ever computes
-    signals; a human executes manually via "Mark as taken". So this
-    switch means exactly one thing: stop producing new signals.
+    SCOPE: this does NOT cancel orders or flatten positions — there is no
+    order-placement code anywhere in this codebase. The engine only computes
+    signals; a human executes manually via "Mark as taken". What it does:
+
+      1. Removes every scheduled job and persists the flag, so a restart or
+         deploy while killed stays stopped (scheduler.start() declines).
+      2. run_scan() refuses to start while the flag is set — scheduled AND
+         manual (POST /jobs/scan) — returning status skipped_kill_switch.
+      3. run_scan() checks again immediately before publishing; a scan that
+         is mid-loop when this fires aborts there and writes nothing from its
+         publish phase (status aborted_kill_switch).
+
+    It does not interrupt a scan that has already begun publishing (one
+    transaction), and it does not block backtests, cold-start or other jobs,
+    none of which publish signals. Until 6 Oct only (1) existed; (2) and (3)
+    were described here and in the response but not implemented.
 
     Requires the internal key header AND a confirmation token in the
     body — a single authenticated call being enough to silence the
@@ -1620,9 +1631,11 @@ async def kill_switch(request: Request):
     log.warning("KILL SWITCH FIRED. Jobs removed: %s", stopped_jobs)
     return {"stopped": True, "jobs_removed": stopped_jobs,
             "abort_requested": True,
-            "note": "In-flight scans check this before writing further "
-                    "signal rows; already-computed signals for this run "
-                    "are not retroactively removed."}
+            "note": "Scheduled jobs removed. New scans, including manual "
+                    "POST /jobs/scan, return skipped_kill_switch. A scan "
+                    "already running aborts at its publish step and writes "
+                    "nothing from it; one already publishing completes. "
+                    "Clear with POST /jobs/kill-switch/reset."}
 
 
 @app.post("/jobs/kill-switch/reset")
@@ -1986,6 +1999,11 @@ def backtest_results(request: Request):
     finally:
         conn.close()
     return {"run": run}
+
+
+# Step 1 diagnostics (read-only; see platform_routes.py).
+import platform_routes
+platform_routes.register(app, require_internal_key=require_internal_key, ist=IST)
 
 
 @app.get("/jobs/status")
