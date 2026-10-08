@@ -1355,6 +1355,12 @@ def scan_job(request: Request):
                           finished_at=None, error=None)
 
     def run():
+        import engine_mode
+        if engine_mode.is_engine2():
+            # Engine 2 publishes. It records its own run and writes the UI-shaped last_scan_summary itself, so this
+            # route must not overwrite that key with its own compact result.
+            import e2_service
+            return e2_service.run_scan_slot(mode if mode in ("premarket", "intraday", "postclose") else "postclose", "manual")
         from ingest import connect as _connect
         from scan import run_scan
         summary = run_scan(mode=mode)

@@ -82,6 +82,21 @@ _scheduler: BackgroundScheduler | None = None
 _last_runs: dict[str, dict] = {}
 
 
+def _scan_or_shadow(mode: str) -> dict:
+    """
+    The one place a scheduled slot decides WHICH engine publishes (engine_mode.py).
+      ENGINE_MODE=legacy   (default) the original scan, exactly as before.
+      ENGINE_MODE=engine2  Engine 2 publishes from its own slots; this slot keeps its data loading but runs
+                           the original scan in SHADOW (rolled back, recorded for the week-1 comparison).
+    """
+    import engine_mode
+    if not engine_mode.is_engine2():
+        from scan import run_scan
+        return run_scan(mode=mode)
+    import e2_legacy_shadow
+    return e2_legacy_shadow.run_slot(mode)
+
+
 def _record(slot: str, status: str, detail: dict | None = None) -> None:
     _last_runs[slot] = {
         "status": status,
@@ -142,7 +157,7 @@ def _premarket() -> dict:
     finally:
         conn.close()
 
-    return run_scan(mode="premarket")
+    return _scan_or_shadow("premarket")
 
 
 def _skip_today(mode: str) -> dict | None:
@@ -211,7 +226,7 @@ def _intraday() -> dict:
     if TokenStore().valid_token() is None:
         raise RuntimeError("token_invalid")
 
-    return run_scan(mode="intraday")
+    return _scan_or_shadow("intraday")
 
 
 def _postclose() -> dict:
@@ -267,7 +282,7 @@ def _postclose() -> dict:
     finally:
         conn.close()
 
-    return run_scan(mode="postclose")
+    return _scan_or_shadow("postclose")
 
 
 def _sync_universe_job() -> dict:
@@ -641,6 +656,9 @@ def start() -> BackgroundScheduler | None:
         log.info("Scheduled refresh_fundamentals Fridays %s IST, months %s",
                  FUNDAMENTALS_REFRESH_TIME, FUNDAMENTALS_REFRESH_MONTHS)
 
+    import engine_mode
+    log.info("ENGINE_MODE=%s (%s publishes signals; set ENGINE_MODE=legacy and redeploy to roll back)", engine_mode.current(),
+             "Engine 2" if engine_mode.is_engine2() else "the original engine")
     try:                                              # Engine 2 jobs; must never be able to stop the live scheduler
         import e2_service
         e2_service.schedule(_scheduler, _guarded, IST)
@@ -659,8 +677,10 @@ def status() -> dict:
                 "slot": job.id,
                 "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
             })
+    import engine_mode
     return {
         "enabled": SCHEDULER_ENABLED,
+        "engine_mode": engine_mode.current(),
         "now_ist": datetime.now(IST).isoformat(),
         "slots": {**{k: v[0] for k, v in SLOTS.items()},
                   "intraday": f"hourly {INTRADAY_HOURS}"},

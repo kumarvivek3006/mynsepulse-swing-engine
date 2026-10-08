@@ -101,6 +101,14 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
     mult, max_pos = float(pn.regime["size_mult"].iat[-1]), int(pn.regime["max_positions"].iat[-1])
     state = str(pn.regime["state"].iat[-1])
     surv_active = data.coverage.get("surveillance", {}).get("snapshot_days", 0) >= 30
+    # The UI's regime panel reads market_regime (breadth as a % of the universe above its own 50-day
+    # average, index close, VIX). Computed here from the same panel the scan used, so the publisher
+    # writes real figures rather than the regime's 0-100 component scores.
+    ma50 = pn.close.rolling(50).mean().iloc[-1]
+    ok50 = ma50.notna()
+    market = {"breadth_above_50dma": round(float((pn.close.iloc[-1][ok50] > ma50[ok50]).mean() * 100), 2) if ok50.any() else None,
+              "nifty_close": float(data.index_close.iloc[-1]) if data.index_close is not None and len(data.index_close) else None,
+              "vix": float(data.vix.iloc[-1]) if data.vix is not None and len(data.vix) else None}
 
     rows, gated, stale, short = [], Counter(), 0, 0
     by_det = Counter()
@@ -213,7 +221,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
     lag = (pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None) - last.normalize()).days
     out = {"as_of": str(last.date()), "as_of_lag_days": int(lag), "generated_at": pd.Timestamp.now("UTC").isoformat(timespec="seconds"),
            "mode": "shadow", "scan_mode": mode, "provisional": provisional,
-           "regime": regime, "universe_symbols": len(data.frames), "universe": (data.coverage or {}).get("universe"),
+           "regime": regime, "market": market, "universe_symbols": len(data.frames), "universe": (data.coverage or {}).get("universe"),
            "stale_symbols": stale, "symbols_too_short": short, "detectors_run": len(DETECTOR_NAMES),
            "detector_errors": dict(det_errors), "detector_error_samples": det_error_msgs,
            "candidates_raw_by_detector": dict(by_det), "gated": dict(gated),

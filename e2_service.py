@@ -254,6 +254,34 @@ def run_scan_slot(mode: str, trigger: str = "scheduled") -> dict:
     return result
 
 
+def log_report() -> dict:
+    """
+    Write the stored validation report and the pattern diagnosis into the service log, one line per row
+    (prefix E2REPORT|). The report lives in the database and is served at /jobs/engine2-report; this makes
+    the same text readable from the Railway log as well, for whoever cannot reach the endpoint. Read-only.
+    """
+    from ingest import connect
+    conn = connect()
+    try:
+        rep, _ = _get(conn, REPORT_KEY)
+        diag, _ = _get(conn, "engine2_diagnosis")
+    finally:
+        conn.close()
+    if not rep:
+        log.error("E2REPORT| no engine-2 report is stored yet")
+        return {"logged": 0}
+    text = render_markdown(rep)
+    if diag:
+        import e2_diagnosis
+        text += "\n\n" + e2_diagnosis.render_markdown(diag)
+    n = 0
+    for line in text.splitlines():
+        for i in range(0, max(len(line), 1), 1500):
+            log.info("E2REPORT| %s", line[i:i + 1500])
+            n += 1
+    return {"logged": n, "code_version": rep.get("code_version")}
+
+
 def _scan_job(mode: str):
     return lambda: run_scan_slot(mode, "scheduled")
 
@@ -288,6 +316,8 @@ def schedule(scheduler, guarded, ist) -> None:
         now = datetime.now(ist)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=2), timezone=ist),
                           args=["engine2_diagnosis", lambda: _spawn("diagnose", "boot")], id="engine2_diagnosis_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=4), timezone=ist),
+                          args=["engine2_report_log", log_report], id="engine2_report_log_boot", replace_existing=True)
         if now.hour >= 22 or now.hour < 5:                      # deployed overnight: do not wait a day
             scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=3), timezone=ist),
                               args=["engine2_validate", _validate_if_needed], id="engine2_validate_boot", replace_existing=True)
@@ -350,8 +380,11 @@ def auto_scan_brief(conn) -> dict:
     cols = ("mode", "as_of", "status", "reason", "trigger", "finished_at", "duration_sec", "universe", "detectors_firing",
             "candidates", "signals", "degraded")
     failed = [r for r in runs if r.get("status") == "failed"]
+    import engine_mode
     return {
-        "enabled": ENABLED,
+        "enabled": ENABLED, "engine_mode": engine_mode.current(),
+        "publishing": ("Engine 2 publishes to the signals table; the original scan runs in shadow" if engine_mode.is_engine2()
+                       else "the original engine publishes; Engine 2 records in shadow"),
         "slots": {"engine2_premarket": f"Mon-Fri {PREMARKET_TIME} IST", "engine2_intraday": f"Mon-Fri hours {INTRADAY_HOURS} at :{INTRADAY_MINUTE:02d} IST",
                   "engine2_postclose": f"Mon-Fri {POSTCLOSE_TIME} IST", "engine2_validate": f"daily {VALIDATE_TIME} IST"},
         "next_runs": _next_runs(),

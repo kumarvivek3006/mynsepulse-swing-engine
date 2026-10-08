@@ -135,10 +135,17 @@ def record_skip(mode: str, result: dict, trigger: str = "scheduled") -> dict:
     return s
 
 
-def _publishing(would_publish: int) -> dict:
-    return {"channel": "none", "published": 0, "would_publish": int(would_publish),
-            "note": "Engine 2 is a parallel validation service: it records, it does not publish to `signals`. "
-                    "Publishing through the normal channel is the cutover step."}
+def _publishing(would_publish: int, pub: dict | None = None) -> dict:
+    import engine_mode
+    mode = engine_mode.current()
+    if mode == engine_mode.ENGINE2 and pub is not None:
+        return {"engine_mode": mode, "channel": "signals table + last_scan_summary",
+                "published": pub.get("inserted", 0) + pub.get("updated", 0), "would_publish": int(would_publish), **pub}
+    if mode == engine_mode.ENGINE2:
+        return {"engine_mode": mode, "channel": "signals table + last_scan_summary", "published": 0, "would_publish": int(would_publish),
+                "note": "Engine 2 is the publishing engine, and this slot did not reach the publish step."}
+    return {"engine_mode": mode, "channel": "none", "published": 0, "would_publish": int(would_publish),
+            "note": "SHADOW: ENGINE_MODE=legacy, so the original engine publishes and Engine 2 only records."}
 
 
 # ----------------------------------------------------------------------
@@ -321,7 +328,7 @@ def _validation_running(conn) -> bool:
         return False
 
 
-def build_summary(mode: str, out: dict, notes: dict, started: datetime, trigger: str) -> dict:
+def build_summary(mode: str, out: dict, notes: dict, started: datetime, trigger: str, pub: dict | None = None) -> dict:
     import e2_backtest as BT
     from e2_detectors import DETECTORS
     raw = out.get("candidates_raw_by_detector") or {}
@@ -347,7 +354,7 @@ def build_summary(mode: str, out: dict, notes: dict, started: datetime, trigger:
         "signals": out.get("selected", 0), "not_selected_reasons": out.get("not_selected_reasons"),
         "regime": {k: reg.get(k) for k in ("state", "score", "size_mult", "max_positions", "breadth", "vix")},
         "validation_running_concurrently": notes.pop("validation_running", False),
-        "publishing": _publishing(out.get("selected", 0)),
+        "publishing": _publishing(out.get("selected", 0), pub),
         "watchlist": [{"symbol": p["symbol"], "detector": p["detector"], "score": p["score"], "pivot": p["pivot"],
                        "entry_ref": p["plan"]["entry_ref"], "stop": p["plan"]["stop"], "t1": p["plan"]["t1"],
                        "t2": p["plan"]["t2"], "shares": p["plan"]["shares"], "sector": p["sector"]} for p in picks[:25]],
@@ -411,8 +418,22 @@ def run(mode: str, trigger: str = "scheduled") -> dict:
             if errs and len(errs) >= int(out.get("detectors_run") or 0):
                 raise ScanFailed("all_detectors_failed", {"detector_errors": errs})
 
-            s = build_summary(mode, out, notes, started, trigger)
+            import engine_mode
+            pub = None
+            if engine_mode.is_engine2():                  # CUTOVER: Engine 2 publishes; legacy mode never reaches this
+                import e2_publish
+                try:
+                    pub = e2_publish.publish(conn, out, mode, now_ist().date())
+                except Exception as pe:                   # noqa: BLE001 — nothing was written (one transaction)
+                    raise ScanFailed("publish_failed", {"error": f"{type(pe).__name__}: {pe}"[:300]})
+                if pub.get("aborted"):
+                    raise ScanFailed(pub["aborted"], {"note": "kill switch active: nothing was published"})
+
+            s = build_summary(mode, out, notes, started, trigger, pub)
             record(conn, s)
+            if pub is not None:                           # the key the UI reads (/jobs/status); engine2_last_scan_summary stays separate
+                import scan as live_scan
+                live_scan.store_summary(conn, e2_publish.ui_summary(s, out, pub))
             log.info("Engine 2 %s scan ok: as_of %s, universe %s, %d/%d detectors fired, %d candidates, %d selected%s",
                      mode, s["as_of"], s["universe"], s["detectors_firing"], s["detectors_run"], s["candidates"], s["signals"],
                      f", {len(errs)} detector(s) errored" if errs else "")
