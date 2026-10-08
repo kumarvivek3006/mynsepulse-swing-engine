@@ -123,6 +123,10 @@ def run_validation_blocking(trigger: str = "manual") -> dict:
             rep = BT.run_study(data, progress=lambda m: _progress(conn, stage=m))
             _put(conn, REPORT_KEY, rep)
             _progress(conn, state="done", stage="finished", error=None, runtime_sec=rep.get("runtime_sec"))
+            try:                                                    # the finished report goes into the service log (E2REPORT| lines)
+                log_report()
+            except Exception:                                       # noqa: BLE001
+                log.exception("could not log the finished report")
             return {"state": "done", "runtime_sec": rep.get("runtime_sec")}
         except Exception as e:                                    # noqa: BLE001
             log.exception("engine2 validation failed")
