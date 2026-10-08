@@ -401,6 +401,12 @@ def _refresh_fundamentals_job() -> dict:
                 problems.append(problem)
         if problems:
             raise RuntimeError("fundamentals_refresh_degraded: " + "; ".join(problems))
+        # One summary row under THIS slot's own name. The two syncs log under
+        # their own names, which a manual /jobs/fundamentals run shares, so
+        # only this row proves the scheduled slot (new code) ran.
+        _run_log(conn, "refresh_fundamentals", "success",
+                 sum(int((out.get(n) or {}).get("written") or 0) for n, _ in jobs),
+                 f"source={out['source']}")
         return out
     finally:
         conn.close()
@@ -441,10 +447,27 @@ def _data_quality_job() -> dict:
             raise RuntimeError("data_quality_critical: " + "; ".join(rep["critical"])[:400])
         _run_log(conn, "data_quality", "success", rep["universe"],
                  "; ".join(rep["warnings"])[:500] or None)
+        _probe_once(conn)
         return {"severity": rep["severity"], "universe": rep["universe"],
                 "warnings": rep["warnings"]}
     finally:
         conn.close()
+
+
+def _probe_once(conn) -> None:
+    """
+    Step 1.5, hands-off: the first evening this slot runs with a valid Upstox
+    token, probe historical intraday availability and store the verdict. Runs
+    once (a stored verdict is kept). It must never fail the data-quality slot
+    or hide its report, so every error is logged and swallowed; the status
+    endpoint shows "pending" until a verdict exists.
+    """
+    try:
+        import data_probe
+        data_probe.probe_once(conn)
+    except Exception:
+        conn.rollback()
+        log.exception("Intraday probe did not complete (will retry next evening)")
 
 
 def _sync_holidays_job() -> dict:

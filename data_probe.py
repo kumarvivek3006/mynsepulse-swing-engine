@@ -123,3 +123,39 @@ def probe_intraday(client, conn, symbol: str = "RELIANCE",
         "note": ("The engine stores NO intraday history; this probe only shows what the API "
                  "could supply. Using it would mean a new fetch-and-store path."),
     }
+
+
+PROBE_KEY = "intraday_probe_latest"
+
+
+def store_result(conn, result: dict) -> None:
+    """Keep the latest probe result in engine_settings so it can be read later
+    without anyone having to call the probe (and so it survives a restart)."""
+    import json
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into engine_settings (key, value, updated_at) values (%s, %s::jsonb, now()) "
+            "on conflict (key) do update set value = excluded.value, updated_at = now()",
+            (PROBE_KEY, json.dumps(result, default=str)))
+    conn.commit()
+
+
+def probe_once(conn, client=None, **kw) -> dict | None:
+    """
+    Run the probe unless a usable result is already stored. Returns the stored
+    or fresh result, or None when it cannot run (no valid token). A stored
+    result that is an ERROR is retried; a stored verdict is kept.
+    """
+    with conn.cursor() as cur:
+        cur.execute("select value from engine_settings where key = %s", (PROBE_KEY,))
+        row = cur.fetchone()
+    if row and isinstance(row[0], dict) and "verdict" in row[0]:
+        return row[0]
+    if client is None:
+        from upstox_client import TokenStore, UpstoxClient
+        if TokenStore().valid_token() is None:
+            return None
+        client = UpstoxClient()
+    result = probe_intraday(client, conn, **kw)
+    store_result(conn, result)
+    return result

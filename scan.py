@@ -162,6 +162,43 @@ def expected_last_session(now: datetime | None = None) -> date:
             return day
 
 
+
+def store_summary(conn, summary: dict) -> None:
+    """
+    Persist a COMPLETED scan's summary so it is queryable however the scan was
+    started. Until Step 1 only the manual POST /jobs/scan route wrote
+    engine_settings.last_scan_summary; the scheduled premarket / intraday /
+    postclose scans returned their summary to memory and it was lost, so "what
+    did the last scheduled scan see?" had no answer. Two keys:
+
+      last_scan_summary    latest completed scan, any mode (the key the manual
+                           route has always written, so existing readers see
+                           no change in shape)
+      last_completed_scan  identical value, written ONLY here, i.e. only for a
+                           scan that ran to completion. The manual route also
+                           stores skipped / aborted results under
+                           last_scan_summary, which would otherwise overwrite
+                           the last real run.
+
+    Bookkeeping must never fail a scan that has already published: a failure
+    is logged loudly and rolled back, not raised.
+    """
+    import json
+    try:
+        payload = json.dumps(summary, default=str)
+        with conn.cursor() as cur:
+            for key in ("last_scan_summary", "last_completed_scan"):
+                cur.execute(
+                    "insert into engine_settings (key, value, updated_at) "
+                    "values (%s, %s::jsonb, now()) "
+                    "on conflict (key) do update set value = excluded.value, "
+                    "updated_at = now()", (key, payload))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("Could not persist the scan summary (scan itself completed)")
+
+
 def ensure_bars_current(conn) -> dict:
     """
     Refresh prices only when they are actually behind.
@@ -550,8 +587,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
                 "regime_gate": "skipped",
                 "regime_gate_detail": regime_gate_detail,
             }
-            # run_scan returns; server.py is what persists to
-            # engine_settings.last_scan_summary. There is no _store_summary.
+            store_summary(conn, summary)
             return summary
 
         # Trailing-performance throttle.
@@ -1237,6 +1273,7 @@ def run_scan(as_of: date | None = None, mode: str = "postclose") -> dict:
         }
         log.info("Scan complete [%s]: %d signals from %d structural candidates (%s regime)",
                  mode, len(signals), counts.get("passed_gates_0_3", 0), regime["state"])
+        store_summary(conn, summary)
         return summary
 
     finally:

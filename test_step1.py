@@ -268,6 +268,12 @@ check("kill fired MID-scan -> aborted_kill_switch, publish phase wrote nothing",
 res, st = run_scan_with_kill(lambda n: False)
 pub = [x for x in st["log"] if x.startswith(PUBLISH)]
 check("control: never killed -> publish phase DOES write (so the abort test is not vacuous)", len(pub) >= 3, str(len(pub)))
+persist = [x for x in st["log"] if x.startswith("insert into engine_settings")]
+check("a COMPLETED scan persists its own summary (last_scan_summary + last_completed_scan), whatever started it",
+      len(persist) == 2, str(persist))
+res_k, st_k = run_scan_with_kill(lambda n: n >= 2)
+check("...and an ABORTED scan persists nothing (it would overwrite the last real run)",
+      not [x for x in st_k["log"] if x.startswith("insert into engine_settings")], str(st_k["log"][-4:]))
 check("universe breakdown (active / dropped / excluded / scanned) reaches the scan summary",
       res.get("universe_detail", {}).get("scanned") == 5 and res.get("universe") == 5, str({k: res.get(k) for k in ("universe", "universe_detail")}))
 
@@ -726,6 +732,189 @@ with mock.patch.object(upstox_client, "TokenStore", lambda: _TS2("t")), mock.pat
     bad_arg = cl.get("/jobs/intraday-probe?intervals=five", headers=H)
 check("intraday-probe: returns the availability verdict per interval", pr.status_code == 200 and set(pr.json()["verdict"]) == {"5", "15"}, pr.text[:160])
 check("intraday-probe: a malformed intervals argument is a 400, not a 500", bad_arg.status_code == 400)
+
+
+# =====================================================================
+print("G. /jobs/step-status: the one-call Step 1 status, and the hands-off pieces behind it")
+import step_status as SS
+import data_probe as DPB
+IST_ = scheduler.IST
+T0 = datetime(2026, 10, 8, 22, 19, tzinfo=IST_)                  # "this deploy started"
+NEXT = {"premarket": "2026-10-09T08:15:00+05:30", "intraday": "2026-10-09T10:00:00+05:30",
+        "postclose": "2026-10-09T18:30:00+05:30", "refresh_fundamentals": "2026-10-09T19:30:00+05:30",
+        "data_quality": "2026-10-09T19:00:00+05:30"}
+
+def put(conn, key, value, at=None):
+    with conn.cursor() as cur:
+        cur.execute("insert into engine_settings (key, value, updated_at) values (%s, %s::jsonb, coalesce(%s, now())) "
+                    "on conflict (key) do update set value = excluded.value, updated_at = excluded.updated_at",
+                    (key, json.dumps(value), at))
+    conn.commit()
+
+def seed_universe(conn):
+    for sym, kw in {"AAA": {}, "BBB": {}, "CCC": {"in_index": False}, "BIRET": {}}.items():
+        add_symbol(conn, sym, **kw)
+    conn.commit()
+
+def run_log(conn, job, status, rows=0, err=None, at=None):
+    with conn.cursor() as cur:
+        cur.execute("insert into ingestion_runs (job, finished_at, status, rows_written, error) "
+                    "values (%s, coalesce(%s, now()), %s, %s, %s)", (job, at, status, rows, err))
+    conn.commit()
+
+conn = fresh(); seed_universe(conn)
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("live corrected universe comes from the symbols table under the same rule (AAA, BBB; CCC left the index, BIRET excluded)",
+      r["universe"]["symbols_table_now"]["scanned"] == 2 and r["universe"]["symbols_table_now"]["dropped_not_in_index"] == 1)
+check("nothing recorded yet -> NOT closed, both blockers named",
+      r["step1"]["closed"] is False and [b["fact"] for b in r["step1"]["blocking"]] == ["scan on the new code", "fundamentals refresh on the new code"], str(r["step1"]["blocking"]))
+check("...and each blocker says when it resolves ON ITS OWN (the next scheduled slot), so nobody has to act",
+      "2026-10-09T08:15" in r["step1"]["blocking"][0]["resolves"] and "2026-10-09T19:30" in r["step1"]["blocking"][1]["resolves"], str(r["step1"]["blocking"]))
+check("probe and data quality read 'pending' with their next attempt, not an error",
+      r["intraday_probe"]["status"] == "pending" and r["data_quality"]["status"] == "pending" and r["data_quality"]["next_scheduled"] == NEXT["data_quality"])
+check("deploy block reports the running code's capabilities (no scan needed to know the filter is in)",
+      r["deploy"]["running_code"]["universe_filter"] is True and r["deploy"]["running_code"]["persists_scan_summary"] is True
+      and r["deploy"]["process_started_at"] == T0.isoformat())
+check("whole payload is JSON-serialisable", json.dumps(r, default=str) is not None)
+
+# the OLD scan's summary (527, no universe_detail), written BEFORE this deploy
+put(conn, "last_scan_summary", {"mode": "postclose", "as_of": "2026-10-08", "universe": 527}, T0 - timedelta(hours=3))
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+b0 = r["step1"]["blocking"][0]
+check("old-code summary (527, no universe_detail, predates the deploy) -> blocked with exactly that reason",
+      r["scan"]["predates_this_deploy"] is True and "predates this deployment" in b0["why"] and r["step1"]["facts"]["universe_detail_populated"]["ok"] is False, b0["why"])
+
+# the new code ran after the deploy
+new = {"mode": "premarket", "as_of": "2026-10-09", "universe": 2, "signals": 1, "regime": "neutral",
+       "universe_detail": {"scanned": 2, "active": 4, "in_nifty500": 3, "dropped_not_in_index": 1, "dropped_excluded_symbols": 1}}
+put(conn, "last_completed_scan", new, T0 + timedelta(hours=10))
+put(conn, "last_scan_summary", new, T0 + timedelta(hours=10))
+r = SS.build(conn, next_runs=NEXT, token_valid=False, started_at=T0)
+f = r["step1"]["facts"]
+check("new-code scan with the corrected count -> facts 1 and 2 true",
+      f["scanned_universe_is_corrected"]["ok"] and f["universe_detail_populated"]["ok"] and f["scanned_universe_is_corrected"]["corrected_universe_now"] == 2, str(f))
+check("...only the fundamentals fact is left, and it warns that there is no valid token right now",
+      [b["fact"] for b in r["step1"]["blocking"]] == ["fundamentals refresh on the new code"] and "log in" in r["step1"]["blocking"][0]["resolves"], str(r["step1"]["blocking"]))
+
+# a manual /jobs/fundamentals run logs under the sync names: it must NOT close the step
+run_log(conn, "sync_shareholding", "success", 400); run_log(conn, "sync_quarterly_results", "success", 400)
+run_log(conn, "sync_shareholding_upstox", "success", 400)
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("a manual/old-path fundamentals run does NOT satisfy 'ran on the new code'", r["step1"]["closed"] is False)
+run_log(conn, "refresh_fundamentals", "failed", 0, "token_invalid")
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("a FAILED scheduled refresh stays blocking and shows its error", r["step1"]["closed"] is False and "token_invalid" in r["step1"]["blocking"][0]["why"], str(r["step1"]["blocking"]))
+run_log(conn, "refresh_fundamentals", "success", 812, "source=upstox", at=datetime.now(IST_) + timedelta(seconds=5))
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("scheduled refresh succeeded -> Step 1 CLOSED, nothing left blocking, rows written reported",
+      r["step1"]["closed"] is True and r["step1"]["blocking"] == [] and r["fundamentals_refresh"]["last_run"]["rows_written"] == 812, str(r["step1"]))
+
+# a later skipped/aborted result must not hide the last real run
+put(conn, "last_scan_summary", {"mode": "intraday", "status": "skipped_kill_switch"}, T0 + timedelta(hours=11))
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("a later skipped_kill_switch result is shown as the latest event but does not erase the last completed scan",
+      r["scan"]["universe"] == 2 and r["scan"]["latest_event"]["status"] == "skipped_kill_switch" and r["step1"]["closed"] is True, str(r["scan"]["latest_event"]))
+
+# universe that disagrees with the rule
+add_symbol(conn, "DDD"); conn.commit()
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("last scan count (2) != the rule's count now (3) -> fact 1 false with both numbers in the reason",
+      r["step1"]["facts"]["scanned_universe_is_corrected"]["ok"] is False and "2 != corrected universe 3" in " ".join(b["why"] for b in r["step1"]["blocking"]), str(r["step1"]["blocking"]))
+
+# a scan ran AFTER the deploy yet has no universe_detail: say it is a bug, don't wait silently
+put(conn, "last_completed_scan", {"mode": "premarket", "universe": 527}, T0 + timedelta(hours=12))
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("scan after the deploy with no universe_detail -> flagged as unexpected, not as 'wait'",
+      any("unexpected" in b["why"] for b in r["step1"]["blocking"]), str(r["step1"]["blocking"]))
+
+# data quality + probe sections when present
+put(conn, "data_quality_latest", {"severity": "warn", "stale": {"count": 3, "pct": 0.6, "expected_last_session": "2026-10-09"},
+                                  "critical": [], "warnings": ["fundamentals: 34 symbols with none"]})
+put(conn, "intraday_probe_latest", {"verdict": {"5": {"full_sessions_back_to": "2025-10-08"}}})
+r = SS.build(conn, next_runs=NEXT, token_valid=True, started_at=T0)
+check("data quality section: severity, stale-bar count, last run time",
+      r["data_quality"]["severity"] == "warn" and r["data_quality"]["stale_bars"] == 3 and r["data_quality"]["last_run_at"])
+check("probe section: done, with the verdict", r["intraday_probe"]["status"] == "done" and r["intraday_probe"]["verdict"]["5"]["full_sessions_back_to"] == "2025-10-08")
+
+# ---- scan.store_summary
+conn = fresh()
+scan.store_summary(conn, {"universe": 497, "universe_detail": {"scanned": 497}, "mode": "postclose"})
+with conn.cursor() as cur:
+    cur.execute("select key, value->>'universe' from engine_settings where key in ('last_scan_summary','last_completed_scan') order by key")
+    rows = cur.fetchall()
+check("store_summary writes both keys with the same value", rows == [("last_completed_scan", "497"), ("last_scan_summary", "497")], str(rows))
+class _Boom:
+    rolled = False
+    def cursor(s): raise RuntimeError("db gone")
+    def rollback(s): s.rolled = True
+bm = _Boom()
+try:
+    scan.store_summary(bm, {"universe": 1}); swallowed = True
+except Exception:
+    swallowed = False
+check("a bookkeeping failure never fails a scan that already published (logged, rolled back)", swallowed and bm.rolled)
+
+# ---- refresh job: its own success row, and only on success
+conn = fresh()
+for i in range(10):
+    add_symbol(conn, f"X{i}")
+def ok_sh(c, client, symbols=None): return {"written": 300, "failed": 0, "empty": 0}
+def ok_q(c, client, symbols=None): return {"written": 120, "failed": 0, "empty": 0}
+with mock.patch.object(F, "UPSTOX_FUNDAMENTALS_ENABLED", True), \
+     mock.patch.object(F, "sync_shareholding_upstox", ok_sh), mock.patch.object(F, "sync_quarterly_results_upstox", ok_q), \
+     mock.patch.object(upstox_client, "TokenStore", lambda: _TS("tok")), mock.patch.object(upstox_client, "UpstoxClient", lambda: object()), \
+     mock.patch.object(scheduler, "_skip_today", return_value=None), mock.patch.object(ingest, "connect", side_effect=dsn_conn):
+    scheduler._refresh_fundamentals_job()
+with psycopg.connect(DSN) as c2:
+    rows = c2.execute("select job, status, rows_written, error from ingestion_runs where job = 'refresh_fundamentals'").fetchall()
+check("successful refresh writes ONE summary row under its own slot name with the total and the source",
+      rows == [("refresh_fundamentals", "success", 420, "source=upstox")], str(rows))
+
+# ---- probe_once
+conn = fresh()
+with conn.cursor() as cur:
+    cur.execute("insert into symbols (symbol, is_active, in_nifty500, upstox_instrument_key) values ('RELIANCE', true, true, 'NSE_EQ|INE002A01018')")
+conn.commit()
+fc = FakeClient(date(2025, 1, 1))
+r1 = DPB.probe_once(conn, fc, symbol="RELIANCE", intervals=(5,), today=date(2026, 10, 8), lookbacks=(1, 30))
+n1 = len(fc.paths)
+r2 = DPB.probe_once(conn, fc, symbol="RELIANCE", intervals=(5,), today=date(2026, 10, 8), lookbacks=(1, 30))
+check("probe_once runs the probe, stores the verdict, and a second call makes NO further API calls",
+      "verdict" in r1 and len(fc.paths) == n1 and r2 == json.loads(json.dumps(r1, default=str)), str((n1, len(fc.paths))))
+conn = fresh()
+with mock.patch.object(upstox_client, "TokenStore", lambda: _TS(None)):
+    check("probe_once without a valid token does nothing and returns None (status stays 'pending')", DPB.probe_once(conn) is None)
+put(conn, "intraday_probe_latest", {"error": "no instrument key stored for RELIANCE"})
+with conn.cursor() as cur:
+    cur.execute("insert into symbols (symbol, is_active, in_nifty500, upstox_instrument_key) values ('RELIANCE', true, true, 'k')")
+conn.commit()
+fc = FakeClient(date(2025, 1, 1))
+r3 = DPB.probe_once(conn, fc, symbol="RELIANCE", intervals=(5,), today=date(2026, 10, 8), lookbacks=(1,))
+check("a stored ERROR result is retried (only a stored verdict is kept)", "verdict" in r3 and len(fc.paths) == 1)
+
+# ---- the data-quality slot probes once and a probe failure never hides its report
+conn = fresh(); build_dq(conn)
+def _probe_boom(conn_, *a, **k): raise RuntimeError("upstox 500")
+with mock.patch.object(DQ, "_now", return_value=THU_1900_IST), mock.patch.object(scheduler, "_skip_today", return_value=None), \
+     mock.patch.object(ingest, "connect", side_effect=dsn_conn), mock.patch.object(DPB, "probe_once", _probe_boom), \
+     mock.patch.object(MC, "expected_last_session", return_value=EXPECTED):
+    out = scheduler._data_quality_job()
+with psycopg.connect(DSN) as c2:
+    stored = c2.execute("select value->>'severity' from engine_settings where key='data_quality_latest'").fetchone()
+check("a probe that raises is swallowed: the data-quality slot still succeeds and its report is stored",
+      out["severity"] == "ok" and stored and stored[0] == "ok", str((out, stored)))
+
+# ---- the route, through the real app
+conn = fresh(); seed_universe(conn)
+put(conn, "last_completed_scan", new, datetime.now(IST_) + timedelta(hours=1))
+with mock.patch.object(ingest, "connect", side_effect=dsn_conn):
+    unauth = cl.get("/jobs/step-status")
+    ok = cl.get("/jobs/step-status", headers=H)
+check("GET /jobs/step-status: no key -> 401", unauth.status_code == 401)
+body = ok.json() if ok.status_code == 200 else {}
+check("...with the key -> 200 and the full shape (closed flag, facts, blocking, universe, scan, deploy, fundamentals, data quality, probe)",
+      ok.status_code == 200 and {"step1", "universe", "scan", "deploy", "fundamentals_refresh", "data_quality", "intraday_probe"} <= set(body), ok.text[:200])
+check("...and says plainly that Step 1 is not closed while the refresh is outstanding", body.get("step1", {}).get("closed") is False)
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

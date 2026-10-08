@@ -10,6 +10,7 @@ imported by scan.py or the scheduler's scan path.
   GET  /jobs/data-quality        latest stored report
   POST /jobs/data-quality        run the checks now (synchronous, a few seconds)
   GET  /jobs/intraday-probe      is historical intraday data available, how far back
+  GET  /jobs/step-status         ONE json: is Step 1 closed, and if not why and when
 """
 from __future__ import annotations
 
@@ -127,6 +128,36 @@ def register(app, *, require_internal_key, ist):
         intervals = _int_list(request.query_params.get("intervals", ""), data_probe.DEFAULT_INTERVALS)
         conn = connect()
         try:
-            return data_probe.probe_intraday(UpstoxClient(), conn, symbol, intervals)
+            result = data_probe.probe_intraday(UpstoxClient(), conn, symbol, intervals)
+            if "verdict" in result:
+                data_probe.store_result(conn, result)     # readable later via /jobs/step-status
+            return result
+        finally:
+            conn.close()
+
+    @app.get("/jobs/step-status")
+    def step_status(request: Request):
+        """
+        The single status call for the rebuild's Step 1. Read-only. Same
+        x-internal-key header as /jobs/status.
+        """
+        require_internal_key(request)
+        import os
+        import scheduler
+        import step_status as SS
+        from ingest import connect
+
+        next_runs = {}
+        if scheduler._scheduler:
+            for job in scheduler._scheduler.get_jobs():
+                next_runs[job.id] = job.next_run_time.isoformat() if job.next_run_time else None
+        try:
+            from upstox_client import TokenStore
+            token_valid = TokenStore().valid_token() is not None
+        except Exception:
+            token_valid = None
+        conn = connect()
+        try:
+            return SS.build(conn, next_runs=next_runs, token_valid=token_valid, env=dict(os.environ))
         finally:
             conn.close()
