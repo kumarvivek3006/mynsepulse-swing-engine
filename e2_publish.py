@@ -250,8 +250,9 @@ def publish(conn, out: dict, mode: str, today: date | None = None) -> dict:
         conn.rollback()
         log.exception("Engine 2 publish failed; nothing was written")
         raise
-    log.info("Engine 2 published [%s %s]: %d new, %d updated, %d withdrawn, %d malformed", mode, as_of, res["inserted"],
-             res["updated"], res["withdrawn"], res["malformed"])
+    log.info("Engine 2 published [%s %s]: %d new, %d updated, %d withdrawn, %d malformed | unchanged %d, already taken %d | signals: %s",
+             mode, as_of, res["inserted"], res["updated"], res["withdrawn"], res["malformed"], res["unchanged"],
+             res["skipped_already_taken"], ", ".join(res["symbols"]) or "none")
     return res
 
 

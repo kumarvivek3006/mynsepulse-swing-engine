@@ -151,6 +151,11 @@ def run(mode: str) -> dict:
             lg = {r["symbol"] for r in result.get("would_have_published", [])}
             result["comparison_with_engine2"] = {"both": sorted(lg & e2), "only_original": sorted(lg - e2), "only_engine2": sorted(e2 - lg),
                                                  "n_original": len(lg), "n_engine2": len(e2)}
+        cmp_ = result.get("comparison_with_engine2")
+        if cmp_:
+            log.info("legacy shadow [%s %s]: original would have published %d (%s); Engine 2 published %d; both: %s; only original: %s; only Engine 2: %s",
+                     mode, result.get("as_of"), cmp_["n_original"], ", ".join(sorted(r["symbol"] for r in result.get("would_have_published", []))) or "none",
+                     cmp_["n_engine2"], cmp_["both"] or "none", cmp_["only_original"] or "none", cmp_["only_engine2"] or "none")
         result["finished_at"] = datetime.now(IST).isoformat(timespec="seconds")
         _put(conn, LATEST_KEY, result)
         runs = list(_get(conn, RUNS_KEY) or [])
