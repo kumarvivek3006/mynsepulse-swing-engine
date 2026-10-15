@@ -135,6 +135,15 @@ def record_skip(mode: str, result: dict, trigger: str = "scheduled") -> dict:
     return s
 
 
+def detector_line(mode: str, out: dict) -> str:
+    """Raw candidates per detector, what the portfolio selected from each, and why the rest were not selected. Observability only."""
+    from collections import Counter
+    raw = {k: int(v) for k, v in sorted((out.get("candidates_raw_by_detector") or {}).items()) if v}
+    sel = Counter(p.get("detector") for p in (out.get("picks") or []))
+    return (f"Engine 2 {mode} detectors: raw candidates {raw or 'none'} | selected {dict(sorted(sel.items())) or 'none'} | "
+            f"not selected {out.get('not_selected_reasons') or {}}")
+
+
 def regime_line(mode: str, out: dict) -> str:
     """One log line with Engine 2's own regime: the band it chose and why. The *_score fields are the 0-100 component
     scores the regime is built from (the VIX score is 100 minus INDIAVIX's 252-session percentile rank, NOT the VIX
@@ -451,6 +460,7 @@ def run(mode: str, trigger: str = "scheduled") -> dict:
                      f", {len(errs)} detector(s) errored" if errs else "")
             try:
                 log.info("%s", regime_line(mode, out))
+                log.info("%s", detector_line(mode, out))
             except Exception:                             # noqa: BLE001 — a log line must never fail a scan that already published
                 log.exception("Engine 2 regime log line failed (scan unaffected)")
             return s
