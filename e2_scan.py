@@ -135,6 +135,18 @@ def record_skip(mode: str, result: dict, trigger: str = "scheduled") -> dict:
     return s
 
 
+def regime_line(mode: str, out: dict) -> str:
+    """One log line with Engine 2's own regime: the band it chose and why. The *_score fields are the 0-100 component
+    scores the regime is built from (the VIX score is 100 minus INDIAVIX's 252-session percentile rank, NOT the VIX
+    level); vix / breadth_pct / nifty are the real market figures. Observability only: nothing here feeds a decision."""
+    r, m = out.get("regime") or {}, out.get("market") or {}
+    f = lambda v, n=1: "n/a" if v is None else (f"{float(v):.{n}f}" if isinstance(v, (int, float)) else str(v))
+    return (f"Engine 2 {mode} regime: {r.get('state')} (score {f(r.get('score'))}, size_mult {f(r.get('size_mult'), 2)}, "
+            f"max_positions {r.get('max_positions')}) | component scores: index {f(r.get('index'))}, breadth {f(r.get('breadth'))}, "
+            f"vix {f(r.get('vix'))}, sector {f(r.get('sector'))}, ad {f(r.get('ad'))} | market: INDIAVIX {f(m.get('vix'), 2)} "
+            f"(bar {m.get('vix_date') or 'n/a'}), breadth_above_50dma {f(m.get('breadth_above_50dma'))}%, nifty {f(m.get('nifty_close'), 2)}")
+
+
 def _publishing(would_publish: int, pub: dict | None = None) -> dict:
     import engine_mode
     mode = engine_mode.current()
@@ -437,6 +449,10 @@ def run(mode: str, trigger: str = "scheduled") -> dict:
             log.info("Engine 2 %s scan ok: as_of %s, universe %s, %d/%d detectors fired, %d candidates, %d selected%s",
                      mode, s["as_of"], s["universe"], s["detectors_firing"], s["detectors_run"], s["candidates"], s["signals"],
                      f", {len(errs)} detector(s) errored" if errs else "")
+            try:
+                log.info("%s", regime_line(mode, out))
+            except Exception:                             # noqa: BLE001 — a log line must never fail a scan that already published
+                log.exception("Engine 2 regime log line failed (scan unaffected)")
             return s
         except ScanFailed as f:
             try:

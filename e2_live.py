@@ -108,7 +108,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
     ok50 = ma50.notna()
     market = {"breadth_above_50dma": round(float((pn.close.iloc[-1][ok50] > ma50[ok50]).mean() * 100), 2) if ok50.any() else None,
               "nifty_close": float(data.index_close.iloc[-1]) if data.index_close is not None and len(data.index_close) else None,
-              "vix": float(data.vix.iloc[-1]) if data.vix is not None and len(data.vix) else None}
+              "vix": float(data.vix.iloc[-1]) if data.vix is not None and len(data.vix) else None,
+              "vix_date": str(data.vix.index[-1])[:10] if data.vix is not None and len(data.vix) else None}
 
     rows, gated, stale, short = [], Counter(), 0, 0
     by_det = Counter()
