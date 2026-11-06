@@ -29,6 +29,8 @@ live strategy engine, the signals table or the live scan.
   GET  /jobs/engine2-actions         the 6 Nov actions study: detector-specific scoring, strict pocket_pivot, vcp armed port (?format=md)
   POST /jobs/engine2/actions         run it now (also runs ~20 minutes after a deploy while E2_ACTIONS_BOOT=1)
   GET  /jobs/engine2-exits           the 6 Nov exit redesign study: variants A-D vs the live exits (?format=md); logged as E2EXIT| lines
+  GET  /jobs/engine2-fwd             the 7 Nov forward-return test: market-adjusted 5/10/20-session returns by detector, no stops (?format=md); E2FWD| lines
+  POST /jobs/engine2/fwd             run it now (also runs ~24 minutes after a deploy while E2_FWD_BOOT=1)
   POST /jobs/engine2/exits           run it now (also runs ~22 minutes after a deploy while E2_EXITS_BOOT=1)
   POST /jobs/engine2/diagnose        re-run the disabled-pattern diagnosis now (it also runs ahead of every validation)
 """
@@ -196,11 +198,20 @@ def _actions_if_idle() -> dict:
 
 def _exits_if_idle() -> dict:
     """Boot job for the exit redesign study (loads the full history: never alongside a validation run)."""
-    if os.environ.get("E2_EXITS_BOOT", "1") != "1":
+    if os.environ.get("E2_EXITS_BOOT", "0") != "1":                # finished 6 Nov: no variant passed
         return {"skipped": "E2_EXITS_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/exits when it has finished"}
     return _spawn("exits", "boot")
+
+
+def _fwd_if_idle() -> dict:
+    """Boot job for the forward-return test (loads the full history: never alongside a validation run)."""
+    if os.environ.get("E2_FWD_BOOT", "1") != "1":
+        return {"skipped": "E2_FWD_BOOT is not 1"}
+    if _running_here():
+        return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwd when it has finished"}
+    return _spawn("fwd", "boot")
 
 
 def _validate_if_needed() -> dict:
@@ -405,6 +416,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_actions", _actions_if_idle], id="engine2_actions_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=24), timezone=ist),
                           args=["engine2_exits", _exits_if_idle], id="engine2_exits_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=26), timezone=ist),
+                          args=["engine2_fwd", _fwd_if_idle], id="engine2_fwd_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
                           args=["engine2_candidates_log", log_candidates], id="engine2_candidates_log_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=8), timezone=ist),
@@ -768,6 +781,27 @@ def register(app, *, require_internal_key, ist) -> None:
             return {"started": False, "reason": "a validation run is in progress"}
         return _spawn("exits", "manual")
 
+    @app.get("/jobs/engine2-fwd")
+    def e2_fwd_view(request: Request, format: str = "json"):
+        """The forward-return test (measurement only)."""
+        require_internal_key(request)
+        import e2_fwd
+        conn = connect()
+        try:
+            d, _ = _get(conn, e2_fwd.KEY)
+        finally:
+            conn.close()
+        if not d:
+            raise HTTPException(404, "the forward-return test has not run yet (POST /jobs/engine2/fwd to start it)")
+        return PlainTextResponse(e2_fwd.render_markdown(d)) if format == "md" else d
+
+    @app.post("/jobs/engine2/fwd")
+    def e2_fwd_now(request: Request):
+        require_internal_key(request)
+        if _running_here():
+            return {"started": False, "reason": "a validation run is in progress"}
+        return _spawn("fwd", "manual")
+
     @app.get("/jobs/engine2-shadow")
     def e2_shadow(request: Request):
         require_internal_key(request)
@@ -860,6 +894,9 @@ if __name__ == "__main__":                                    # the child proces
     if kind == "defdiag":
         import e2_defdiag
         print(json.dumps({k: v for k, v in e2_defdiag.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "fwd":
+        import e2_fwd
+        print(json.dumps({k: v for k, v in e2_fwd.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "exits":
         import e2_exits
         print(json.dumps({k: v for k, v in e2_exits.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))

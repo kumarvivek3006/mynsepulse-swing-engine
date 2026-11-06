@@ -45,6 +45,13 @@ LIVE_LOOKBACK = 40
 # Detectors that are SHADOWED: scored, logged with outcomes in the forward log, shown in the candidate views - but never selected into the
 # book and so never published to signals. (7 Nov: pocket_pivot, until the exits are redesigned.)
 SHADOW_DETECTORS = {d.strip() for d in os.environ.get("E2_SHADOW_DETECTORS", "pocket_pivot").split(",") if d.strip()}
+# Publishing whitelist (7 Nov owner order): when set, ONLY these detectors can be selected into the book and published; every other detector
+# still runs, is scored, and is logged in the forward log, but is shadowed. Empty = no whitelist.
+PUBLISH_DETECTORS = {d.strip() for d in os.environ.get("E2_PUBLISH_DETECTORS", "").split(",") if d.strip()}
+
+
+def is_shadow(detector: str) -> bool:
+    return detector in SHADOW_DETECTORS or (bool(PUBLISH_DETECTORS) and detector not in PUBLISH_DETECTORS)
 
 
 def _get(conn, key):
@@ -164,7 +171,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
                          "points": SC.points_for(frac, c.detector),   # what each component added under the weights in force (detector or spec)
                          "catalyst_source": frac["_catalyst_source"], "next_results": nxt, "plan": plan, "meta": c.meta})
     for r_ in rows:
-        r_["shadow"] = r_["detector"] in SHADOW_DETECTORS
+        r_["shadow"] = is_shadow(r_["detector"])
     rows.sort(key=lambda r: (r["shadow"], -r["score"]))             # shadowed detectors rank after every publishable candidate
     for i_, r_ in enumerate(rows, 1):
         r_["rank"] = i_                                         # position in the score ranking, before any cap is applied
@@ -261,7 +268,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
            "candidates": len(rows), "selected": len(sel), "not_selected_reasons": dict(rej),
            "picks": [r for r in rows if r["selected"]], "all_candidates": rows[:150],
            "forward_log": forward_summary(flog) if not provisional else None, "log_resolved_this_run": resolved,
-           "shadow_detectors": sorted(SHADOW_DETECTORS),
+           "shadow_detectors": sorted(SHADOW_DETECTORS), "publish_only": sorted(PUBLISH_DETECTORS),
            "note": "Shadow mode: recorded only. Nothing here is published to signals."}
     if extra:
         out.update(extra)
