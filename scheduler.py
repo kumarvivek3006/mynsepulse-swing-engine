@@ -665,6 +665,12 @@ def start() -> BackgroundScheduler | None:
     except Exception:                                 # noqa: BLE001
         log.exception("Engine 2 scheduling not registered (live scheduler unaffected)")
 
+    try:                                              # daily unreviewed-signal count; never able to stop the scheduler
+        import verification
+        verification.schedule(_scheduler, _guarded, IST)
+    except Exception:                                 # noqa: BLE001
+        log.exception("Verification reconciliation not scheduled (live scheduler unaffected)")
+
     _scheduler.start()
     return _scheduler
 

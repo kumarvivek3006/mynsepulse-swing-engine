@@ -46,6 +46,16 @@ store = TokenStore()
 
 
 @app.on_event("startup")
+def _apply_verification_schema() -> None:
+    """Add signals.verification_* if missing. Never raises: a failure is logged at ERROR and the service still starts."""
+    try:
+        import verification
+        verification.ensure_schema()
+    except Exception:
+        log.exception("Verification schema step failed (service unaffected)")
+
+
+@app.on_event("startup")
 def _start_scheduler() -> None:
     try:
         import scheduler
@@ -313,6 +323,15 @@ def put_settings(request: Request, body: dict = Body(...)):
         conn.close()
 
 
+def _verification_annotate(rows: list) -> None:
+    """Adds verification_outcome / _reason / _note / _at to rows. Additive; a failure leaves the response as it was."""
+    try:
+        import verification
+        verification.annotate(rows)
+    except Exception:
+        log.exception("verification annotate failed (response unaffected)")
+
+
 @app.get("/signals")
 def signals(request: Request):
     """
@@ -438,6 +457,7 @@ def signals(request: Request):
     def band(score):
         return "high" if score >= 80 else "medium" if score >= 65 else "low"
 
+    _verification_annotate(rows)
     for r in rows:
         r["id"] = str(r["id"])
         r["band"] = band(float(r["score_total"]))
@@ -729,6 +749,7 @@ def daily_log(request: Request, day: str | None = Query(None)):
     finally:
         conn.close()
 
+    _verification_annotate(sigs)
     for s_ in sigs:
         s_["id"] = str(s_["id"])
         for k in ("entry_trigger", "stop_loss", "t1", "t2", "r_multiple_t1",
@@ -1137,6 +1158,7 @@ def my_trades(request: Request):
             live_error = str(exc)[:200]
             log.warning("Live prices unavailable for my-trades: %s", live_error)
 
+    _verification_annotate(trades)
     open_t, closed = [], []
     for t in trades:
         t["id"] = str(t["id"])
@@ -1246,6 +1268,12 @@ def take_signal(request: Request, body: dict = Body(...)):
 
             entry_price = float(body.get("entry_price") or row[0])
             cur.execute("update signals set status = 'triggered' where id = %s", (signal_id,))
+            try:
+                import verification
+                with conn.transaction():                       # a savepoint: a verification problem must never block recording the trade
+                    verification.mark_taken(cur, signal_id)
+            except Exception:
+                log.exception("could not set verification_outcome on take (the trade itself is still recorded)")
             cur.execute("""
                 insert into signal_outcomes (signal_id, entry_date, entry_price)
                 values (%s, current_date, %s)
@@ -2010,6 +2038,13 @@ def backtest_results(request: Request):
 # Step 1 diagnostics (read-only; see platform_routes.py).
 import platform_routes
 platform_routes.register(app, require_internal_key=require_internal_key, ist=IST)
+
+# Signal verification (taken / skipped + reason). Isolated like Engine 2: a load failure cannot affect the live service.
+try:
+    import verification
+    verification.register(app, require_internal_key=require_internal_key)
+except Exception:                                    # noqa: BLE001
+    logging.getLogger("verification").exception("Verification routes not registered (live service unaffected)")
 
 # Engine 2 (shadow-mode research engine). Isolated: its failure to load cannot affect the live service.
 try:
