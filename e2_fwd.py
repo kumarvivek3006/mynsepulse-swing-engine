@@ -52,7 +52,8 @@ LOG_PREFIX = "E2FWD|"
 HORIZONS = tuple(int(x) for x in os.environ.get("E2_FWD_HORIZONS", "1,3,5,10,20").split(","))
 TRIAGE_H = tuple(h for h in (5, 10, 20) if h in HORIZONS)
 COST_PCT = 100.0 * (COST_RT + 2 * SLIP)
-PP_VARIANTS = {"pocket_pivot_strict_rung0": dict(strict=True, rung=0), "pocket_pivot_legacy": dict(strict=False)}
+PP_VARIANTS = {"pocket_pivot_strict_rung0": dict(strict=True, rung=0), "pocket_pivot_legacy": dict(strict=False),
+               "pocket_pivot_rung5": dict(strict=True, rung=5)}
 
 
 def _f(x, nd=3):

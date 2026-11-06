@@ -228,6 +228,15 @@ def _fwddiag_if_idle() -> dict:
     return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "pocket_pivot")})
 
 
+def _swingcheck_if_idle() -> dict:
+    """Boot job for the gap_and_hold conditional check (swing engine step 1b; measurement only)."""
+    if os.environ.get("E2_SWINGCHECK_BOOT", "1") != "1":
+        return {"skipped": "E2_SWINGCHECK_BOOT is not 1"}
+    if _running_here():
+        return {"skipped": "a validation run is in progress; POST /jobs/engine2/swingcheck when it has finished"}
+    return _spawn("swingcheck", "boot")
+
+
 def _exits_wl_if_idle() -> dict:
     if os.environ.get("E2_EXITS_WL_BOOT", "0") != "1":            # retired 7 Nov: the live exits are the exits for a 20-session hold
         return {"skipped": "E2_EXITS_WL_BOOT is not 1"}
@@ -442,6 +451,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_fwd", _fwd_if_idle], id="engine2_fwd_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=28), timezone=ist),
                           args=["engine2_fwddiag", _fwddiag_if_idle], id="engine2_fwddiag_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=30), timezone=ist),
+                          args=["engine2_swingcheck", _swingcheck_if_idle], id="engine2_swingcheck_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=32), timezone=ist),
                           args=["engine2_exits_wl", _exits_wl_if_idle], id="engine2_exits_wl_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
@@ -849,6 +860,27 @@ def register(app, *, require_internal_key, ist) -> None:
             return {"started": False, "reason": "a validation run is in progress"}
         return _spawn("fwddiag", "manual", {"E2_FWDDIAG_DETECTOR": detector})
 
+    @app.get("/jobs/engine2-swingcheck")
+    def e2_swingcheck_view(request: Request, format: str = "json"):
+        """gap_and_hold conditional check and the episodic_pivot day-1 profile (measurement only)."""
+        require_internal_key(request)
+        import e2_swingcheck
+        conn = connect()
+        try:
+            d, _ = _get(conn, e2_swingcheck.KEY)
+        finally:
+            conn.close()
+        if not d:
+            raise HTTPException(404, "the swing check has not run yet (POST /jobs/engine2/swingcheck)")
+        return PlainTextResponse(e2_swingcheck.render_markdown(d)) if format == "md" else d
+
+    @app.post("/jobs/engine2/swingcheck")
+    def e2_swingcheck_now(request: Request):
+        require_internal_key(request)
+        if _running_here():
+            return {"started": False, "reason": "a validation run is in progress"}
+        return _spawn("swingcheck", "manual")
+
     @app.get("/jobs/engine2-exits-wl")
     def e2_exits_wl_view(request: Request, format: str = "json"):
         require_internal_key(request)
@@ -961,6 +993,9 @@ if __name__ == "__main__":                                    # the child proces
     if kind == "defdiag":
         import e2_defdiag
         print(json.dumps({k: v for k, v in e2_defdiag.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "swingcheck":
+        import e2_swingcheck
+        print(json.dumps({k: v for k, v in e2_swingcheck.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "exits_wl":
         import e2_exits_wl
         print(json.dumps({k: v for k, v in e2_exits_wl.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))

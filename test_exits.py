@@ -124,8 +124,8 @@ for s, df in sorted(data.frames.items()):
     bb = compute_features(s, df)
     if bb is not None:
         bars[s] = bb
-counts = {r: sum(len(DM.pocket_pivot(bb, {}, 200, bb.n, strict=True, rung=r)) for bb in bars.values()) for r in (0, 1, 2, 3, 4)}
-check("each rung is a subset of the one before (counts non-increasing)", all(counts[r] >= counts[r + 1] for r in range(4)) and counts[0] > 0, str(counts))
+counts = {r: sum(len(DM.pocket_pivot(bb, {}, 200, bb.n, strict=True, rung=r)) for bb in bars.values()) for r in (0, 1, 2, 3, 4, 5)}
+check("each rung is a subset of the one before (counts non-increasing)", all(counts[r] >= counts[r + 1] for r in range(5)) and counts[0] > 0, str(counts))
 ok = True
 for bb in bars.values():
     for c in DM.pocket_pivot(bb, {}, 200, bb.n, strict=True, rung=3):
@@ -133,6 +133,14 @@ for bb in bars.values():
         ok &= bool(c.meta["vol_vs_down"] >= 1.5 and bb.relvol[i] >= 2.0 and bb.close_pos[i] >= 0.75)
 check("rung 3 hits satisfy every clause", ok)
 check("default rung is 3", DM.PP_RUNG == 3)
+ok5, any5 = True, 0
+for bb in bars.values():
+    for c in DM.pocket_pivot(bb, {}, 200, bb.n, strict=True, rung=5):
+        any5 += 1
+        ok5 &= bool((1 - bb.c[c.idx] / bb.high52[c.idx]) * 100 <= 2.0 and c.meta["near_52w_high_2pct"] and (bb.c[c.idx] / bb.ema20[c.idx] - 1) * 100 <= 5.0)
+check("rung 5 hits are within 2% of the 52-week high (and satisfy rung 4)", ok5, str(any5))
+flags = [c.meta["near_52w_high_2pct"] for bb in bars.values() for c in DM.pocket_pivot(bb, {}, 200, bb.n, strict=True, rung=3)]
+check("every live (rung 3) candidate carries the near_52w_high_2pct flag", len(flags) > 0 and all(isinstance(f, bool) for f in flags))
 import e2_live as LV
 check("pocket_pivot is a shadow detector by default", "pocket_pivot" in LV.SHADOW_DETECTORS)
 

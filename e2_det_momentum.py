@@ -98,6 +98,9 @@ PP_NEAR_HIGH, PP_BASE_LOOK, PP_BASE_DEPTH = fenv("E2_PP_NEAR_HIGH", 0.90), ienv(
 # decision): ~12 per week, still SHADOWED (logged with outcomes, never published). 0 = strict only.
 PP_RUNG = ienv("E2_PP_RUNG", 3)
 PP_RUNG_VOL_VS_DOWN, PP_RUNG_RELVOL, PP_RUNG_CLOSEPOS, PP_RUNG_EXT20 = 1.5, 2.0, 0.75, 5.0
+# Rung 5 (7 Nov, owner: SHADOW ONLY): close within 2% of the 52-week high (diagnosis day 3: the one half-stable feature that survived the held-out check).
+# The live rung stays 3; every pocket_pivot candidate also carries meta.near_52w_high_2pct so the forward log can be read with and without it.
+PP_RUNG_NEAR52 = fenv("E2_PP_NEAR52", 2.0)
 
 
 def _pp_structure(b: Bars, i: int) -> tuple[bool, bool]:
@@ -153,10 +156,13 @@ def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int, strict: bool | None = Non
             continue                                                    # rung 3: close in the top quarter of the day's range
         if strict and rung >= 4 and not (b.ema20[i] > 0 and (b.c[i] / b.ema20[i] - 1.0) * 100.0 <= PP_RUNG_EXT20):
             continue                                                    # rung 4: no more than 5% above the 20-EMA
+        near52 = bool(b.high52[i] > 0 and (1.0 - b.c[i] / b.high52[i]) * 100.0 <= PP_RUNG_NEAR52)
+        if strict and rung >= 5 and not near52:
+            continue                                                    # rung 5 (shadow): within 2% of the 52-week high
         stop = float(b.l[i - 4:i + 1].min())
         q = 0.4 * min(b.v[i] / ref / 2.0, 1) * 100 + 0.3 * b.close_pos[i] * 100 + 0.3 * (100 if b.c[i] > b.sma50[i] else 40)
         out.append(make(b, "pocket_pivot", int(i), b.h[i], stop, q,
-                        vol_vs_down=vvd, no_down_day=bool(not down.any())))
+                        vol_vs_down=vvd, no_down_day=bool(not down.any()), near_52w_high_2pct=near52))
     return out
 
 
