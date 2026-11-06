@@ -94,6 +94,10 @@ def momentum_burst(b: Bars, ctx: dict, lo: int, hi: int) -> list[Candidate]:
 PP_STRICT = os.environ.get("E2_PP_STRICT", "1").lower() in ("1", "true", "yes")
 PP_MIN_RELVOL = fenv("E2_PP_MIN_RELVOL", 1.5)           # strict: the up day must be >= 1.5x the average volume
 PP_NEAR_HIGH, PP_BASE_LOOK, PP_BASE_DEPTH = fenv("E2_PP_NEAR_HIGH", 0.90), ienv("E2_PP_BASE_LOOK", 40), fenv("E2_PP_BASE_DEPTH", 0.20)
+# The clause ladder measured on 6 Nov (each rung adds one clause to the one before it; strict = rung 0). The owner chose rung 3 (7 Nov
+# decision): ~12 per week, still SHADOWED (logged with outcomes, never published). 0 = strict only.
+PP_RUNG = ienv("E2_PP_RUNG", 3)
+PP_RUNG_VOL_VS_DOWN, PP_RUNG_RELVOL, PP_RUNG_CLOSEPOS, PP_RUNG_EXT20 = 1.5, 2.0, 0.75, 5.0
 
 
 def _pp_structure(b: Bars, i: int) -> tuple[bool, bool]:
@@ -109,7 +113,7 @@ def _pp_structure(b: Bars, i: int) -> tuple[bool, bool]:
     return up, base
 
 
-def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int, strict: bool | None = None) -> list[Candidate]:
+def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int, strict: bool | None = None, rung: int | None = None) -> list[Candidate]:
     """
     Up day whose volume exceeds the HIGHEST down-day volume of the prior 10 bars, closing in the top half of its range.
     Current definition (E2_PP_STRICT=0): if there was no down day in those 10 bars the comparison is against the 20-bar average volume.
@@ -119,6 +123,7 @@ def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int, strict: bool | None = Non
       * the prior structure must be an intact uptrend OR a valid base (_pp_structure)
     """
     strict = PP_STRICT if strict is None else strict
+    rung = PP_RUNG if rung is None else rung            # only applies in strict mode
     out = []
     idx = np.arange(max(lo, WARMUP), hi)
     pre = (b.c[idx] > b.c_prev[idx]) & (b.close_pos[idx] >= PP_CLOSEPOS)
@@ -139,10 +144,19 @@ def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int, strict: bool | None = Non
             up, base = _pp_structure(b, i)
             if not (up or base):
                 continue
+        vvd = round(float(b.v[i] / ref), 2)
+        if strict and rung >= 1 and vvd < PP_RUNG_VOL_VS_DOWN:
+            continue                                                    # rung 1: volume >= 1.5x the largest down-day volume
+        if strict and rung >= 2 and not (b.relvol[i] >= PP_RUNG_RELVOL):
+            continue                                                    # rung 2: relvol >= 2.0
+        if strict and rung >= 3 and not (b.close_pos[i] >= PP_RUNG_CLOSEPOS):
+            continue                                                    # rung 3: close in the top quarter of the day's range
+        if strict and rung >= 4 and not (b.ema20[i] > 0 and (b.c[i] / b.ema20[i] - 1.0) * 100.0 <= PP_RUNG_EXT20):
+            continue                                                    # rung 4: no more than 5% above the 20-EMA
         stop = float(b.l[i - 4:i + 1].min())
         q = 0.4 * min(b.v[i] / ref / 2.0, 1) * 100 + 0.3 * b.close_pos[i] * 100 + 0.3 * (100 if b.c[i] > b.sma50[i] else 40)
         out.append(make(b, "pocket_pivot", int(i), b.h[i], stop, q,
-                        vol_vs_down=round(float(b.v[i] / ref), 2), no_down_day=bool(not down.any())))
+                        vol_vs_down=vvd, no_down_day=bool(not down.any())))
     return out
 
 

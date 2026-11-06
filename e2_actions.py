@@ -104,7 +104,7 @@ def variants_pass(ctx: Ctx, w0, progress=None) -> dict:
         sets: dict[str, list] = {}
         try:
             sets["pp_current"] = dedupe(pocket_pivot(b, {}, lo, b.n, strict=False))
-            sets["pp_strict"] = dedupe(pocket_pivot(b, {}, lo, b.n, strict=True))
+            sets["pp_strict"] = dedupe(pocket_pivot(b, {}, lo, b.n, strict=True, rung=0))
         except Exception:                                                             # noqa: BLE001
             log.exception("pocket_pivot variants failed for %s", sym)
         for c in sets.get("pp_strict", []):

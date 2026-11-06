@@ -42,6 +42,9 @@ INTRADAY_KEY = "engine2_intraday_latest"
 LOG_KEEP_DAYS, LOG_MAX = 150, 8000
 EQUITY = float(os.environ.get("E2_SHADOW_EQUITY", "1000000"))
 LIVE_LOOKBACK = 40
+# Detectors that are SHADOWED: scored, logged with outcomes in the forward log, shown in the candidate views - but never selected into the
+# book and so never published to signals. (7 Nov: pocket_pivot, until the exits are redesigned.)
+SHADOW_DETECTORS = {d.strip() for d in os.environ.get("E2_SHADOW_DETECTORS", "pocket_pivot").split(",") if d.strip()}
 
 
 def _get(conn, key):
@@ -160,7 +163,9 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
                          "components": {k: round(float(v), 3) for k, v in frac.items() if not k.startswith("_")},
                          "points": SC.points_for(frac, c.detector),   # what each component added under the weights in force (detector or spec)
                          "catalyst_source": frac["_catalyst_source"], "next_results": nxt, "plan": plan, "meta": c.meta})
-    rows.sort(key=lambda r: -r["score"])
+    for r_ in rows:
+        r_["shadow"] = r_["detector"] in SHADOW_DETECTORS
+    rows.sort(key=lambda r: (r["shadow"], -r["score"]))             # shadowed detectors rank after every publishable candidate
     for i_, r_ in enumerate(rows, 1):
         r_["rank"] = i_                                         # position in the score ranking, before any cap is applied
 
@@ -168,6 +173,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
     sel, rej, heat, sec_n = [], Counter(), 0.0, Counter()
     ret = pn.returns
     for r in rows:
+        if r["shadow"]:
+            rej["shadow_detector"] += 1; r["selected"] = False; r["why_not"] = "shadow_detector"; continue
         if len(sel) >= max_pos:
             rej["max_positions"] += 1; r["selected"] = False; r["why_not"] = "max_positions"; continue
         if heat + mult > 6.0 + 1e-9:
@@ -254,6 +261,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
            "candidates": len(rows), "selected": len(sel), "not_selected_reasons": dict(rej),
            "picks": [r for r in rows if r["selected"]], "all_candidates": rows[:150],
            "forward_log": forward_summary(flog) if not provisional else None, "log_resolved_this_run": resolved,
+           "shadow_detectors": sorted(SHADOW_DETECTORS),
            "note": "Shadow mode: recorded only. Nothing here is published to signals."}
     if extra:
         out.update(extra)
