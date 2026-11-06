@@ -129,16 +129,24 @@ with mock.patch.object(V, "mark_taken", side_effect=RuntimeError("boom")):
 cur.execute("select status from signals where id = %s", (f,))
 check("a verification failure does not block the take", r.status_code == 200 and cur.fetchone()[0] == "triggered", r.text)
 
-print("schema missing -> degrade loudly, not silently")
-for col in ("verification_outcome", "verification_reason", "verification_note", "verification_at"):
-    cur.execute(f"alter table signals drop column if exists {col}")
+print("schema missing -> self-heal; if it cannot be applied, degrade loudly, not silently")
+def drop_cols():
+    for col in ("verification_outcome", "verification_reason", "verification_note", "verification_at"):
+        cur.execute(f"alter table signals drop column if exists {col}")
+drop_cols()
 V._state.update(ready=False, checked=0.0, error="simulated")
 r = cl.post("/signals/verify", headers=H, json={"signal_id": a, "outcome": "taken"})
-check("verify answers 503 with the reason", r.status_code == 503 and "not available" in r.text, r.text)
-r = cl.get("/signals", headers=H)
-check("/signals is unaffected without the columns", r.status_code == 200)
-r = cl.get("/jobs/verification-status", headers=H)
-check("status says schema_ready false", r.json()["schema_ready"] is False)
+check("columns lost -> the next request re-applies them and succeeds", r.status_code == 200, r.text)
+drop_cols()
+V._state.update(ready=False, checked=0.0, error="simulated")
+with mock.patch.object(V, "ensure_schema", return_value=False):
+    r = cl.post("/signals/verify", headers=H, json={"signal_id": a, "outcome": "taken"})
+    check("cannot be applied -> 503 with the reason", r.status_code == 503 and "not available" in r.text, r.text)
+    r = cl.get("/signals", headers=H)
+    check("/signals is unaffected without the columns", r.status_code == 200)
+    V._state.update(ready=False, checked=0.0)
+    r = cl.get("/jobs/verification-status", headers=H)
+    check("status says schema_ready false", r.json()["schema_ready"] is False)
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

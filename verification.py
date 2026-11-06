@@ -93,6 +93,8 @@ def is_ready(conn=None) -> bool:
                         "and column_name = 'verification_outcome'")
             ok = cur.fetchone() is not None
         _state.update(ready=ok, checked=time.time(), error=None if ok else (_state["error"] or "columns not present"))
+        if not ok and own:
+            return ensure_schema()               # self-heal: the startup attempt may have lost a lock race with a publish
         return ok
     except Exception as exc:                                         # noqa: BLE001
         _state.update(ready=False, checked=time.time(), error=str(exc)[:300])
