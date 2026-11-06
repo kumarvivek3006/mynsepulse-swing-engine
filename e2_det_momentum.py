@@ -91,7 +91,7 @@ def momentum_burst(b: Bars, ctx: dict, lo: int, hi: int) -> list[Candidate]:
 
 
 # =====================================================================
-PP_STRICT = os.environ.get("E2_PP_STRICT", "0").lower() in ("1", "true", "yes")
+PP_STRICT = os.environ.get("E2_PP_STRICT", "1").lower() in ("1", "true", "yes")
 PP_MIN_RELVOL = fenv("E2_PP_MIN_RELVOL", 1.5)           # strict: the up day must be >= 1.5x the average volume
 PP_NEAR_HIGH, PP_BASE_LOOK, PP_BASE_DEPTH = fenv("E2_PP_NEAR_HIGH", 0.90), ienv("E2_PP_BASE_LOOK", 40), fenv("E2_PP_BASE_DEPTH", 0.20)
 
@@ -112,7 +112,7 @@ def _pp_structure(b: Bars, i: int) -> tuple[bool, bool]:
 def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int, strict: bool | None = None) -> list[Candidate]:
     """
     Up day whose volume exceeds the HIGHEST down-day volume of the prior 10 bars, closing in the top half of its range.
-    Default (E2_PP_STRICT=0): if there was no down day in those 10 bars the comparison is against the 20-bar average volume.
+    Current definition (E2_PP_STRICT=0): if there was no down day in those 10 bars the comparison is against the 20-bar average volume.
     STRICT (ACTION 2, 6 Nov): in addition
       * the prior 10 sessions must contain a down day (no accumulation signature to test against otherwise: rejected)
       * the up day's volume must be >= 1.5x the average volume (relvol)

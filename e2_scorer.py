@@ -105,8 +105,7 @@ def total(frac: dict, weights: dict = SPEC_WEIGHTS) -> float:
 
 
 # ---------------------------------------------------------------------
-# detector-specific scoring (ACTION 1, 6 Nov): E2_SCORING=detector (default once e2_detector_weights.json is committed)
-# or spec (the single global weight set). A missing or unreadable weights file is logged at ERROR and the scan falls back
+# detector-specific scoring (ACTION 1, 6 Nov): E2_SCORING=detector or spec (default: the single global weight set; detector scoring was NOT adopted after round 1). A missing or unreadable weights file is logged at ERROR and the scan falls back
 # to spec scoring: a scan still runs, and the fallback is visible in `scoring_mode()`.
 # ---------------------------------------------------------------------
 WEIGHTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "e2_detector_weights.json")
@@ -115,7 +114,7 @@ _DET: dict = {"model": None, "loaded": False, "error": None}
 
 
 def _model():
-    if os.environ.get("E2_SCORING", "detector").lower() != "detector":
+    if os.environ.get("E2_SCORING", "spec").lower() != "detector":
         return None
     if not _DET["loaded"]:
         _DET["loaded"] = True
@@ -130,7 +129,7 @@ def _model():
 
 
 def scoring_mode() -> str:
-    if os.environ.get("E2_SCORING", "detector").lower() != "detector":
+    if os.environ.get("E2_SCORING", "spec").lower() != "detector":
         return "spec (E2_SCORING=spec)"
     return "detector" if _model() is not None else f"spec (fallback: {_DET['error']})"
 

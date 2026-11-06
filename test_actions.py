@@ -79,7 +79,7 @@ for s, b in bars.items():
 check("strict hits are a subset of the current hits", subset)
 check("every strict hit meets all stated clauses", clauses)
 check("strict is a real reduction", 0 < str_n < cur_n, f"{str_n}/{cur_n}")
-check("env default is the current definition", DM.PP_STRICT is False or os.environ.get("E2_PP_STRICT") == "1")
+check("env default is the strict definition", DM.PP_STRICT is True)
 
 print("armed vcp and the buy-stop entry")
 armed = {s: DB.vcp_armed(b, {}, 130, b.n) for s, b in bars.items()}

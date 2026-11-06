@@ -107,6 +107,10 @@ def variants_pass(ctx: Ctx, w0, progress=None) -> dict:
             sets["pp_strict"] = dedupe(pocket_pivot(b, {}, lo, b.n, strict=True))
         except Exception:                                                             # noqa: BLE001
             log.exception("pocket_pivot variants failed for %s", sym)
+        for c in sets.get("pp_strict", []):
+            i = c.idx
+            c.meta.update(relvol=float(b.relvol[i]), close_pos=float(b.close_pos[i]),
+                          ext20=float((b.c[i] / b.ema20[i] - 1.0) * 100.0) if b.ema20[i] > 0 else None)
         for c in sets.get("pp_current", []):
             i = c.idx
             has_down = not c.meta.get("no_down_day", False)
@@ -198,6 +202,124 @@ def old_armed_reference(conn) -> dict:
         return {"error": f"{type(e).__name__}: {e}"[:300]}
 
 
+
+# ----------------------------------------------------------------------
+# round 2 (measurement only): where does the negative drift come from, and is the ranking any use at the top?
+# ----------------------------------------------------------------------
+LADDER = [("strict (as specified)", lambda m: True),
+          ("+ volume > 1.5x the largest down-day volume", lambda m: m.get("vol_vs_down", 0) >= 1.5),
+          ("+ relvol >= 2.0", lambda m: (m.get("relvol") or 0) >= 2.0),
+          ("+ close in the top quarter of the range", lambda m: (m.get("close_pos") or 0) >= 0.75),
+          ("+ no more than 5% above the 20-EMA", lambda m: m.get("ext20") is not None and m["ext20"] <= 5.0)]
+
+
+def pp_ladder(trades: list[Trade], weeks: float) -> list[dict]:
+    """The rungs and their order were written down before any result; each rung adds one clause to the previous one."""
+    rows, cur = [], trades
+    for label, fn in LADDER:
+        cur = [t for t in cur if fn(t.meta)]
+        st = BT.stats_r(cur)
+        rows.append({"rung": label, "per_week": _f(len(cur) / weeks, 1), **{k: st.get(k) for k in ("n", "win_rate_pct", "avg_r", "profit_factor_r")}})
+    return rows
+
+
+def cost_decomposition(trades: list[Trade]) -> dict:
+    from e2_manage import COST_RT, SLIP
+    by: dict[str, list[Trade]] = defaultdict(list)
+    for t in trades:
+        if not t.skipped:
+            by[t.detector].append(t)
+
+    def row(ts):
+        r = np.array([t.r for t in ts]); rf = np.array([t.risk_frac for t in ts])
+        cost_r = (COST_RT + 2 * SLIP) / np.where(rf > 0, rf, np.nan)
+        mfe = np.array([t.mfe_r for t in ts])
+        reasons = Counter(t.reason for t in ts)
+        return {"n": len(ts), "net_r": _f(r.mean()), "cost_r": _f(np.nanmean(cost_r)), "gross_r": _f(r.mean() + np.nanmean(cost_r)),
+                "risk_pct": _f(100 * rf.mean(), 2), "mfe_ge_1r_pct": _f(100 * (mfe >= 1).mean(), 1), "mfe_ge_2r_pct": _f(100 * (mfe >= 2).mean(), 1),
+                "mfe_ge_3r_pct": _f(100 * (mfe >= 3).mean(), 1), "initial_stop_exit_pct": _f(100 * (reasons.get("stop", 0) + reasons.get("stop_gap", 0)) / len(ts), 1),
+                "exit_mix_pct": {k: _f(100 * v / len(ts), 1) for k, v in reasons.most_common(6)},
+                "stopped_within_5_bars_pct": _f(100 * np.mean([(t.reason in ("stop", "stop_gap") and t.bars <= 5) for t in ts]), 1),
+                "avg_bars": _f(np.mean([t.bars for t in ts]), 1), "floored_stop_pct": _f(100 * np.mean([t.floored for t in ts]), 1)}
+    allt = [t for ts in by.values() for t in ts]
+    return {"all": row(allt), "by_detector": {d: row(ts) for d, ts in sorted(by.items(), key=lambda kv: -len(kv[1]))},
+            "note": "cost_r = (round-trip 0.30% + 2 x 0.10% slippage) / risk fraction; gross_r = net_r + cost_r. Net R already includes both."}
+
+
+def component_stability(live: list[Trade], split64) -> dict:
+    dt = lambda t: np.datetime64(t.signal_date, "D")        # noqa: E731
+    tr_ = [t for t in live if dt(t) < split64]
+    te_ = [t for t in live if dt(t) >= split64]
+
+    def rho(ts, c):
+        if len(ts) < 50:
+            return None
+        v = SC._spearman(np.array([t.frac[c] for t in ts], float), np.array([t.r for t in ts], float))
+        return None if v != v else round(float(v), 3)
+    out = {"pooled": {c: {"train": rho(tr_, c), "test": rho(te_, c)} for c in SC.COMPONENTS}, "by_detector": {}}
+    for d in DETECTORS:
+        a, b_ = [t for t in tr_ if t.detector == d], [t for t in te_ if t.detector == d]
+        if len(a) >= 300 and len(b_) >= 300:
+            out["by_detector"][d] = {c: {"train": rho(a, c), "test": rho(b_, c)} for c in SC.COMPONENTS}
+    return out
+
+
+def top_slot(ts: list[Trade], fn, ks=(3,), pct=(5, 10), reps=1000, seed=7) -> dict:
+    """Mean R of the trades a scheme ranks highest: the top k per signal day, and the top pct% overall.
+    The 95% interval resamples signal DAYS (trades on a day are not independent)."""
+    rng = np.random.default_rng(seed)
+    dt = lambda t: np.datetime64(t.signal_date, "D")        # noqa: E731
+    days: dict = defaultdict(list)
+    for t in ts:
+        days[dt(t)].append((fn(t), t.r))
+    keys = list(days)
+    out = {"all_trades_mean_r": _f(np.mean([t.r for t in ts])), "n": len(ts)}
+    for k in ks:
+        per = {d: sorted(v, key=lambda x: -x[0])[:k] for d, v in days.items()}
+        s = np.array([sum(r for _, r in per[d]) for d in keys]); n = np.array([len(per[d]) for d in keys])
+        boot = []
+        for _ in range(reps):
+            ix = rng.integers(0, len(keys), len(keys))
+            boot.append(s[ix].sum() / max(n[ix].sum(), 1))
+        out[f"top{k}_per_day"] = {"n": int(n.sum()), "mean_r": _f(s.sum() / max(n.sum(), 1)),
+                                  "ci95": [_f(np.quantile(boot, .025)), _f(np.quantile(boot, .975))]}
+    sc = np.array([fn(t) for t in ts]); r = np.array([t.r for t in ts]); dd = np.array([dt(t).astype("int64") for t in ts])
+    for p in pct:
+        m = sc >= np.quantile(sc, 1 - p / 100.0)
+        ud = np.unique(dd[m]); boot = []
+        for _ in range(reps):
+            pick = rng.choice(ud, len(ud))
+            vals = np.concatenate([r[m & (dd == d)] for d in pick]) if len(pick) else np.array([0.0])
+            boot.append(vals.mean() if len(vals) else 0.0)
+        out[f"top{p}pct"] = {"n": int(m.sum()), "mean_r": _f(r[m].mean()), "ci95": [_f(np.quantile(boot, .025)), _f(np.quantile(boot, .975))]}
+    return out
+
+
+def old_armed_all_runs(conn) -> dict:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select run_id, pattern, signal_date, r_realised from backtest_trades "
+                        "where setup_type like 'armed%%' and r_realised is not null and exit_reason <> 'never_triggered'")
+            df = pd.DataFrame(cur.fetchall(), columns=["run_id", "pattern", "signal_date", "r"])
+        df["r"] = pd.to_numeric(df["r"], errors="coerce")
+        df["signal_date"] = pd.to_datetime(df["signal_date"])
+        out = {}
+        for rid, g in df.groupby("run_id"):
+            half = g["signal_date"].median()
+            out[int(rid)] = {"n": int(len(g)), "avg_r": _f(g["r"].mean()), "win_rate_pct": _f(100 * (g["r"] > 0).mean(), 1),
+                             "window": [str(g["signal_date"].min().date()), str(g["signal_date"].max().date())],
+                             "first_half_r": _f(g[g["signal_date"] <= half]["r"].mean()), "second_half_r": _f(g[g["signal_date"] > half]["r"].mean()),
+                             "by_pattern": {k: {"n": int(len(x)), "avg_r": _f(x["r"].mean())} for k, x in g.groupby("pattern")}}
+        return out
+    except Exception as e:                                                             # noqa: BLE001
+        log.exception("old armed per-run failed")
+        try:
+            conn.rollback()
+        except Exception:                                                              # noqa: BLE001
+            pass
+        return {"error": f"{type(e).__name__}: {e}"[:300]}
+
+
 # ----------------------------------------------------------------------
 # ACTION 1: detector-specific scoring
 # ----------------------------------------------------------------------
@@ -232,6 +354,8 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
         ev[sname] = row
     detail_test = {sname: DS.spearman_within([t.detector for t in test], arr(test, fn), arr(test, lambda t: t.r))["by_detector"]
                    for sname, fn in schemes.items() if sname in ("S0_spec_global_before", "S3_fitted_weights_plus_expected_R_mapping")}
+
+    top = {sname: top_slot(test, fn) for sname, fn in schemes.items()}
 
     # median score per detector, before / after
     med = {}
@@ -278,7 +402,7 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
     sample = {d: sum(1 for t in train if t.detector == d) for d in names}
     return {"protocol": "priors (instruction) -> train-half ridge fit -> lambda by expanding time-block CV inside train -> held-out half scored once",
             "split": str(mid.date()), "n_train": len(train), "n_test": len(test), "train_trades_by_detector": sample,
-            "evaluation": ev, "within_detector_test_half": detail_test, "median_score_by_detector": med, "portfolio": port,
+            "evaluation": ev, "top_slot_test_half": top, "within_detector_test_half": detail_test, "median_score_by_detector": med, "portfolio": port,
             "weights": {d: {k: v for k, v in e.items() if k in ("weights", "prior", "lam", "n_train", "mu", "raw_mean")} for d, e in model.det.items()},
             "cv": model.meta.get("cv"), "slope_R_per_raw_point": _f(model.slope, 5), "global_mean_r_train": _f(model.global_mean),
             "model_train_only": model.to_json(), "model_full_window_for_deployment": full_model.to_json(),
@@ -312,6 +436,7 @@ def compute(data, conn, out: dict) -> dict:
         "reduction_pct_candidates": _f(100 * (1 - pp_str["candidates"] / pp_cur["candidates"]), 1) if pp_cur["candidates"] else None,
         "clause_funnel_on_current_hits": vp["_funnel"], "target_per_week": "5-15",
         "definitions_declared_before_run": "uptrend = close > rising 50d SMA and 50d > 150d; base = close within 10% of the 52-week high and the prior 40 sessions' range <= 20% deep; up day >= 1.5x relvol (50-day average volume)"}
+    out["action2_pocket_pivot"]["ladder_on_strict"] = pp_ladder(vp["pp_strict"]["trades"], weeks)
     out["action3_vcp"] = {
         "variants": {k: blocks[k] for k in ("vcp_breakout", "vcp_armed", "vcp_armed_p60", "vcp_armed_nextopen")},
         "old_engine_reference": old_armed_reference(conn) if conn is not None else {"error": "no database connection"},
@@ -321,8 +446,17 @@ def compute(data, conn, out: dict) -> dict:
     del vp
 
     prog("per-symbol scan for the scoring study")
-    ps = BT.per_symbol(data, pn, w0, prog)
+    import e2_det_momentum as DM
+    keep = DM.PP_STRICT
+    DM.PP_STRICT = False          # the scoring study's universe stays the round-1 one (current pocket_pivot) whatever the live default is
+    try:
+        ps = BT.per_symbol(data, pn, w0, prog)
+    finally:
+        DM.PP_STRICT = keep
     out["action1_scoring"] = scoring_study(ctx, ps["trades"], w0, mid, w1)
+    live_ps = [t for t in ps["trades"] if not t.skipped and t.frac is not None]
+    out["round2"] = {"cost_decomposition": cost_decomposition(ps["trades"]), "component_stability": component_stability(live_ps, split64),
+                     "old_armed_all_runs": old_armed_all_runs(conn) if conn is not None else {"error": "no database connection"}}
     return out
 
 
@@ -386,6 +520,11 @@ def render_markdown(d: dict) -> str:
                   f"filled {x['filled_trades']} | {_st(x['stats'])} | 1st half {_st(x['first_half'])} | 2nd half {_st(x['second_half'])}"]
         L += [f"- reduction in candidate count: {a2['reduction_pct_candidates']}%", f"- clause funnel on current hits: {a2['clause_funnel_on_current_hits']}",
               f"- declared: {a2['definitions_declared_before_run']}", ""]
+    if a2 and a2.get("ladder_on_strict"):
+        L += ["pocket_pivot clause ladder on the strict set (rungs declared before the run):"]
+        for r_ in a2["ladder_on_strict"]:
+            L += [f"- {r_['rung']}: {r_['per_week']}/wk n={r_['n']} win={r_['win_rate_pct']}% avgR={r_['avg_r']} PF={r_['profit_factor_r']}"]
+        L += [""]
     a3 = d.get("action3_vcp")
     if a3:
         L += ["## ACTION 3 vcp", ""]
@@ -411,7 +550,23 @@ def render_markdown(d: dict) -> str:
         L += ["", "weights (train fit): detector -> lam, n_train, weights"]
         for k, v in a1["weights"].items():
             L += [f"- {k}: lam={v['lam']} n={v['n_train']} mu={_f(v['mu'])} w={v['weights']}"]
+        L += ["", "top-slot mean R on the held-out half (95% CI resamples days):"]
+        for k, v in (a1.get("top_slot_test_half") or {}).items():
+            L += [f"- {k}: " + json.dumps(v)]
         L += ["", f"cv: {json.dumps(a1['cv'])}", "", f"{a1['note']}"]
+    r2 = d.get("round2")
+    if r2:
+        L += ["", "## ROUND 2 diagnostics", "", "cost decomposition (net R, cost in R, gross R, risk %, MFE reach, stop exits):"]
+        cd = r2["cost_decomposition"]
+        L += ["- ALL: " + json.dumps(cd["all"])]
+        for k, v in cd["by_detector"].items():
+            L += [f"- {k}: " + json.dumps(v)]
+        L += ["", "component stability, Spearman(component fraction, R): train vs test"]
+        for c, v in r2["component_stability"]["pooled"].items():
+            L += [f"- pooled {c}: {v}"]
+        for dname, comp in r2["component_stability"]["by_detector"].items():
+            L += [f"- {dname}: " + json.dumps(comp)]
+        L += ["", "old engine armed trades, every run: " + json.dumps(r2["old_armed_all_runs"], default=str)]
     return "\n".join(L)
 
 
