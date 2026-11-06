@@ -338,11 +338,24 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
     def arr(ts, fn):
         return np.array([fn(t) for t in ts], float)
 
+    # pooled (one weight set for every detector) alternatives, all derived from the TRAIN half only
+    Xtr = np.array([[t.frac[c] for c in SC.COMPONENTS] for t in train], float)
+    ytr = np.array([t.r for t in train], float)
+    fitted = DS._fit(Xtr, ytr)
+    w_pool = dict(zip(SC.COMPONENTS, (float(x) for x in fitted))) if fitted is not None else dict(SC.SPEC_WEIGHTS)
+    cal = SC.calibrate([(t.frac, t.r) for t in train], [(t.frac, t.r) for t in test])
+    rho_tr = {c: SC._spearman(Xtr[:, k], ytr) for k, c in enumerate(SC.COMPONENTS)}
+    pos = {c: v for c, v in rho_tr.items() if c in ("volume", "rs", "catalyst") and v == v and v >= 0.05}
+    w_rho = {c: (100.0 * pos[c] / sum(pos.values()) if c in pos else 0.0) for c in SC.COMPONENTS} if pos else dict(SC.SPEC_WEIGHTS)
+
     schemes = {
         "S0_spec_global_before": lambda t: SC.total(t.frac),
         "S1_priors_only_raw": lambda t: sum(DS.prior_weights(t.detector)[c] * t.frac[c] for c in SC.COMPONENTS),
         "S2_fitted_weights_raw": lambda t: model.score(t.detector, t.frac, mapped=False),
         "S3_fitted_weights_plus_expected_R_mapping": lambda t: model.score(t.detector, t.frac, mapped=True),
+        "S4_one_pooled_weight_set_fitted_on_train": lambda t: SC.total(t.frac, w_pool),
+        "S5_existing_calibrate_shrunk_50_50": lambda t: SC.total(t.frac, cal["calibrated"] if "calibrated" in cal else SC.SPEC_WEIGHTS),
+        "S6_volume_rs_catalyst_weights_by_train_rho": lambda t: SC.total(t.frac, w_rho),
     }
     ev = {}
     for sname, fn in schemes.items():
@@ -393,7 +406,9 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
 
     port = {}
     for label, fn in (("before_spec", schemes["S0_spec_global_before"]), ("after_detector_specific", schemes["S3_fitted_weights_plus_expected_R_mapping"]),
-                      ("after_weights_only_raw", schemes["S2_fitted_weights_raw"])):
+                      ("after_weights_only_raw", schemes["S2_fitted_weights_raw"]),
+                      ("pooled_fit", schemes["S4_one_pooled_weight_set_fitted_on_train"]),
+                      ("volume_rs_catalyst", schemes["S6_volume_rs_catalyst_weights_by_train_rho"])):
         port[label] = {"full_window": book(fn, w0, w1), "test_half": book(fn, mid, w1)}
     for t in trades:                                      # leave the trades as the study found them
         if not t.skipped and t.frac is not None:
@@ -402,7 +417,10 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
     sample = {d: sum(1 for t in train if t.detector == d) for d in names}
     return {"protocol": "priors (instruction) -> train-half ridge fit -> lambda by expanding time-block CV inside train -> held-out half scored once",
             "split": str(mid.date()), "n_train": len(train), "n_test": len(test), "train_trades_by_detector": sample,
-            "evaluation": ev, "top_slot_test_half": top, "within_detector_test_half": detail_test, "median_score_by_detector": med, "portfolio": port,
+            "evaluation": ev, "top_slot_test_half": top,
+            "pooled_weights": {"S4_fit": {k: _f(v, 2) for k, v in w_pool.items()}, "S5_calibrate": {k: _f(v, 2) for k, v in (cal.get("calibrated") or {}).items()},
+                               "S5_adopted_by_its_own_rule": cal.get("adopted"), "S6": {k: _f(v, 2) for k, v in w_rho.items()},
+                               "train_spearman_by_component": {k: _f(v, 3) for k, v in rho_tr.items()}}, "within_detector_test_half": detail_test, "median_score_by_detector": med, "portfolio": port,
             "weights": {d: {k: v for k, v in e.items() if k in ("weights", "prior", "lam", "n_train", "mu", "raw_mean")} for d, e in model.det.items()},
             "cv": model.meta.get("cv"), "slope_R_per_raw_point": _f(model.slope, 5), "global_mean_r_train": _f(model.global_mean),
             "model_train_only": model.to_json(), "model_full_window_for_deployment": full_model.to_json(),
@@ -550,6 +568,7 @@ def render_markdown(d: dict) -> str:
         L += ["", "weights (train fit): detector -> lam, n_train, weights"]
         for k, v in a1["weights"].items():
             L += [f"- {k}: lam={v['lam']} n={v['n_train']} mu={_f(v['mu'])} w={v['weights']}"]
+        L += ["", f"pooled weights: {json.dumps(a1.get('pooled_weights'))}"]
         L += ["", "top-slot mean R on the held-out half (95% CI resamples days):"]
         for k, v in (a1.get("top_slot_test_half") or {}).items():
             L += [f"- {k}: " + json.dumps(v)]
@@ -566,7 +585,9 @@ def render_markdown(d: dict) -> str:
             L += [f"- pooled {c}: {v}"]
         for dname, comp in r2["component_stability"]["by_detector"].items():
             L += [f"- {dname}: " + json.dumps(comp)]
-        L += ["", "old engine armed trades, every run: " + json.dumps(r2["old_armed_all_runs"], default=str)]
+        L += ["", "old engine armed trades, one line per run:"]
+        for rid, v in (r2["old_armed_all_runs"] or {}).items():
+            L += [f"- run {rid}: " + json.dumps(v, default=str)]
     return "\n".join(L)
 
 
