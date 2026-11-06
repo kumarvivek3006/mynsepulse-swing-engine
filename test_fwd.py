@@ -56,7 +56,7 @@ out = {}
 d = make_market(n_stocks=25, n_days=950, seed=5)
 F.compute(d, out)
 rows = out["detectors"]
-check("every detector row has all three horizons", all(set(r["horizons"]) == {"5", "10", "20"} for r in rows.values()))
+check("every detector row has all five horizons", all(set(r["horizons"]) == {"1", "3", "5", "10", "20"} for r in rows.values()))
 check("control row present with a large sample", rows["ALL_BARS (control)"]["horizons"]["10"]["n"] > 1000)
 check("pocket_pivot variants reported next to the live one", {"pocket_pivot_strict_rung0", "pocket_pivot_legacy"} <= set(rows))
 check("sample size shrinks with the horizon (needs more future bars)", all(r["horizons"]["20"]["n"] <= r["horizons"]["5"]["n"] for r in rows.values()))
@@ -96,6 +96,19 @@ check("every other detector is shadowed", all(LV.is_shadow(x) for x in ("vcp", "
 os.environ["E2_PUBLISH_DETECTORS"] = ""
 importlib.reload(LV)
 check("empty whitelist = no whitelist (only the pocket_pivot shadow applies)", LV.is_shadow("pocket_pivot") and not LV.is_shadow("vcp"))
+
+# --- 7 Nov: horizons 1/3/5/10/20 and the per-horizon beats_control flag
+check("horizons 1/3/5/10/20, triage on 5/10/20", F.HORIZONS == (1, 3, 5, 10, 20) and F.TRIAGE_H == (5, 10, 20))
+def _st(m, a, b): return {"n": 500, "mean_adj_pct": m, "ci95": [m - .3, m + .3], "h1": {"mean_adj_pct": a}, "h2": {"mean_adj_pct": b}}
+_c = {"n": 1000, "mean_adj_pct": 0.5, "ci95": [0.2, 0.8], "h1": {"mean_adj_pct": 0.5}, "h2": {"mean_adj_pct": 0.5}}      # half-width 0.3
+check("beats_control case", (F.beats_control(_st(0.9, 0.8, 1.0), _c)) is True)
+assert F.beats_control(_st(0.7, 0.8, 1.0), _c) is False            # excess 0.2 < 0.3
+assert F.beats_control(_st(0.9, 0.4, 1.4), _c) is False            # first half under the control
+check("beats_control case", (F.beats_control({"n": 0}, _c)) is False)
+# the triage label ignores horizons 1 and 3
+_per = {h: _st(0.9, 0.8, 1.0) for h in F.HORIZONS}; _per[1] = _st(-5, -5, -5); _per[3] = _st(-5, -5, -5)
+_ctl = {h: _c for h in F.HORIZONS}
+check("triage label ignores horizons 1 and 3", F.triage(_per, _ctl) == "positive")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

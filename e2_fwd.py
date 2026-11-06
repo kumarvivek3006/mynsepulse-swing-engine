@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -46,7 +47,10 @@ from e2_manage import COST_RT, SLIP, _locked
 log = logging.getLogger("engine2.fwd")
 KEY = "engine2_fwd"
 LOG_PREFIX = "E2FWD|"
-HORIZONS = (5, 10, 20)
+# 7 Nov (owner): 1 and 3 sessions added to see short-horizon edge the 5/10/20 test cannot. The triage label keeps its original three horizons
+# (TRIAGE_H) so the labels stay comparable; every horizon also carries its own beats_control flag (same pre-declared rule, applied per horizon).
+HORIZONS = tuple(int(x) for x in os.environ.get("E2_FWD_HORIZONS", "1,3,5,10,20").split(","))
+TRIAGE_H = tuple(h for h in (5, 10, 20) if h in HORIZONS)
 COST_PCT = 100.0 * (COST_RT + 2 * SLIP)
 PP_VARIANTS = {"pocket_pivot_strict_rung0": dict(strict=True, rung=0), "pocket_pivot_legacy": dict(strict=False)}
 
@@ -101,11 +105,22 @@ class Acc:
                 "pass": bool(adj.mean() > 0 and len(h1) and len(h2) and h1.mean() > 0 and h2.mean() > 0)}
 
 
+def beats_control(s: dict, c: dict) -> bool:
+    """One horizon, the pre-declared rule: mean adjusted return above the control's by at least half the control's 95% interval width,
+    and above the control's mean in BOTH halves."""
+    if not s.get("n") or not c.get("n") or s.get("mean_adj_pct") is None or c.get("mean_adj_pct") is None:
+        return False
+    need = 0.5 * (c["ci95"][1] - c["ci95"][0])
+    h1, h2 = s["h1"]["mean_adj_pct"], s["h2"]["mean_adj_pct"]
+    return bool(s["mean_adj_pct"] - c["mean_adj_pct"] >= need and h1 is not None and h2 is not None
+                and h1 > c["h1"]["mean_adj_pct"] and h2 > c["h2"]["mean_adj_pct"])
+
+
 def triage(per_h: dict, ctl: dict | None = None) -> str:
     """Control-relative rule when `ctl` (the control row's per-horizon stats) is given; otherwise the original rule against zero."""
     if ctl is not None:
         passes, below, seen = 0, 0, 0
-        for h in HORIZONS:
+        for h in TRIAGE_H:
             s, c = per_h[h], ctl[h]
             if not s.get("n") or not c.get("n") or s.get("mean_adj_pct") is None:
                 continue
@@ -123,10 +138,10 @@ def triage(per_h: dict, ctl: dict | None = None) -> str:
 
 
 def triage_vs_zero(per_h: dict) -> str:
-    means = [per_h[h].get("mean_adj_pct") for h in HORIZONS if per_h[h].get("n")]
+    means = [per_h[h].get("mean_adj_pct") for h in TRIAGE_H if per_h[h].get("n")]
     if not means:
         return "no_data"
-    passes = sum(1 for h in HORIZONS if per_h[h].get("pass"))
+    passes = sum(1 for h in TRIAGE_H if per_h[h].get("pass"))
     if passes >= 2:
         return "positive"
     if all(m is not None and m <= 0 for m in means):
@@ -206,6 +221,7 @@ def compute(data, out: dict) -> dict:
         is_ctl = det.startswith("ALL_BARS")
         rows[det] = {"horizons": {str(h): per_int[h] for h in HORIZONS},
                      "triage": "control" if is_ctl else triage(per_int, ctl), "triage_vs_zero": "control" if is_ctl else triage_vs_zero(per_int),
+                     "beats_control": None if is_ctl else {str(h): beats_control(per_int[h], ctl[h]) for h in HORIZONS if per_int[h].get("n")},
                      "excess_vs_control_pct": None if is_ctl else {str(h): _f((per_int[h].get("mean_adj_pct") or 0) - (ctl[h].get("mean_adj_pct") or 0))
                                                                   for h in HORIZONS if per_int[h].get("n")}}
     out["detectors"] = rows
@@ -266,10 +282,15 @@ def render_markdown(d: dict) -> str:
             if not s.get("n"):
                 parts.append(f"h{h}: n0")
                 continue
-            parts.append(f"h{h}: n{s['n']} adj {_p(s['mean_adj_pct'])}% CI{s['ci95']} med {_p(s['median_adj_pct'])} pos {s['pos_pct']}% "
+            star = "*" if (r.get("beats_control") or {}).get(str(h)) else ""
+            parts.append(f"h{h}{star}: n{s['n']} adj {_p(s['mean_adj_pct'])}% CI{s['ci95']} med {_p(s['median_adj_pct'])} pos {s['pos_pct']}% "
                          f"halves {_p(s['h1']['mean_adj_pct'])}/{_p(s['h2']['mean_adj_pct'])} net {_p(s['net_of_costs_pct'])}")
         ex = r.get("excess_vs_control_pct")
         L.append(f"{det} [{r['triage']}; vs zero: {r.get('triage_vs_zero')}]" + (f" excess vs control {ex}" if ex else "") + ": " + " | ".join(parts))
+    L.append("## beats the control (mean above control by >= half the control's interval width AND above it in both halves), per horizon; * on a row above")
+    for h in HORIZONS:
+        names = [det for det, r in (d.get("detectors") or {}).items() if (r.get("beats_control") or {}).get(str(h))]
+        L.append(f"h{h}: " + (", ".join(names) if names else "none"))
     L.append("## diagnosis queue (10-session adjusted return, strongest first)")
     for q in d.get("diagnosis_queue_by_10bar_adj") or []:
         L.append(f"{q['detector']}: {q['mean_adj_pct_10']} (n {q['n']}) {q['triage']}")

@@ -32,7 +32,7 @@ live strategy engine, the signals table or the live scan.
   GET  /jobs/engine2-fwd             the 7 Nov forward-return test: market-adjusted 5/10/20-session returns by detector, no stops (?format=md); E2FWD| lines
   POST /jobs/engine2/fwd             run it now (also runs ~24 minutes after a deploy while E2_FWD_BOOT=1)
   GET  /jobs/engine2-fwddiag         forward returns inside ONE detector split by signal-bar context (?detector=pullback_ema&format=md); E2FWDD| lines
-  POST /jobs/engine2/fwddiag         run it now (?detector=); also ~28 minutes after a deploy for E2_FWDDIAG_DETECTOR (default pullback_ema) while E2_FWDDIAG_BOOT=1
+  POST /jobs/engine2/fwddiag         run it now (?detector=); also ~28 minutes after a deploy for E2_FWDDIAG_DETECTOR (default pocket_pivot) while E2_FWDDIAG_BOOT=1
   GET  /jobs/engine2-exits-wl        the 7 Nov exit study on the publishing detectors only + the 5-/20-session mode rulebooks (?format=md); E2EXW| lines
   POST /jobs/engine2/exits-wl        run it now (also ~32 minutes after a deploy while E2_EXITS_WL_BOOT=1)
   POST /jobs/engine2/exits           run it now (also runs ~22 minutes after a deploy while E2_EXITS_BOOT=1)
@@ -225,11 +225,11 @@ def _fwddiag_if_idle() -> dict:
         return {"skipped": "E2_FWDDIAG_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwddiag when it has finished"}
-    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "pullback_ema,ascending_base")})
+    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "pocket_pivot")})
 
 
 def _exits_wl_if_idle() -> dict:
-    if os.environ.get("E2_EXITS_WL_BOOT", "1") != "1":
+    if os.environ.get("E2_EXITS_WL_BOOT", "0") != "1":            # retired 7 Nov: the live exits are the exits for a 20-session hold
         return {"skipped": "E2_EXITS_WL_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/exits-wl when it has finished"}
@@ -966,7 +966,7 @@ if __name__ == "__main__":                                    # the child proces
         print(json.dumps({k: v for k, v in e2_exits_wl.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwddiag":
         import e2_fwddiag
-        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "pullback_ema,ascending_base"), trigger=trig).items()
+        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "pocket_pivot"), trigger=trig).items()
                           if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwd":
         import e2_fwd
