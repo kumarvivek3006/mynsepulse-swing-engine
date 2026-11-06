@@ -113,6 +113,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
 
     rows, gated, stale, short = [], Counter(), 0, 0
     by_det = Counter()
+    gated_det, stale_names = Counter(), []                      # record-only: which detector lost candidates at which gate / which symbols were stale
     det_errors, det_error_msgs = Counter(), {}                  # a detector that throws is a visible line, never a hole
     bars_cache = {}
     for sym, df in sorted(data.frames.items()):
@@ -123,6 +124,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
         bars_cache[sym] = b
         if b.date[-1] != last64:
             stale += 1
+            stale_names.append(f"{sym}(last bar {str(b.date[-1])[:10]})")
             continue
         cs, errs = detect_all(b, lo=b.n - LIVE_LOOKBACK)          # a window, so the 3-bar cooldown sees yesterday's duplicates
         for name, msg in errs:
@@ -134,6 +136,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
             g = BT.gate(b, c, data.surveillance.get(sym), surv_active)
             if g:
                 gated[g] += 1
+                gated_det[(c.detector, g)] += 1
                 continue
             sec = pn.sector_of.get(sym)
             c.sector = sec
@@ -144,6 +147,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
             plan = plan_for(b, c, mult)
             if plan is None:
                 gated["no_valid_stop"] += 1
+                gated_det[(c.detector, "no_valid_stop")] += 1
                 continue
             ev = data.events.get(sym)
             nxt = None
@@ -156,6 +160,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
                          "components": {k: round(float(v), 3) for k, v in frac.items() if not k.startswith("_")},
                          "catalyst_source": frac["_catalyst_source"], "next_results": nxt, "plan": plan, "meta": c.meta})
     rows.sort(key=lambda r: -r["score"])
+    for i_, r_ in enumerate(rows, 1):
+        r_["rank"] = i_                                         # position in the score ranking, before any cap is applied
 
     # hypothetical book from an empty portfolio, using the same caps as the portfolio layer
     sel, rej, heat, sec_n = [], Counter(), 0.0, Counter()
@@ -183,6 +189,20 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
         if r["sector"] is not None:
             sec_n[r["sector"]] += 1
 
+    # ---- record-only: what happened to each detector's candidates (no decision reads any of this) ------------
+    rank_by_det, sel_scores = {}, []
+    try:                                                         # record-only: it must never be able to fail a scan
+        sel_by_det = Counter(r["detector"] for r in rows if r.get("selected"))
+        for dn in sorted(by_det):
+            mine = [r for r in rows if r["detector"] == dn]      # already in score order
+            rank_by_det[dn] = {"raw": int(by_det[dn]), "ranked": len(mine), "selected": int(sel_by_det.get(dn, 0)),
+                               "best_score": mine[0]["score"] if mine else None, "best_rank": mine[0]["rank"] if mine else None,
+                               "gated": {g: int(n) for (d_, g), n in gated_det.items() if d_ == dn},
+                               "not_selected": dict(Counter(r.get("why_not") for r in mine if not r.get("selected")))}
+        sel_scores = [r["score"] for r in rows if r.get("selected")]
+    except Exception:                                            # noqa: BLE001
+        log.exception("per-detector ranking record failed (scan unaffected)")
+
     # ---- forward log: add today's, resolve older ----------------------------------------
     # A forming bar is provisional (partial volume, partial range): it must never enter the forward
     # record that is later scored against real outcomes.
@@ -195,7 +215,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
         key = (r["symbol"], r["detector"], r["signal_date"])
         if key not in have:
             flog.append({"s": r["symbol"], "d": r["detector"], "dt": r["signal_date"], "sc": r["score"], "q": r["quality"],
-                         "pv": r["pivot"], "st": r["plan"]["stop"], "sec": r["sector"], "sel": bool(r["selected"]), "fam": r["family"]})
+                         "pv": r["pivot"], "st": r["plan"]["stop"], "sec": r["sector"], "sel": bool(r["selected"]), "fam": r["family"],
+                         "rk": r["rank"], "wn": r.get("why_not")})
     resolved = 0
     cutoff = (last - pd.Timedelta(days=LOG_KEEP_DAYS)).strftime("%Y-%m-%d")
     for e in flog:
@@ -223,9 +244,11 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
     out = {"as_of": str(last.date()), "as_of_lag_days": int(lag), "generated_at": pd.Timestamp.now("UTC").isoformat(timespec="seconds"),
            "mode": "shadow", "scan_mode": mode, "provisional": provisional,
            "regime": regime, "market": market, "universe_symbols": len(data.frames), "universe": (data.coverage or {}).get("universe"),
-           "stale_symbols": stale, "symbols_too_short": short, "detectors_run": len(DETECTOR_NAMES),
+           "stale_symbols": stale, "stale_symbol_list": stale_names[:60], "symbols_too_short": short, "detectors_run": len(DETECTOR_NAMES),
            "detector_errors": dict(det_errors), "detector_error_samples": det_error_msgs,
            "candidates_raw_by_detector": dict(by_det), "gated": dict(gated),
+           "gated_by_detector": {f"{d_}|{g}": int(n) for (d_, g), n in sorted(gated_det.items())},
+           "rank_by_detector": rank_by_det, "selected_scores": sel_scores, "cutoff_score": min(sel_scores) if sel_scores else None,
            "candidates": len(rows), "selected": len(sel), "not_selected_reasons": dict(rej),
            "picks": [r for r in rows if r["selected"]], "all_candidates": rows[:150],
            "forward_log": forward_summary(flog) if not provisional else None, "log_resolved_this_run": resolved,

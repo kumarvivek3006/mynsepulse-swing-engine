@@ -369,7 +369,8 @@ class UpstoxClient:
 
     # -- history ------------------------------------------------------
     def historical_daily(self, instrument_key: str, start: date, end: date,
-                         chunk_years: int = 1) -> list[list]:
+                         chunk_years: int = 1, label: str | None = None,
+                         failures: list | None = None) -> list[list]:
         """
         Daily candles, oldest first: [timestamp, o, h, l, c, v, oi].
 
@@ -390,8 +391,11 @@ class UpstoxClient:
             if payload.get("status") == "success":
                 out.extend(payload.get("data", {}).get("candles", []))
             else:
-                log.error("history failed %s %s→%s: %s",
-                          instrument_key, cursor, chunk_end, payload)
+                log.error("history failed %s%s %s→%s: %s",
+                          instrument_key, f" ({label})" if label else "", cursor, chunk_end, payload)
+                if failures is not None:                       # lets the caller name the symbol; the return value is unchanged
+                    failures.append({"label": label, "key": instrument_key, "from": str(cursor), "to": str(chunk_end),
+                                     "code": ((payload.get("errors") or [{}])[0] or {}).get("errorCode") if isinstance(payload, dict) else None})
             cursor = chunk_end + timedelta(days=1)
 
         seen, deduped = set(), []

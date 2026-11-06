@@ -19,6 +19,7 @@ live strategy engine, the signals table or the live scan.
   GET  /jobs/engine2-shadow          the latest completed-session scan (watchlist and hypothetical book)
   GET  /jobs/engine2-diagnosis       cup_handle / ascending_base / flag_pennant / asc_triangle: old engine vs corrected definition
   GET  /jobs/engine2-scan            the latest scan summary and the recent runs;  ?mode=intraday for the forming-bar scan
+  GET  /jobs/engine2-candidates      per-candidate score, rank, selected / why not, vs the day's selected scores and cut-off;  ?detector=a,b&since=YYYY-MM-DD
   POST /jobs/engine2/validate        start a validation run now (returns immediately)
   POST /jobs/engine2/scan?mode=      run one scan now (premarket | intraday | postclose); returns immediately
   POST /jobs/engine2/shadow          same as scan?mode=postclose
@@ -594,6 +595,60 @@ def register(app, *, require_internal_key, ist) -> None:
             return intr
         return {"last_scan": last, "recent_runs": list(allruns or [])[-max(1, min(runs, 80)):],
                 "next_runs": _next_runs()}
+
+    @app.get("/jobs/engine2-candidates")
+    def e2_candidates(request: Request, detector: str | None = None, since: str | None = None, until: str | None = None):
+        """
+        Per-candidate record from the forward log: every candidate that reached the score ranking at a non-provisional scan, with
+        its composite score, rank, whether the portfolio selected it and (from 2026-11-06 on) the rule that kept it out - next to
+        the scores of what WAS selected that day and the cut-off. ?detector=episodic_pivot,gap_and_go  &since=2026-10-09.
+
+        Candidates that fired but are missing here were removed by a hard gate (liquidity, data_quality, surveillance) or had no
+        valid stop BEFORE ranking; raw_vs_ranked shows how many, per detector, wherever the day's postclose run record is still kept.
+        Read-only. Nothing here is used by any decision.
+        """
+        require_internal_key(request)
+        from collections import defaultdict
+        conn = connect()
+        try:
+            flog, _ = _get(conn, "engine2_shadow_log")
+            allruns, _ = _get(conn, "engine2_scan_runs")
+        finally:
+            conn.close()
+        want = {d.strip() for d in detector.split(",") if d.strip()} if detector else None
+        raw_by_day = {r["as_of"]: r.get("detector_candidates") or {} for r in (allruns or [])
+                      if r.get("mode") == "postclose" and r.get("status") == "success" and r.get("as_of")}
+        by_day = defaultdict(list)
+        for e in (flog or []):
+            if (since and e["dt"] < since) or (until and e["dt"] > until):
+                continue
+            by_day[e["dt"]].append(e)
+        days = []
+        for dt in sorted(set(by_day) | {d for d in raw_by_day if (not since or d >= since) and (not until or d <= until)}):
+            day = sorted(by_day.get(dt, []), key=lambda e: -e["sc"])
+            rank = {(e["s"], e["d"]): i + 1 for i, e in enumerate(day)}
+            chosen = [e for e in day if e.get("sel")]
+            cutoff = min((e["sc"] for e in chosen), default=None)
+            mine = [e for e in day if want is None or e["d"] in want]
+            raw = raw_by_day.get(dt)
+            if want and not mine and not (raw and any(raw.get(d) for d in want)):
+                continue
+            row = {"date": dt, "ranked_total": len(day), "slots_filled": len(chosen), "cutoff_score": cutoff,
+                   "selected": [{"symbol": e["s"], "detector": e["d"], "score": e["sc"], "rank": rank[(e["s"], e["d"])]} for e in chosen],
+                   "candidates": [{"symbol": e["s"], "detector": e["d"], "score": e["sc"], "quality": e.get("q"),
+                                   "rank": rank[(e["s"], e["d"])], "selected": bool(e.get("sel")),
+                                   "why_not": None if e.get("sel") else (e.get("wn") or "not_recorded"),
+                                   "points_below_cutoff": None if (e.get("sel") or cutoff is None) else round(cutoff - e["sc"], 1)}
+                                  for e in mine]}
+            if raw is not None:
+                dets = want or {d for d, n in raw.items() if n}
+                row["raw_vs_ranked"] = {d: {"raw": raw.get(d, 0), "ranked": sum(1 for e in day if e["d"] == d),
+                                            "removed_before_ranking": raw.get(d, 0) - sum(1 for e in day if e["d"] == d)}
+                                        for d in sorted(dets)}
+            days.append(row)
+        return {"detector_filter": sorted(want) if want else None, "days": days,
+                "note": "score = composite used for ranking; selection takes the highest scores subject to max_positions, heat, sector and correlation caps. "
+                        "raw_vs_ranked needs the day's postclose run record (the last 80 runs are kept)."}
 
     @app.post("/jobs/engine2/scan")
     def e2_scan_now(request: Request, mode: str = "postclose"):

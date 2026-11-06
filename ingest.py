@@ -311,13 +311,17 @@ def backfill_prices(conn, client: UpstoxClient, years: int = BACKFILL_YEARS,
         targets = cur.fetchall()
 
     total = 0
+    failed: list[dict] = []
     for symbol, instrument_key, latest in targets:
         start = (latest + timedelta(days=1)) if latest else default_start
         if only_missing and start > end:
             continue
 
         try:
-            candles = client.historical_daily(instrument_key, start, end)
+            n_before = len(failed)
+            candles = client.historical_daily(instrument_key, start, end, label=symbol, failures=failed)
+            for f_ in failed[n_before:]:
+                f_["last_stored_bar"] = str(latest) if latest else None
         except Exception as exc:
             log.error("Backfill failed for %s: %s", symbol, exc)
             continue
@@ -353,6 +357,14 @@ def backfill_prices(conn, client: UpstoxClient, years: int = BACKFILL_YEARS,
         conn.commit()
         log.debug("%s: %d bars", symbol, len(candles))
 
+    if failed:
+        # One line naming every symbol whose history fetch was rejected, with the newest bar we still hold for it. Before this
+        # the per-symbol error carried only the instrument key, and the symbol (and how stale it had become) had to be dug out
+        # of the database.
+        log.warning("Backfill: %d symbol(s) rejected by the history endpoint (their stored bars stop at 'last_stored_bar'): %s",
+                    len({f_["label"] for f_ in failed}),
+                    "; ".join(f"{f_['label']} {f_['key']} {f_['code']} last_stored_bar={f_['last_stored_bar']}"
+                              for f_ in failed[:25]))
     log.info("Backfill complete: %d bars across %d symbols", total, len(targets))
     return total
 

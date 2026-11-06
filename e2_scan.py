@@ -144,6 +144,24 @@ def detector_line(mode: str, out: dict) -> str:
             f"not selected {out.get('not_selected_reasons') or {}}")
 
 
+def ranking_line(mode: str, out: dict) -> str:
+    """Where the candidates sit in the score ranking, and what happened to every detector that fired but got no slot:
+    how many reached the ranking, its best score and rank, the hard gate that removed the rest, and the portfolio rule
+    that kept the ranked ones out. Observability only: nothing here feeds a decision."""
+    rb = out.get("rank_by_detector") or {}
+    sel = out.get("selected_scores") or []
+    none = {d: {"raw": v["raw"], "ranked": v["ranked"], "best_score": v["best_score"], "best_rank": v["best_rank"],
+                "gated": v["gated"], "not_selected": v["not_selected"]} for d, v in sorted(rb.items()) if not v.get("selected")}
+    return (f"Engine 2 {mode} ranking: {out.get('candidates', 0)} ranked after gates, gated {out.get('gated') or {}} | "
+            f"selected scores {sel or 'none'} (cutoff {out.get('cutoff_score')}) | fired but got no slot {none or 'none'}")
+
+
+def inputs_line(mode: str, out: dict) -> str:
+    """Which symbols were excluded as stale (newest bar older than the scan date) - the per-symbol view of stale_symbols."""
+    return (f"Engine 2 {mode} inputs: universe {out.get('universe_symbols')}, stale {out.get('stale_symbols')} "
+            f"{out.get('stale_symbol_list') or []}, too_short {out.get('symbols_too_short')}")
+
+
 def regime_line(mode: str, out: dict) -> str:
     """One log line with Engine 2's own regime: the band it chose and why. The *_score fields are the 0-100 component
     scores the regime is built from (the VIX score is 100 minus INDIAVIX's 252-session percentile rank, NOT the VIX
@@ -372,6 +390,9 @@ def build_summary(mode: str, out: dict, notes: dict, started: datetime, trigger:
         "detector_errors": errs, "detector_error_samples": out.get("detector_error_samples") or {},
         "degraded": bool(errs),
         "gated": out.get("gated"), "candidates": out.get("candidates", 0),
+        "stale_symbol_list": out.get("stale_symbol_list"), "gated_by_detector": out.get("gated_by_detector"),
+        "rank_by_detector": out.get("rank_by_detector"), "selected_scores": out.get("selected_scores"),
+        "cutoff_score": out.get("cutoff_score"),
         "signals": out.get("selected", 0), "not_selected_reasons": out.get("not_selected_reasons"),
         "regime": {k: reg.get(k) for k in ("state", "score", "size_mult", "max_positions", "breadth", "vix")},
         "validation_running_concurrently": notes.pop("validation_running", False),
@@ -461,6 +482,8 @@ def run(mode: str, trigger: str = "scheduled") -> dict:
             try:
                 log.info("%s", regime_line(mode, out))
                 log.info("%s", detector_line(mode, out))
+                log.info("%s", ranking_line(mode, out))
+                log.info("%s", inputs_line(mode, out))
             except Exception:                             # noqa: BLE001 — a log line must never fail a scan that already published
                 log.exception("Engine 2 regime log line failed (scan unaffected)")
             return s
