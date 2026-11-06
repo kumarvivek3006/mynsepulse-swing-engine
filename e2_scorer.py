@@ -109,12 +109,18 @@ def total(frac: dict, weights: dict = SPEC_WEIGHTS) -> float:
 # to spec scoring: a scan still runs, and the fallback is visible in `scoring_mode()`.
 # ---------------------------------------------------------------------
 WEIGHTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "e2_detector_weights.json")
+POOLED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "e2_pooled_scoring.json")
 _log = logging.getLogger("engine2.scorer")
 _DET: dict = {"model": None, "loaded": False, "error": None}
+_POOL: dict = {"model": None, "loaded": False, "error": None}
+
+
+def _mode() -> str:
+    return os.environ.get("E2_SCORING", "spec").lower()
 
 
 def _model():
-    if os.environ.get("E2_SCORING", "spec").lower() != "detector":
+    if _mode() != "detector":
         return None
     if not _DET["loaded"]:
         _DET["loaded"] = True
@@ -128,20 +134,53 @@ def _model():
     return _DET["model"]
 
 
+def _pooled():
+    """E2_SCORING=pooled: ONE weight set for every detector (volume, relative strength, catalyst; the components whose rank
+    correlation with realised R was >= 0.05 on the train half), mapped monotonically onto the spec composite's distribution so
+    the UI bands keep their meaning. See e2_pooled_scoring.json for the derivation."""
+    if _mode() != "pooled":
+        return None
+    if not _POOL["loaded"]:
+        _POOL["loaded"] = True
+        try:
+            with open(POOLED_FILE) as f:
+                d = json.load(f)
+            _POOL["model"] = {"w": {c: float(d["weights"][c]) for c in COMPONENTS}, "raw_q": np.array(d["raw_q"], float),
+                              "spec_q": np.array(d["spec_q"], float), "name": d.get("name", "pooled")}
+        except Exception as e:                                       # noqa: BLE001
+            _POOL["error"] = f"{type(e).__name__}: {e}"[:200]
+            _log.error("pooled scoring requested but %s could not be loaded (%s): SPEC scoring is in use", POOLED_FILE, _POOL["error"])
+    return _POOL["model"]
+
+
+def _pooled_score(frac: dict) -> tuple[float, float]:
+    m = _pooled()
+    raw = float(sum(m["w"][c] * frac[c] for c in COMPONENTS))
+    return raw, float(np.interp(raw, m["raw_q"], m["spec_q"]))
+
+
 def scoring_mode() -> str:
-    if os.environ.get("E2_SCORING", "spec").lower() != "detector":
-        return "spec (E2_SCORING=spec)"
-    return "detector" if _model() is not None else f"spec (fallback: {_DET['error']})"
+    mode = _mode()
+    if mode == "detector":
+        return "detector" if _model() is not None else f"spec (fallback: {_DET['error']})"
+    if mode == "pooled":
+        return f"pooled:{_POOL['model']['name']}" if _pooled() is not None else f"spec (fallback: {_POOL['error']})"
+    return "spec"
 
 
 def total_for(frac: dict, detector: str) -> float:
-    """The score the scan ranks by: the detector's own weights mapped to expected R, or the spec composite."""
+    """The score the scan ranks by: the pooled evidence-weighted score, the detector's own weights mapped to expected R, or the spec composite."""
+    if _pooled() is not None:
+        return _pooled_score(frac)[1]
     m = _model()
     return m.score(detector, frac) if m is not None else total(frac)
 
 
 def points_for(frac: dict, detector: str) -> dict:
     """What each component contributed under the weights in force (for the per-candidate record)."""
+    pm = _pooled()
+    if pm is not None:
+        return {k: round(float(frac[k]) * pm["w"][k], 1) for k in COMPONENTS}      # raw pooled points (before the band map)
     m = _model()
     w = m.weights(detector) if m is not None else SPEC_WEIGHTS
     return {k: round(float(frac[k]) * w[k], 1) for k in COMPONENTS}

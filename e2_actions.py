@@ -345,7 +345,7 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
     w_pool = dict(zip(SC.COMPONENTS, (float(x) for x in fitted))) if fitted is not None else dict(SC.SPEC_WEIGHTS)
     cal = SC.calibrate([(t.frac, t.r) for t in train], [(t.frac, t.r) for t in test])
     rho_tr = {c: SC._spearman(Xtr[:, k], ytr) for k, c in enumerate(SC.COMPONENTS)}
-    pos = {c: v for c, v in rho_tr.items() if c in ("volume", "rs", "catalyst") and v == v and v >= 0.05}
+    pos = {c: v for c, v in rho_tr.items() if v == v and v >= 0.05}        # the rule applies to all seven components
     w_rho = {c: (100.0 * pos[c] / sum(pos.values()) if c in pos else 0.0) for c in SC.COMPONENTS} if pos else dict(SC.SPEC_WEIGHTS)
 
     schemes = {
@@ -369,6 +369,16 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
                    for sname, fn in schemes.items() if sname in ("S0_spec_global_before", "S3_fitted_weights_plus_expected_R_mapping")}
 
     top = {sname: top_slot(test, fn) for sname, fn in schemes.items()}
+    # S6 as a deployable object: its weights, plus a monotone map from its raw 0-100 value onto the spec composite's own
+    # distribution on the TRAIN half (quantile matching). The map cannot change any ordering, so Spearman and top-slot R are
+    # untouched; it only keeps the score on the scale the UI bands (high >= 80, medium >= 65) were written for.
+    qs = np.linspace(0.0, 1.0, 101)
+    raw6 = np.array([SC.total(t.frac, w_rho) for t in train], float)
+    spec6 = np.array([SC.total(t.frac) for t in train], float)
+    pooled_model = {"version": 1, "name": "volume_rs_catalyst", "weights": {k: round(float(v), 4) for k, v in w_rho.items()},
+                    "raw_q": [round(float(x), 4) for x in np.quantile(raw6, qs)], "spec_q": [round(float(x), 4) for x in np.quantile(spec6, qs)],
+                    "derived_from": f"train half (signals before {mid.date()}), {len(train)} trades; components kept = train Spearman(component, R) >= 0.05",
+                    "train_spearman_by_component": {k: _f(v, 3) for k, v in rho_tr.items()}}
 
     # median score per detector, before / after
     med = {}
@@ -423,7 +433,7 @@ def scoring_study(ctx: Ctx, trades: list[Trade], w0, mid, w1) -> dict:
                                "train_spearman_by_component": {k: _f(v, 3) for k, v in rho_tr.items()}}, "within_detector_test_half": detail_test, "median_score_by_detector": med, "portfolio": port,
             "weights": {d: {k: v for k, v in e.items() if k in ("weights", "prior", "lam", "n_train", "mu", "raw_mean")} for d, e in model.det.items()},
             "cv": model.meta.get("cv"), "slope_R_per_raw_point": _f(model.slope, 5), "global_mean_r_train": _f(model.global_mean),
-            "model_train_only": model.to_json(), "model_full_window_for_deployment": full_model.to_json(),
+            "pooled_model_S6": pooled_model, "model_train_only": model.to_json(), "model_full_window_for_deployment": full_model.to_json(),
             "note": "Headline = S3, declared before the run. Pooled Spearman mixes between-detector and within-detector ordering; "
                     "the within-detector figure isolates what the weights themselves add. Full-window numbers include the train half the model was fitted on."}
 
@@ -601,7 +611,7 @@ def log_markdown(md: str) -> int:
 
 def log_models(d: dict) -> None:
     a1 = d.get("action1_scoring") or {}
-    for label in ("model_train_only", "model_full_window_for_deployment"):
+    for label in ("pooled_model_S6", "model_train_only", "model_full_window_for_deployment"):
         blob = json.dumps(a1.get(label), sort_keys=True, separators=(",", ":"))
         parts = [blob[i:i + 1500] for i in range(0, len(blob), 1500)]
         for k, p in enumerate(parts):

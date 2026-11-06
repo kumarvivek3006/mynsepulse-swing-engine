@@ -167,6 +167,25 @@ os.environ["E2_SCORING"] = "detector"
 SC.WEIGHTS_FILE = "/nonexistent/w.json"
 SC._DET.update(model=None, loaded=False, error=None)
 check("a missing file falls back to spec and says so", abs(SC.total_for(frac0, "a") - SC.total(frac0)) < 1e-9 and "fallback" in SC.scoring_mode())
+print("live switch: E2_SCORING=pooled")
+import numpy as _np
+pj = os.path.join(tempfile.mkdtemp(), "pooled.json")
+_w = {"trend": 0.0, "rs": 30.0, "volume": 45.0, "base": 0.0, "catalyst": 25.0, "sector": 0.0, "regime": 0.0}
+_rawq = [float(x) for x in _np.linspace(0, 60, 101)]
+_specq = [float(x) for x in _np.linspace(30, 95, 101)]
+_json.dump({"version": 1, "name": "t", "weights": _w, "raw_q": _rawq, "spec_q": _specq}, open(pj, "w"))
+SC.POOLED_FILE = pj
+SC._POOL.update(model=None, loaded=False, error=None)
+os.environ["E2_SCORING"] = "pooled"
+lo = {c: 0.0 for c in SC.COMPONENTS}; hi = {c: 1.0 for c in SC.COMPONENTS}; mid = dict(lo, volume=1.0)
+check("pooled mode loads and reports itself", SC.scoring_mode().startswith("pooled"))
+check("pooled score is monotone in the raw weighted sum and lands on the spec scale",
+      SC.total_for(lo, "x") < SC.total_for(mid, "x") < SC.total_for(hi, "x") and 30 <= SC.total_for(lo, "x") and SC.total_for(hi, "x") <= 95)
+check("pooled mode ignores trend/base/sector/regime", abs(SC.total_for(dict(lo, base=1.0, trend=1.0), "x") - SC.total_for(lo, "x")) < 1e-9)
+check("pooled mode does not depend on the detector", abs(SC.total_for(mid, "a") - SC.total_for(mid, "b")) < 1e-12)
+SC.POOLED_FILE = "/nonexistent/p.json"
+SC._POOL.update(model=None, loaded=False, error=None)
+check("a missing pooled file falls back to spec and says so", abs(SC.total_for(mid, "a") - SC.total(mid)) < 1e-9 and "fallback" in SC.scoring_mode())
 os.environ.pop("E2_SCORING", None)
 
 print("the study end to end on synthetic data")
