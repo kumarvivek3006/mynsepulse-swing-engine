@@ -150,6 +150,25 @@ noise = [("n", {c: float(rng.random()) for c in SC.COMPONENTS}, float(rng.standa
 mn = DS.fit_model(noise, ["n"])
 check("on pure noise the shrink keeps the weights near the prior", max(abs(mn.weights("n")[c] - DS.prior_weights("n")[c]) for c in SC.COMPONENTS) < 15 or mn.det["n"]["lam"] <= 0.5)
 
+print("live switch: E2_SCORING")
+import json as _json
+tmpf = os.path.join(tempfile.mkdtemp(), "w.json")
+DS.dump(m, tmpf)
+frac0 = rows[0][1]
+SC.WEIGHTS_FILE = tmpf
+SC._DET.update(model=None, loaded=False, error=None)
+os.environ["E2_SCORING"] = "detector"
+check("detector mode loads the file and scores through it", SC.scoring_mode() == "detector" and abs(SC.total_for(frac0, "a") - m.score("a", frac0)) < 1e-9)
+pts = SC.points_for(frac0, "a")
+check("points use the detector's weights", abs(sum(pts.values()) - m.raw("a", frac0)) < 0.2)
+os.environ["E2_SCORING"] = "spec"
+check("E2_SCORING=spec restores the global composite", abs(SC.total_for(frac0, "a") - SC.total(frac0)) < 1e-9 and SC.scoring_mode().startswith("spec"))
+os.environ["E2_SCORING"] = "detector"
+SC.WEIGHTS_FILE = "/nonexistent/w.json"
+SC._DET.update(model=None, loaded=False, error=None)
+check("a missing file falls back to spec and says so", abs(SC.total_for(frac0, "a") - SC.total(frac0)) < 1e-9 and "fallback" in SC.scoring_mode())
+os.environ.pop("E2_SCORING", None)
+
 print("the study end to end on synthetic data")
 out = {"state": "running"}
 A.compute(make_market(n_stocks=25, n_days=950, seed=5), None, out)

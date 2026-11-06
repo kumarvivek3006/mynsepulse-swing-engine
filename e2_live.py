@@ -143,7 +143,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
             rs = pn.rs_pct.iat[row, pn.rs_pct.columns.get_loc(sym)] if sym in pn.rs_pct.columns else np.nan
             rk = pn.sector_rank.iat[row, pn.sector_rank.columns.get_loc(sec)] if sec in pn.sector_rank.columns else np.nan
             frac = SC.components(b, c, rs, SE.sector_points(rk, int(pn.sector_rank.iloc[row].notna().sum())), state)
-            c.score_parts, c.score = frac, SC.total(frac)
+            c.score_parts, c.score = frac, SC.total_for(frac, c.detector)
             plan = plan_for(b, c, mult)
             if plan is None:
                 gated["no_valid_stop"] += 1
@@ -158,7 +158,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
                          "score": round(c.score, 1), "quality": round(c.quality, 1), "pivot": round(c.pivot, 2),
                          "sector": sec, "rs_percentile": None if np.isnan(rs) else round(float(rs), 1),
                          "components": {k: round(float(v), 3) for k, v in frac.items() if not k.startswith("_")},
-                         "points": {k: round(float(frac[k]) * SC.SPEC_WEIGHTS[k], 1) for k in SC.COMPONENTS},   # what each component added to the score
+                         "points": SC.points_for(frac, c.detector),   # what each component added under the weights in force (detector or spec)
                          "catalyst_source": frac["_catalyst_source"], "next_results": nxt, "plan": plan, "meta": c.meta})
     rows.sort(key=lambda r: -r["score"])
     for i_, r_ in enumerate(rows, 1):
@@ -244,7 +244,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
 
     lag = (pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None) - last.normalize()).days
     out = {"as_of": str(last.date()), "as_of_lag_days": int(lag), "generated_at": pd.Timestamp.now("UTC").isoformat(timespec="seconds"),
-           "mode": "shadow", "scan_mode": mode, "provisional": provisional,
+           "mode": "shadow", "scan_mode": mode, "scoring": SC.scoring_mode(), "provisional": provisional,
            "regime": regime, "market": market, "universe_symbols": len(data.frames), "universe": (data.coverage or {}).get("universe"),
            "stale_symbols": stale, "stale_symbol_list": stale_names[:60], "symbols_too_short": short, "detectors_run": len(DETECTOR_NAMES),
            "detector_errors": dict(det_errors), "detector_error_samples": det_error_msgs,

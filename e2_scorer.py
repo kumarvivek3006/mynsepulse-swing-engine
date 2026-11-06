@@ -18,6 +18,10 @@ report says so.
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -98,6 +102,50 @@ def components(b: Bars, cand: Candidate, rs_pct: float | None, sector_pts: float
 
 def total(frac: dict, weights: dict = SPEC_WEIGHTS) -> float:
     return float(sum(weights[c] * frac[c] for c in COMPONENTS))
+
+
+# ---------------------------------------------------------------------
+# detector-specific scoring (ACTION 1, 6 Nov): E2_SCORING=detector (default once e2_detector_weights.json is committed)
+# or spec (the single global weight set). A missing or unreadable weights file is logged at ERROR and the scan falls back
+# to spec scoring: a scan still runs, and the fallback is visible in `scoring_mode()`.
+# ---------------------------------------------------------------------
+WEIGHTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "e2_detector_weights.json")
+_log = logging.getLogger("engine2.scorer")
+_DET: dict = {"model": None, "loaded": False, "error": None}
+
+
+def _model():
+    if os.environ.get("E2_SCORING", "detector").lower() != "detector":
+        return None
+    if not _DET["loaded"]:
+        _DET["loaded"] = True
+        try:
+            import e2_dscore
+            _DET["model"] = e2_dscore.load(WEIGHTS_FILE)
+        except Exception as e:                                       # noqa: BLE001
+            _DET["error"] = f"{type(e).__name__}: {e}"[:200]
+            _log.error("detector-specific scoring requested but %s could not be loaded (%s): SPEC scoring is in use",
+                       WEIGHTS_FILE, _DET["error"])
+    return _DET["model"]
+
+
+def scoring_mode() -> str:
+    if os.environ.get("E2_SCORING", "detector").lower() != "detector":
+        return "spec (E2_SCORING=spec)"
+    return "detector" if _model() is not None else f"spec (fallback: {_DET['error']})"
+
+
+def total_for(frac: dict, detector: str) -> float:
+    """The score the scan ranks by: the detector's own weights mapped to expected R, or the spec composite."""
+    m = _model()
+    return m.score(detector, frac) if m is not None else total(frac)
+
+
+def points_for(frac: dict, detector: str) -> dict:
+    """What each component contributed under the weights in force (for the per-candidate record)."""
+    m = _model()
+    w = m.weights(detector) if m is not None else SPEC_WEIGHTS
+    return {k: round(float(frac[k]) * w[k], 1) for k in COMPONENTS}
 
 
 # ---------------------------------------------------------------------
