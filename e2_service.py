@@ -268,6 +268,27 @@ def run_scan_slot(mode: str, trigger: str = "scheduled") -> dict:
     return result
 
 
+def log_candidates() -> dict:
+    """
+    Write the per-candidate record for the detectors that have had no slot (default episodic_pivot and gap_and_go, from the
+    cutover) into the service log, one E2CAND| line per day, so it is readable from the Railway log as well as from
+    GET /jobs/engine2-candidates. Runs once after each start. Read-only.
+    """
+    import json as _json
+    from ingest import connect
+    dets = os.environ.get("E2_CANDIDATE_LOG_DETECTORS", "episodic_pivot,gap_and_go")
+    since = os.environ.get("E2_CANDIDATE_LOG_SINCE", "2026-10-09")
+    conn = connect()
+    try:
+        rep = candidates_report(conn, dets, since, None)
+    finally:
+        conn.close()
+    for d in rep["days"]:
+        log.info("E2CAND| %s", _json.dumps(d, separators=(",", ":"), default=str))
+    log.info("E2CAND| %d day(s) with candidates from %s for %s", len(rep["days"]), since, dets)
+    return {"days": len(rep["days"])}
+
+
 def log_report() -> dict:
     """
     Write the stored validation report and the pattern diagnosis into the service log, one line per row
@@ -336,6 +357,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_report_log", log_report], id="engine2_report_log_late", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=15), timezone=ist),
                           args=["engine2_defdiag", _defdiag_if_idle], id="engine2_defdiag_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
+                          args=["engine2_candidates_log", log_candidates], id="engine2_candidates_log_boot", replace_existing=True)
         if now.hour >= 22 or now.hour < 5:                      # deployed overnight: do not wait a day
             scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=3), timezone=ist),
                               args=["engine2_validate", _validate_if_needed], id="engine2_validate_boot", replace_existing=True)
@@ -474,6 +497,47 @@ def render_markdown(rep: dict) -> str:
     return "\n".join(L)
 
 
+def candidates_report(conn, detector: str | None = None, since: str | None = None, until: str | None = None) -> dict:
+    """Per-candidate record from the forward log; see GET /jobs/engine2-candidates. Read-only."""
+    from collections import defaultdict
+    flog, _ = _get(conn, "engine2_shadow_log")
+    allruns, _ = _get(conn, "engine2_scan_runs")
+    want = {d.strip() for d in detector.split(",") if d.strip()} if detector else None
+    raw_by_day = {r["as_of"]: r.get("detector_candidates") or {} for r in (allruns or [])
+                  if r.get("mode") == "postclose" and r.get("status") == "success" and r.get("as_of")}
+    by_day = defaultdict(list)
+    for e in (flog or []):
+        if (since and e["dt"] < since) or (until and e["dt"] > until):
+            continue
+        by_day[e["dt"]].append(e)
+    days = []
+    for dt in sorted(set(by_day) | {d for d in raw_by_day if (not since or d >= since) and (not until or d <= until)}):
+        day = sorted(by_day.get(dt, []), key=lambda e: -e["sc"])
+        rank = {(e["s"], e["d"]): i + 1 for i, e in enumerate(day)}
+        chosen = [e for e in day if e.get("sel")]
+        cutoff = min((e["sc"] for e in chosen), default=None)
+        mine = [e for e in day if want is None or e["d"] in want]
+        raw = raw_by_day.get(dt)
+        if want and not mine and not (raw and any(raw.get(d) for d in want)):
+            continue
+        row = {"date": dt, "ranked_total": len(day), "slots_filled": len(chosen), "cutoff_score": cutoff,
+               "selected": [{"symbol": e["s"], "detector": e["d"], "score": e["sc"], "rank": rank[(e["s"], e["d"])]} for e in chosen],
+               "candidates": [{"symbol": e["s"], "detector": e["d"], "score": e["sc"], "quality": e.get("q"),
+                               "rank": rank[(e["s"], e["d"])], "selected": bool(e.get("sel")),
+                               "why_not": None if e.get("sel") else (e.get("wn") or "not_recorded"),
+                               "points_below_cutoff": None if (e.get("sel") or cutoff is None) else round(cutoff - e["sc"], 1)}
+                              for e in mine]}
+        if raw is not None:
+            dets = want or {d for d, n in raw.items() if n}
+            row["raw_vs_ranked"] = {d: {"raw": raw.get(d, 0), "ranked": sum(1 for e in day if e["d"] == d),
+                                        "removed_before_ranking": raw.get(d, 0) - sum(1 for e in day if e["d"] == d)}
+                                    for d in sorted(dets)}
+        days.append(row)
+    return {"detector_filter": sorted(want) if want else None, "days": days,
+            "note": "score = composite used for ranking; selection takes the highest scores subject to max_positions, heat, sector and correlation caps. "
+                    "raw_vs_ranked needs the day's postclose run record (the last 80 runs are kept)."}
+
+
 def register(app, *, require_internal_key, ist) -> None:
     from ingest import connect
 
@@ -608,47 +672,11 @@ def register(app, *, require_internal_key, ist) -> None:
         Read-only. Nothing here is used by any decision.
         """
         require_internal_key(request)
-        from collections import defaultdict
         conn = connect()
         try:
-            flog, _ = _get(conn, "engine2_shadow_log")
-            allruns, _ = _get(conn, "engine2_scan_runs")
+            return candidates_report(conn, detector, since, until)
         finally:
             conn.close()
-        want = {d.strip() for d in detector.split(",") if d.strip()} if detector else None
-        raw_by_day = {r["as_of"]: r.get("detector_candidates") or {} for r in (allruns or [])
-                      if r.get("mode") == "postclose" and r.get("status") == "success" and r.get("as_of")}
-        by_day = defaultdict(list)
-        for e in (flog or []):
-            if (since and e["dt"] < since) or (until and e["dt"] > until):
-                continue
-            by_day[e["dt"]].append(e)
-        days = []
-        for dt in sorted(set(by_day) | {d for d in raw_by_day if (not since or d >= since) and (not until or d <= until)}):
-            day = sorted(by_day.get(dt, []), key=lambda e: -e["sc"])
-            rank = {(e["s"], e["d"]): i + 1 for i, e in enumerate(day)}
-            chosen = [e for e in day if e.get("sel")]
-            cutoff = min((e["sc"] for e in chosen), default=None)
-            mine = [e for e in day if want is None or e["d"] in want]
-            raw = raw_by_day.get(dt)
-            if want and not mine and not (raw and any(raw.get(d) for d in want)):
-                continue
-            row = {"date": dt, "ranked_total": len(day), "slots_filled": len(chosen), "cutoff_score": cutoff,
-                   "selected": [{"symbol": e["s"], "detector": e["d"], "score": e["sc"], "rank": rank[(e["s"], e["d"])]} for e in chosen],
-                   "candidates": [{"symbol": e["s"], "detector": e["d"], "score": e["sc"], "quality": e.get("q"),
-                                   "rank": rank[(e["s"], e["d"])], "selected": bool(e.get("sel")),
-                                   "why_not": None if e.get("sel") else (e.get("wn") or "not_recorded"),
-                                   "points_below_cutoff": None if (e.get("sel") or cutoff is None) else round(cutoff - e["sc"], 1)}
-                                  for e in mine]}
-            if raw is not None:
-                dets = want or {d for d, n in raw.items() if n}
-                row["raw_vs_ranked"] = {d: {"raw": raw.get(d, 0), "ranked": sum(1 for e in day if e["d"] == d),
-                                            "removed_before_ranking": raw.get(d, 0) - sum(1 for e in day if e["d"] == d)}
-                                        for d in sorted(dets)}
-            days.append(row)
-        return {"detector_filter": sorted(want) if want else None, "days": days,
-                "note": "score = composite used for ranking; selection takes the highest scores subject to max_positions, heat, sector and correlation caps. "
-                        "raw_vs_ranked needs the day's postclose run record (the last 80 runs are kept)."}
 
     @app.post("/jobs/engine2/scan")
     def e2_scan_now(request: Request, mode: str = "postclose"):
