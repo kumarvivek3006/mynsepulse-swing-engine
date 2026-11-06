@@ -35,11 +35,21 @@ check("net of costs subtracts 0.50", abs(s["net_of_costs_pct"] - 0.25) < 1e-9)
 check("both halves reported and the horizon passes", s["h1"]["n"] > 0 and s["h2"]["n"] > 0 and s["pass"])
 check("interval brackets the mean", s["ci95"][0] <= s["mean_adj_pct"] <= s["ci95"][1])
 per = {5: {"n": 10, "mean_adj_pct": 0.5, "pass": True}, 10: {"n": 10, "mean_adj_pct": 0.4, "pass": True}, 20: {"n": 10, "mean_adj_pct": -0.2, "pass": False}}
-check("triage: 2 of 3 horizons pass = positive", F.triage(per) == "positive")
+check("triage: 2 of 3 horizons pass = positive", F.triage_vs_zero(per) == "positive")
 per2 = {h: {"n": 10, "mean_adj_pct": -0.1, "pass": False} for h in F.HORIZONS}
-check("triage: all horizons <= 0 = negative", F.triage(per2) == "negative")
+check("triage: all horizons <= 0 = negative", F.triage_vs_zero(per2) == "negative")
 per3 = {5: {"n": 10, "mean_adj_pct": 0.3, "pass": True}, 10: {"n": 10, "mean_adj_pct": -0.1, "pass": False}, 20: {"n": 10, "mean_adj_pct": -0.5, "pass": False}}
-check("triage: good early and fading = mixed", F.triage(per3) == "mixed")
+check("triage: good early and fading = mixed", F.triage_vs_zero(per3) == "mixed")
+def st(m, h1, h2): return {"n": 100, "mean_adj_pct": m, "h1": {"mean_adj_pct": h1}, "h2": {"mean_adj_pct": h2}}
+ctl = {h: {"n": 1000, "mean_adj_pct": 0.5, "ci95": [0.2, 0.8], "h1": {"mean_adj_pct": 0.5}, "h2": {"mean_adj_pct": 0.5}} for h in F.HORIZONS}     # half-width 0.3
+beat = {5: st(0.9, 0.8, 1.0), 10: st(0.9, 0.8, 1.0), 20: st(0.6, 0.6, 0.6)}
+check("control-relative: beating the control by >= half its interval width at 2 of 3 horizons, both halves = positive", F.triage(beat, ctl) == "positive")
+near = {h: st(0.71, 0.7, 0.72) for h in F.HORIZONS}
+check("control-relative: +0.71 against a control of 0.5 (interval half-width 0.3) is NOT positive", F.triage(near, ctl) != "positive")
+oneh = {5: st(0.9, 0.9, 0.2), 10: st(0.9, 0.9, 0.9), 20: st(0.9, 0.9, 0.9)}
+check("control-relative: a half that does not beat the control fails that horizon", F.triage(oneh, ctl) == "positive")   # 10 and 20 still pass
+worse = {h: st(0.1, 0.1, 0.1) for h in F.HORIZONS}
+check("control-relative: at or below the control at every horizon = negative", F.triage(worse, ctl) == "negative")
 
 print("end to end on synthetic data")
 out = {}

@@ -15,11 +15,13 @@ which is what a detector has to beat.
 Rows for pocket_pivot: the live definition (rung 3, shadowed), the strict definition (rung 0) and the original loose one (legacy), so the
 definition question can be read next to the class question.
 
-Triage rule, declared before the run. A horizon PASSES when mean adjusted return > 0 in the full sample and in both halves.
+Triage rule (revised 7 Nov 01:25 IST by the owner: the benchmark is the control row, not zero). A horizon PASSES when the detector's mean adjusted
+return beats the control's mean at that horizon by at least HALF THE WIDTH of the control's 95% interval, and beats the control's mean in BOTH halves.
   positive  - at least 2 of the 3 horizons pass
-  negative  - mean adjusted return <= 0 at all three horizons
+  negative  - mean adjusted return <= the control's at all three horizons
   mixed     - everything else (read the per-horizon line: good early and fading, or the reverse)
-A "positive" with the interval straddling zero is reported as exactly that. The diagnosis queue is ordered by mean adjusted return at 10 sessions.
+`triage_vs_zero` keeps the first rule (mean > 0 in the full sample and both halves) for comparison with the 7 Nov 00:50 report.
+A "positive" whose interval straddles the control is reported as exactly that. The diagnosis queue is ordered by mean adjusted return at 10 sessions.
 
 Measurement only: no detector, gate, score or exit is touched. Writes engine_settings.engine2_fwd; logs E2FWD| lines; GET /jobs/engine2-fwd.
 """
@@ -99,7 +101,28 @@ class Acc:
                 "pass": bool(adj.mean() > 0 and len(h1) and len(h2) and h1.mean() > 0 and h2.mean() > 0)}
 
 
-def triage(per_h: dict) -> str:
+def triage(per_h: dict, ctl: dict | None = None) -> str:
+    """Control-relative rule when `ctl` (the control row's per-horizon stats) is given; otherwise the original rule against zero."""
+    if ctl is not None:
+        passes, below, seen = 0, 0, 0
+        for h in HORIZONS:
+            s, c = per_h[h], ctl[h]
+            if not s.get("n") or not c.get("n") or s.get("mean_adj_pct") is None:
+                continue
+            seen += 1
+            need = 0.5 * (c["ci95"][1] - c["ci95"][0])
+            beats = s["mean_adj_pct"] - c["mean_adj_pct"] >= need
+            both = (s["h1"]["mean_adj_pct"] is not None and s["h2"]["mean_adj_pct"] is not None
+                    and s["h1"]["mean_adj_pct"] > c["h1"]["mean_adj_pct"] and s["h2"]["mean_adj_pct"] > c["h2"]["mean_adj_pct"])
+            passes += bool(beats and both)
+            below += bool(s["mean_adj_pct"] <= c["mean_adj_pct"])
+        if not seen:
+            return "no_data"
+        return "positive" if passes >= 2 else ("negative" if below == seen else "mixed")
+    return triage_vs_zero(per_h)
+
+
+def triage_vs_zero(per_h: dict) -> str:
     means = [per_h[h].get("mean_adj_pct") for h in HORIZONS if per_h[h].get("n")]
     if not means:
         return "no_data"
@@ -177,10 +200,14 @@ def compute(data, out: dict) -> dict:
     out["window"] = {"start": str(w0.date()), "split": str(mid.date()), "end": str(pn.cal[-1].date())}
     acc, gated = collect(data, pn, w0)
     rows = {}
-    for det, a in sorted(acc.items()):
-        per = {str(h): a.stats(h, mid64) for h in HORIZONS}
-        per_int = {h: per[str(h)] for h in HORIZONS}
-        rows[det] = {"horizons": per, "triage": triage(per_int) if not det.startswith("ALL_BARS") else "control"}
+    stats = {det: {h: a.stats(h, mid64) for h in HORIZONS} for det, a in sorted(acc.items())}
+    ctl = stats["ALL_BARS (control)"]
+    for det, per_int in stats.items():
+        is_ctl = det.startswith("ALL_BARS")
+        rows[det] = {"horizons": {str(h): per_int[h] for h in HORIZONS},
+                     "triage": "control" if is_ctl else triage(per_int, ctl), "triage_vs_zero": "control" if is_ctl else triage_vs_zero(per_int),
+                     "excess_vs_control_pct": None if is_ctl else {str(h): _f((per_int[h].get("mean_adj_pct") or 0) - (ctl[h].get("mean_adj_pct") or 0))
+                                                                  for h in HORIZONS if per_int[h].get("n")}}
     out["detectors"] = rows
     out["gated"] = gated
     live = {d: r for d, r in rows.items() if r["triage"] != "control" and not d.startswith("pocket_pivot_")}
@@ -241,7 +268,8 @@ def render_markdown(d: dict) -> str:
                 continue
             parts.append(f"h{h}: n{s['n']} adj {_p(s['mean_adj_pct'])}% CI{s['ci95']} med {_p(s['median_adj_pct'])} pos {s['pos_pct']}% "
                          f"halves {_p(s['h1']['mean_adj_pct'])}/{_p(s['h2']['mean_adj_pct'])} net {_p(s['net_of_costs_pct'])}")
-        L.append(f"{det} [{r['triage']}]: " + " | ".join(parts))
+        ex = r.get("excess_vs_control_pct")
+        L.append(f"{det} [{r['triage']}; vs zero: {r.get('triage_vs_zero')}]" + (f" excess vs control {ex}" if ex else "") + ": " + " | ".join(parts))
     L.append("## diagnosis queue (10-session adjusted return, strongest first)")
     for q in d.get("diagnosis_queue_by_10bar_adj") or []:
         L.append(f"{q['detector']}: {q['mean_adj_pct_10']} (n {q['n']}) {q['triage']}")

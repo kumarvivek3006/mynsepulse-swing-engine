@@ -148,5 +148,34 @@ check("stop-out rates are percentages", all(0 <= x["stop_out_pct"] <= 100 and 0 
 check("report is JSON-serialisable and renders", bool(EX.render_markdown({**out, "state": "done"})) and bool(__import__("json").dumps(out, default=str)))
 check("paired deltas exist for every non-base variant", set(out["paired_vs_base"]) == set(EX.ALL) - {"BASE"})
 
+
+print("horizon rulebooks (e2_exits_wl)")
+import e2_exits_wl as XW
+b, t0 = run([bar(100, 100.5, 99.5, 100)] + flat(1), XW.H5["S3"])
+R = t0.entry - t0.stop0
+b, tr = run([bar(100, 100.5, 99.5, 100), bar(100, t0.entry + 1.6 * R, 99.9, t0.entry + 1.2 * R)] + flat(10), XW.H5["S3"])
+check("S3: the whole position is sold at +1.5R and the trade ends there", len(tr.exits) == 1 and abs(tr.exits[0][2] - 1.0) < 1e-9 and tr.reason == "T1" and tr.r > 1.2, f"{tr.exits} {tr.reason} {tr.r}")
+b, tr = run([bar(100, 100.5, 99.5, 100)] + flat(12), XW.H5["S1"])
+check("S1: hard exit at the next open after bar 5", tr.reason == "time_stop" and tr.bars == 6, f"{tr.reason} {tr.bars}")
+b, tr = run([bar(100, 100.5, 99.5, 100)] + flat(30), XW.H20["L1"])
+check("L1: no time stop before bar 20, hard exit after it", tr.reason == "time_stop" and tr.bars == 21, f"{tr.reason} {tr.bars}")
+b, tr0 = run([bar(100, 100.5, 99.5, 100)] + flat(1), XW.H20["L1"])
+R = tr0.entry - tr0.stop0
+b, tr = run([bar(100, 100.5, 99.5, 100), bar(100, tr0.entry + 3.1 * R, 99.9, tr0.entry + 2.5 * R)] + flat(25), XW.H20["L1"])
+check("L1: 50% sold at +3R, then the rest runs to the time exit", tr.exits[0][3] == "T1" and abs(tr.exits[0][2] - 0.5) < 1e-9, str(tr.exits))
+b, t0 = run([bar(100, 100.5, 99.5, 100)] + flat(1), XW.H5["S1"])
+R = t0.entry - t0.stop0
+b, tr = run([bar(100, 100.5, 99.5, 100), bar(100, t0.entry + 0.9 * R, 99.9, t0.entry + 0.8 * R), bar(t0.entry + 0.8 * R, t0.entry + 0.8 * R, t0.entry - 0.5 * R, t0.entry - 0.5 * R)] + flat(5), XW.H5["S1"])
+check("trail 'none': a run-up then a pullback does not exit at break-even or a trailed level (the initial stop is not touched)", tr.reason == "time_stop" and tr.r < 0.2, f"{tr.reason} {tr.exits}")
+
+print("the whitelist study end to end on synthetic data")
+XW.WHITELIST = ("pullback_ema", "pocket_pivot")
+out2 = {}
+XW.compute(make_market(n_stocks=25, n_days=950, seed=5), out2)
+check("every rulebook reported for each detector and both together", all(set(out2["by_detector"][d]) == set(XW.ALL) for d in ("pullback_ema", "pocket_pivot", "BOTH")))
+check("rules evaluated", "passing" in out2["part1_rule"] and "mode_5_session_passing" in out2["part2_rule"])
+check("candidate counts identical across rulebooks", all(len({v["candidates"] for v in out2["by_detector"][d].values()}) == 1 for d in out2["by_detector"]))
+check("renders and serialises", bool(XW.render_markdown({**out2, "state": "done"})) and bool(__import__("json").dumps(out2, default=str)))
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

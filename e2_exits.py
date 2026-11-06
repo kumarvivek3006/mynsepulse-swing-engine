@@ -211,6 +211,8 @@ def simulate_x(b: Bars, cand: Candidate, events: np.ndarray | None, X: ExitSpec)
         if X.trail == "base":
             if stage == 2:
                 stop_now = max(stop_now, min(float(b.ema20[t]), hh_close - MG.TRAIL_ATR * float(b.atr14[t])), entry)
+        elif X.trail == "none":
+            pass
         elif X.trail == "chand":
             a = float(b.atr14[t])
             if not np.isnan(a):
@@ -244,6 +246,8 @@ def simulate_x(b: Bars, cand: Candidate, events: np.ndarray | None, X: ExitSpec)
     tr.bars = tr.exit_idx - e + 1
     tr.ret = realised - COST_RT
     tr.r = tr.ret / tr.risk_frac if tr.risk_frac > 0 else 0.0
+    if not tr.reason:
+        tr.reason = tr.exits[-1][3]                                    # a full exit at the partial level = a target hit
     tr.mfe_r, tr.mae_r = float(mfe), float(mae)
     m = np.array(marks, float)
     tr.marks, tr.mark_dates = m, b.date[e:e + len(m)]

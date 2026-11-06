@@ -208,32 +208,45 @@ def compute(data, detector: str, out: dict) -> dict:
 
 
 def run(detector: str, conn=None, trigger: str = "manual") -> dict:
+    """`detector` may be a comma-separated list: the history is loaded once and each detector is diagnosed in turn (one result per detector)."""
     from ingest import connect
     own = conn is None
     conn = conn or connect()
-    t0 = time.time()
-    out = {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "trigger": trigger, "state": "running", "note": "Measurement only."}
+    names = [d.strip() for d in detector.split(",") if d.strip()]
+    data, load_err = None, None
     try:
         data = BT.load_from_db(conn)
-        compute(data, detector, out)
-        out["state"] = "done"
     except Exception as e:                                                             # noqa: BLE001
-        log.exception("forward-return diagnosis failed")
-        out["state"], out["error"] = "failed", f"{type(e).__name__}: {e}"[:300]
-    out["runtime_sec"] = round(time.time() - t0)
+        log.exception("forward-return diagnosis: loading failed")
+        load_err = f"{type(e).__name__}: {e}"[:300]
+    last = {}
     try:
-        with conn.cursor() as cur:
-            cur.execute("insert into engine_settings (key, value, updated_at) values (%s, %s::jsonb, now()) "
-                        "on conflict (key) do update set value = excluded.value, updated_at = now()", (key_for(detector), json.dumps(out, default=str)))
-        conn.commit()
-    except Exception:                                                                  # noqa: BLE001
-        log.exception("could not store the diagnosis")
-    try:
-        log_markdown(render_markdown(out))
+        for det in names:
+            t0 = time.time()
+            out = {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "trigger": trigger, "state": "running", "note": "Measurement only."}
+            if load_err:
+                out["state"], out["error"], out["detector"] = "failed", load_err, det
+            else:
+                try:
+                    compute(data, det, out)
+                    out["state"] = "done"
+                except Exception as e:                                                 # noqa: BLE001
+                    log.exception("forward-return diagnosis failed for %s", det)
+                    out["state"], out["error"], out["detector"] = "failed", f"{type(e).__name__}: {e}"[:300], det
+            out["runtime_sec"] = round(time.time() - t0)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("insert into engine_settings (key, value, updated_at) values (%s, %s::jsonb, now()) "
+                                "on conflict (key) do update set value = excluded.value, updated_at = now()", (key_for(det), json.dumps(out, default=str)))
+                conn.commit()
+            except Exception:                                                          # noqa: BLE001
+                log.exception("could not store the diagnosis")
+            log_markdown(render_markdown(out))
+            last = out
     finally:
         if own:
             conn.close()
-    return out
+    return last
 
 
 def render_markdown(d: dict) -> str:
