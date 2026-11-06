@@ -31,6 +31,8 @@ live strategy engine, the signals table or the live scan.
   GET  /jobs/engine2-exits           the 6 Nov exit redesign study: variants A-D vs the live exits (?format=md); logged as E2EXIT| lines
   GET  /jobs/engine2-fwd             the 7 Nov forward-return test: market-adjusted 5/10/20-session returns by detector, no stops (?format=md); E2FWD| lines
   POST /jobs/engine2/fwd             run it now (also runs ~24 minutes after a deploy while E2_FWD_BOOT=1)
+  GET  /jobs/engine2-fwddiag         forward returns inside ONE detector split by signal-bar context (?detector=pullback_ema&format=md); E2FWDD| lines
+  POST /jobs/engine2/fwddiag         run it now (?detector=); also ~28 minutes after a deploy for E2_FWDDIAG_DETECTOR (default pullback_ema) while E2_FWDDIAG_BOOT=1
   POST /jobs/engine2/exits           run it now (also runs ~22 minutes after a deploy while E2_EXITS_BOOT=1)
   POST /jobs/engine2/diagnose        re-run the disabled-pattern diagnosis now (it also runs ahead of every validation)
 """
@@ -148,7 +150,7 @@ def run_validation_blocking(trigger: str = "manual") -> dict:
         conn.close()
 
 
-def _spawn(kind: str, trigger: str) -> dict:
+def _spawn(kind: str, trigger: str, extra_env: dict | None = None) -> dict:
     """Start the work in its own interpreter. Returns at once. kind: 'validate' | 'scan:<mode>'."""
     with _lock:
         if kind.startswith("scan:"):
@@ -156,6 +158,7 @@ def _spawn(kind: str, trigger: str) -> dict:
         else:
             cmd = [sys.executable, os.path.abspath(__file__), kind, trigger]
         env = dict(os.environ)
+        env.update(extra_env or {})
         p = subprocess.Popen(cmd, cwd=os.path.dirname(os.path.abspath(__file__)), env=env)   # inherits stdout/stderr -> Railway logs
         threading.Thread(target=p.wait, daemon=True).start()                                  # reap it, no zombie
         return {"started": True, "kind": kind, "pid": p.pid, "trigger": trigger}
@@ -207,11 +210,20 @@ def _exits_if_idle() -> dict:
 
 def _fwd_if_idle() -> dict:
     """Boot job for the forward-return test (loads the full history: never alongside a validation run)."""
-    if os.environ.get("E2_FWD_BOOT", "1") != "1":
+    if os.environ.get("E2_FWD_BOOT", "0") != "1":                  # finished 7 Nov
         return {"skipped": "E2_FWD_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwd when it has finished"}
     return _spawn("fwd", "boot")
+
+
+def _fwddiag_if_idle() -> dict:
+    """Boot job for the one-detector forward-return diagnosis (the detector under triage today)."""
+    if os.environ.get("E2_FWDDIAG_BOOT", "1") != "1":
+        return {"skipped": "E2_FWDDIAG_BOOT is not 1"}
+    if _running_here():
+        return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwddiag when it has finished"}
+    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "pullback_ema")})
 
 
 def _validate_if_needed() -> dict:
@@ -418,6 +430,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_exits", _exits_if_idle], id="engine2_exits_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=26), timezone=ist),
                           args=["engine2_fwd", _fwd_if_idle], id="engine2_fwd_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=28), timezone=ist),
+                          args=["engine2_fwddiag", _fwddiag_if_idle], id="engine2_fwddiag_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
                           args=["engine2_candidates_log", log_candidates], id="engine2_candidates_log_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=8), timezone=ist),
@@ -802,6 +816,27 @@ def register(app, *, require_internal_key, ist) -> None:
             return {"started": False, "reason": "a validation run is in progress"}
         return _spawn("fwd", "manual")
 
+    @app.get("/jobs/engine2-fwddiag")
+    def e2_fwddiag_view(request: Request, detector: str = "pullback_ema", format: str = "json"):
+        """Forward returns inside one detector, split by signal-bar context (measurement only)."""
+        require_internal_key(request)
+        import e2_fwddiag
+        conn = connect()
+        try:
+            d, _ = _get(conn, e2_fwddiag.key_for(detector))
+        finally:
+            conn.close()
+        if not d:
+            raise HTTPException(404, f"no diagnosis stored for {detector} (POST /jobs/engine2/fwddiag?detector={detector})")
+        return PlainTextResponse(e2_fwddiag.render_markdown(d)) if format == "md" else d
+
+    @app.post("/jobs/engine2/fwddiag")
+    def e2_fwddiag_now(request: Request, detector: str = "pullback_ema"):
+        require_internal_key(request)
+        if _running_here():
+            return {"started": False, "reason": "a validation run is in progress"}
+        return _spawn("fwddiag", "manual", {"E2_FWDDIAG_DETECTOR": detector})
+
     @app.get("/jobs/engine2-shadow")
     def e2_shadow(request: Request):
         require_internal_key(request)
@@ -894,6 +929,10 @@ if __name__ == "__main__":                                    # the child proces
     if kind == "defdiag":
         import e2_defdiag
         print(json.dumps({k: v for k, v in e2_defdiag.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "fwddiag":
+        import e2_fwddiag
+        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "pullback_ema"), trigger=trig).items()
+                          if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwd":
         import e2_fwd
         print(json.dumps({k: v for k, v in e2_fwd.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
