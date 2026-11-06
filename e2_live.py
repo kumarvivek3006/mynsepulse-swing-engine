@@ -158,6 +158,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
                          "score": round(c.score, 1), "quality": round(c.quality, 1), "pivot": round(c.pivot, 2),
                          "sector": sec, "rs_percentile": None if np.isnan(rs) else round(float(rs), 1),
                          "components": {k: round(float(v), 3) for k, v in frac.items() if not k.startswith("_")},
+                         "points": {k: round(float(frac[k]) * SC.SPEC_WEIGHTS[k], 1) for k in SC.COMPONENTS},   # what each component added to the score
                          "catalyst_source": frac["_catalyst_source"], "next_results": nxt, "plan": plan, "meta": c.meta})
     rows.sort(key=lambda r: -r["score"])
     for i_, r_ in enumerate(rows, 1):
@@ -216,7 +217,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
         if key not in have:
             flog.append({"s": r["symbol"], "d": r["detector"], "dt": r["signal_date"], "sc": r["score"], "q": r["quality"],
                          "pv": r["pivot"], "st": r["plan"]["stop"], "sec": r["sector"], "sel": bool(r["selected"]), "fam": r["family"],
-                         "rk": r["rank"], "wn": r.get("why_not")})
+                         "rk": r["rank"], "wn": r.get("why_not"),
+                         "cp": [r["points"][k] for k in SC.COMPONENTS], "cs": (r.get("catalyst_source") or "?")[:1]})
     resolved = 0
     cutoff = (last - pd.Timedelta(days=LOG_KEEP_DAYS)).strftime("%Y-%m-%d")
     for e in flog:

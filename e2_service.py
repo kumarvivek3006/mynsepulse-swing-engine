@@ -20,6 +20,7 @@ live strategy engine, the signals table or the live scan.
   GET  /jobs/engine2-diagnosis       cup_handle / ascending_base / flag_pennant / asc_triangle: old engine vs corrected definition
   GET  /jobs/engine2-scan            the latest scan summary and the recent runs;  ?mode=intraday for the forming-bar scan
   GET  /jobs/engine2-candidates      per-candidate score, rank, selected / why not, vs the day's selected scores and cut-off;  ?detector=a,b&since=YYYY-MM-DD
+  GET  /jobs/engine2-components      the seven score components (points) of every ranked candidate, per detector means, selected vs not;  ?detector=a,b&since=&until=
   POST /jobs/engine2/validate        start a validation run now (returns immediately)
   POST /jobs/engine2/scan?mode=      run one scan now (premarket | intraday | postclose); returns immediately
   POST /jobs/engine2/shadow          same as scan?mode=postclose
@@ -289,6 +290,27 @@ def log_candidates() -> dict:
     return {"days": len(rep["days"])}
 
 
+def log_components_latest() -> dict:
+    """
+    Write the component breakdown of the latest completed scan (engine2_shadow_latest) into the service log as E2COMP| lines.
+    Runs once after each start, so the most recent session's components can be read before the next scan replaces them. Read-only.
+    """
+    import e2_scan
+    from ingest import connect
+    conn = connect()
+    try:
+        latest, _ = _get(conn, "engine2_shadow_latest")
+    finally:
+        conn.close()
+    if not latest or not latest.get("all_candidates"):
+        log.info("E2COMP| no stored scan with candidates to replay")
+        return {"lines": 0}
+    lines = e2_scan.component_lines("latest", latest, tag=f"replay-{latest.get('scan_mode')}")
+    for ln in lines:
+        log.info("%s", ln)
+    return {"lines": len(lines), "as_of": latest.get("as_of")}
+
+
 def log_report() -> dict:
     """
     Write the stored validation report and the pattern diagnosis into the service log, one line per row
@@ -359,6 +381,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_defdiag", _defdiag_if_idle], id="engine2_defdiag_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
                           args=["engine2_candidates_log", log_candidates], id="engine2_candidates_log_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=8), timezone=ist),
+                          args=["engine2_components_log", log_components_latest], id="engine2_components_log_boot", replace_existing=True)
         if now.hour >= 22 or now.hour < 5:                      # deployed overnight: do not wait a day
             scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=3), timezone=ist),
                               args=["engine2_validate", _validate_if_needed], id="engine2_validate_boot", replace_existing=True)
@@ -538,6 +562,59 @@ def candidates_report(conn, detector: str | None = None, since: str | None = Non
                     "raw_vs_ranked needs the day's postclose run record (the last 80 runs are kept)."}
 
 
+def components_report(conn, detector: str | None = None, since: str | None = None, until: str | None = None,
+                      with_rows: bool = True) -> dict:
+    """Score components (points) per ranked candidate from the forward log; see GET /jobs/engine2-components. Read-only.
+    Entries logged before 2026-11-06 carry no components and are counted in `entries_without_components`."""
+    import e2_scorer as SC
+    from collections import defaultdict
+    flog, _ = _get(conn, "engine2_shadow_log")
+    want = {d.strip() for d in detector.split(",") if d.strip()} if detector else None
+    inwin = [e for e in (flog or []) if not ((since and e["dt"] < since) or (until and e["dt"] > until))]
+    by_day = defaultdict(list)
+    for e in inwin:
+        by_day[e["dt"]].append(e)
+    cols = SC.COMPONENTS
+    rows, groups = [], defaultdict(list)
+    for dt in sorted(by_day):
+        day = sorted(by_day[dt], key=lambda e: -e["sc"])
+        rank = {(e["s"], e["d"]): e.get("rk") or (i + 1) for i, e in enumerate(day)}
+        cutoff = min((e["sc"] for e in day if e.get("sel")), default=None)
+        for e in day:
+            if not e.get("cp"):
+                continue
+            pts = dict(zip(cols, e["cp"]))
+            sel = bool(e.get("sel"))
+            r = {"date": dt, "symbol": e["s"], "detector": e["d"], "rank": rank[(e["s"], e["d"])], "score": e["sc"], "selected": sel,
+                 "why_not": None if sel else (e.get("wn") or "not_recorded"),
+                 "points_below_cutoff": None if (sel or cutoff is None) else round(cutoff - e["sc"], 1),
+                 "cutoff": cutoff, "catalyst_source": {"c": "confirmed", "p": "proxy"}.get(e.get("cs"), e.get("cs")),
+                 **{f"{k}_score": pts[k] for k in cols}}
+            groups[e["d"]].append((pts, sel, e["sc"]))
+            groups["ALL_SELECTED" if sel else "ALL_NOT_SELECTED"].append((pts, sel, e["sc"]))
+            if sel:
+                groups[e["d"] + ":selected"].append((pts, sel, e["sc"]))
+            if want is None or e["d"] in want:
+                rows.append(r)
+
+    def agg(items):
+        n = len(items)
+        return {"n": n, "score_mean": round(sum(i[2] for i in items) / n, 1),
+                **{f"{k}_mean": round(sum(i[0][k] for i in items) / n, 2) for k in cols}}
+    summary = {g: agg(v) for g, v in sorted(groups.items())}
+    ref = summary.get("ALL_SELECTED")
+    if ref:
+        for g, a in summary.items():
+            a["minus_selected_mean"] = {k: round(a[f"{k}_mean"] - ref[f"{k}_mean"], 2) for k in cols}
+    return {"detector_filter": sorted(want) if want else None, "components": cols, "max_points": SC.SPEC_WEIGHTS,
+            "entries_in_window": len(inwin), "entries_without_components": sum(1 for e in inwin if not e.get("cp")),
+            "rows": rows if with_rows else None, "summary": summary,
+            "note": "points = component fraction x spec weight; the seven add up to the score. summary has one group per detector, "
+                    "'<detector>:selected', ALL_SELECTED and ALL_NOT_SELECTED; minus_selected_mean is a group's mean points minus the mean "
+                    "of every selected row, per component (negative = lower than what gets selected). Only completed-session (postclose) "
+                    "candidates are kept here; every scan's candidates (incl. intraday) are also written to the log as E2COMP| lines."}
+
+
 def register(app, *, require_internal_key, ist) -> None:
     from ingest import connect
 
@@ -675,6 +752,23 @@ def register(app, *, require_internal_key, ist) -> None:
         conn = connect()
         try:
             return candidates_report(conn, detector, since, until)
+        finally:
+            conn.close()
+
+    @app.get("/jobs/engine2-components")
+    def e2_components(request: Request, detector: str | None = None, since: str | None = None, until: str | None = None,
+                      rows: bool = True):
+        """
+        The seven components of the score (trend, rs, volume, base, catalyst, sector, regime - in points) for every candidate that
+        reached the ranking at a completed-session scan, with total score, rank, selected / why not and the day's cut-off, plus
+        per-detector mean points and the same for selected rows, so low components can be read off directly.
+        ?detector=episodic_pivot,gap_and_go &since=2026-11-06 &rows=false for the summary only. Recorded from 2026-11-06.
+        Read-only. Nothing here is used by any decision.
+        """
+        require_internal_key(request)
+        conn = connect()
+        try:
+            return components_report(conn, detector, since, until, rows)
         finally:
             conn.close()
 

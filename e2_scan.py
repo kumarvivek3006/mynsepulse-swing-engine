@@ -156,6 +156,37 @@ def ranking_line(mode: str, out: dict) -> str:
             f"selected scores {sel or 'none'} (cutoff {out.get('cutoff_score')}) | fired but got no slot {none or 'none'}")
 
 
+def _pts(r: dict) -> dict:
+    """Component points of a stored candidate row: the recorded points, or (rows stored before they were recorded) the
+    stored 0-1 fractions times the spec weights - the same arithmetic the score used."""
+    if r.get("points"):
+        return r["points"]
+    from e2_scorer import SPEC_WEIGHTS
+    return {k: round(float(v) * SPEC_WEIGHTS[k], 1) for k, v in (r.get("components") or {}).items() if k in SPEC_WEIGHTS}
+
+
+COMP_COLS = ["symbol", "detector", "rank", "score", "selected", "why_not", "trend", "rs", "volume", "base", "catalyst", "sector",
+             "regime", "catalyst_source"]
+
+
+def component_lines(mode: str, out: dict, per_line: int = 20, tag: str | None = None) -> list[str]:
+    """The score broken into its seven components (points, spec weights: trend 20, rs 20, volume 15, base 20, catalyst 10,
+    sector 10, regime 5) for every ranked candidate of the scan, in chunks of `per_line` so no single log line is huge.
+    Prefix E2COMP|. The same numbers are kept for completed sessions in the forward log (GET /jobs/engine2-components).
+    Observability only: nothing here feeds a decision."""
+    import json as _json
+    rows = out.get("all_candidates") or []
+    lines = []
+    for i in range(0, len(rows), per_line):
+        chunk = [[r["symbol"], r["detector"], r.get("rank"), r["score"], int(bool(r.get("selected"))), r.get("why_not"),
+                  *[_pts(r).get(k) for k in ("trend", "rs", "volume", "base", "catalyst", "sector", "regime")],
+                  r.get("catalyst_source")] for r in rows[i:i + per_line]]
+        lines.append("E2COMP| " + _json.dumps({"mode": tag or mode, "as_of": out.get("as_of"), "ranked_total": out.get("candidates"),
+                                               "cutoff": out.get("cutoff_score"), "part": f"{i // per_line + 1}/{(len(rows) + per_line - 1) // per_line}",
+                                               "cols": COMP_COLS, "rows": chunk}, separators=(",", ":"), default=str))
+    return lines
+
+
 def inputs_line(mode: str, out: dict) -> str:
     """Which symbols were excluded as stale (newest bar older than the scan date) - the per-symbol view of stale_symbols."""
     return (f"Engine 2 {mode} inputs: universe {out.get('universe_symbols')}, stale {out.get('stale_symbols')} "
@@ -484,6 +515,8 @@ def run(mode: str, trigger: str = "scheduled") -> dict:
                 log.info("%s", detector_line(mode, out))
                 log.info("%s", ranking_line(mode, out))
                 log.info("%s", inputs_line(mode, out))
+                for ln in component_lines(mode, out):
+                    log.info("%s", ln)
             except Exception:                             # noqa: BLE001 — a log line must never fail a scan that already published
                 log.exception("Engine 2 regime log line failed (scan unaffected)")
             return s
