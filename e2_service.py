@@ -230,7 +230,7 @@ def _fwddiag_if_idle() -> dict:
 
 def _swingcheck_if_idle() -> dict:
     """Boot job for the gap_and_hold conditional check (swing engine step 1b; measurement only)."""
-    if os.environ.get("E2_SWINGCHECK_BOOT", "1") != "1":
+    if os.environ.get("E2_SWINGCHECK_BOOT", "0") != "1":      # read 7 Nov; POST /jobs/engine2/swingcheck to rerun
         return {"skipped": "E2_SWINGCHECK_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/swingcheck when it has finished"}
