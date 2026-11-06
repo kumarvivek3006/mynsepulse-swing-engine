@@ -14,6 +14,8 @@ confirmation bars lo <= i < hi. All thresholds are pre-registered constants.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from e2_core import Candidate, band_score, clamp, fenv, ienv, shift
@@ -89,12 +91,34 @@ def momentum_burst(b: Bars, ctx: dict, lo: int, hi: int) -> list[Candidate]:
 
 
 # =====================================================================
-def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int) -> list[Candidate]:
+PP_STRICT = os.environ.get("E2_PP_STRICT", "0").lower() in ("1", "true", "yes")
+PP_MIN_RELVOL = fenv("E2_PP_MIN_RELVOL", 1.5)           # strict: the up day must be >= 1.5x the average volume
+PP_NEAR_HIGH, PP_BASE_LOOK, PP_BASE_DEPTH = fenv("E2_PP_NEAR_HIGH", 0.90), ienv("E2_PP_BASE_LOOK", 40), fenv("E2_PP_BASE_DEPTH", 0.20)
+
+
+def _pp_structure(b: Bars, i: int) -> tuple[bool, bool]:
+    """(uptrend intact, valid base). Declared BEFORE the strict backtest, not fitted to it:
+    uptrend  = close > a rising 50-day SMA, and the 50 above the 150;
+    base     = close within 10% of the 52-week high AND the prior 40 sessions' high-to-low range no deeper than 20%."""
+    up = bool(b.c[i] > b.sma50[i] and b.sma50_up[i] and b.sma50[i] > b.sma150[i])
+    base = False
+    h52 = b.high52[i]
+    if not np.isnan(h52) and h52 > 0 and i >= PP_BASE_LOOK:
+        hh, ll = float(b.h[i - PP_BASE_LOOK:i].max()), float(b.l[i - PP_BASE_LOOK:i].min())
+        base = bool(b.c[i] >= PP_NEAR_HIGH * h52 and hh > 0 and (hh - ll) / hh <= PP_BASE_DEPTH)
+    return up, base
+
+
+def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int, strict: bool | None = None) -> list[Candidate]:
     """
-    Up day whose volume exceeds the HIGHEST down-day volume of the prior 10
-    bars. If there was no down day in those 10 bars the comparison is against
-    the 20-bar average volume instead (otherwise any up day would qualify).
+    Up day whose volume exceeds the HIGHEST down-day volume of the prior 10 bars, closing in the top half of its range.
+    Default (E2_PP_STRICT=0): if there was no down day in those 10 bars the comparison is against the 20-bar average volume.
+    STRICT (ACTION 2, 6 Nov): in addition
+      * the prior 10 sessions must contain a down day (no accumulation signature to test against otherwise: rejected)
+      * the up day's volume must be >= 1.5x the average volume (relvol)
+      * the prior structure must be an intact uptrend OR a valid base (_pp_structure)
     """
+    strict = PP_STRICT if strict is None else strict
     out = []
     idx = np.arange(max(lo, WARMUP), hi)
     pre = (b.c[idx] > b.c_prev[idx]) & (b.close_pos[idx] >= PP_CLOSEPOS)
@@ -103,10 +127,18 @@ def pocket_pivot(b: Bars, ctx: dict, lo: int, hi: int) -> list[Candidate]:
         down = b.c[w] < shift(b.c, 1)[w]
         if down.any():
             ref = float(b.v[w][down].max())
+        elif strict:
+            continue
         else:
             ref = float(b.vavg20[i]) if not np.isnan(b.vavg20[i]) else np.nan
         if np.isnan(ref) or b.v[i] <= ref:
             continue
+        if strict:
+            if not (b.relvol[i] >= PP_MIN_RELVOL):
+                continue
+            up, base = _pp_structure(b, i)
+            if not (up or base):
+                continue
         stop = float(b.l[i - 4:i + 1].min())
         q = 0.4 * min(b.v[i] / ref / 2.0, 1) * 100 + 0.3 * b.close_pos[i] * 100 + 0.3 * (100 if b.c[i] > b.sma50[i] else 40)
         out.append(make(b, "pocket_pivot", int(i), b.h[i], stop, q,

@@ -73,6 +73,20 @@ def _trend_ctx(b: Bars, i: int) -> bool:
 
 
 # =====================================================================
+def _vcp_shape(b: Bars, i: int, p: int, last: int):
+    """THE vcp geometry, shared by the breakout detector and the armed variant so the definition cannot drift:
+    contraction depths of the zigzag between the base high p and bar `last`, or None when the shape fails
+    (fewer than 2 contractions, first deeper than VCP_MAX_DEPTH, any not below VCP_RATIO x the prior, final >= VCP_FINAL)."""
+    zz = zigzag(b.h, b.l, p, last, max(VCP_ZZ, VCP_ZZ_ATR * float(b.atr_pct[i]) / 100.0))
+    depths = [(zz[k][2] - zz[k + 1][2]) / zz[k][2] * 100 for k in range(len(zz) - 1)
+              if zz[k][1] == "H" and zz[k + 1][1] == "L"]
+    if len(depths) < 2 or depths[0] > VCP_MAX_DEPTH:
+        return None
+    if any(nx > pv * VCP_RATIO for pv, nx in zip(depths, depths[1:])) or depths[-1] >= VCP_FINAL:
+        return None
+    return depths
+
+
 def vcp(b: Bars, ctx: dict, lo: int, hi: int) -> list[Candidate]:
     out = []
     for i in breakout_candidates(b, max(lo, 160), hi, VOL15):
@@ -82,17 +96,81 @@ def vcp(b: Bars, ctx: dict, lo: int, hi: int) -> list[Candidate]:
             pivot = float(b.h[p])
             if b.c[i] <= pivot or i - p < 25 or pivot < 0.85 * b.high52[i]:
                 continue
-            zz = zigzag(b.h, b.l, p, i - 1, max(VCP_ZZ, VCP_ZZ_ATR * float(b.atr_pct[i]) / 100.0))
-            depths = [(zz[k][2] - zz[k + 1][2]) / zz[k][2] * 100 for k in range(len(zz) - 1)
-                      if zz[k][1] == "H" and zz[k + 1][1] == "L"]
-            if len(depths) < 2 or depths[0] > VCP_MAX_DEPTH:
-                continue
-            if any(nx > pv * VCP_RATIO for pv, nx in zip(depths, depths[1:])) or depths[-1] >= VCP_FINAL:
+            depths = _vcp_shape(b, i, p, i - 1)
+            if depths is None:
                 continue
             shape = 0.5 * band_score(depths[-1], 1.0, 6.0, 6.0) + 0.5 * min(len(depths) / 4.0, 1.0) * 100
             q = breakout_quality(b, i, shape, dryup_score(b, max(p, i - 10), i))
             out.append(make(b, "vcp", int(i), pivot, b.l[i - 10:i].min(), q,
                             contractions=[round(d, 1) for d in depths], base_len=int(i - p)))
+            break
+    return out
+
+
+# ---- the OLD engine's "armed" trigger (setups.detect_trigger) on the SAME vcp geometry -------------------
+ARMED_MIN_PCT, ARMED_MAX_PCT = fenv("E2_ARMED_MIN_PCT", 2.0), fenv("E2_ARMED_MAX_PCT", 4.0)   # setups.ARMED_*_DISTANCE_PCT
+ARMED_DRYUP_MAX = fenv("E2_ARMED_DRYUP_MAX", 1.1)                                             # setups: base.volume_dryup > 1.1 rejects
+ARMED_BUFFER = fenv("E2_ARMED_BUFFER", 0.0025)                                                # setups.ENTRY_BUFFER
+ARMED_EXPIRY = ienv("E2_ARMED_EXPIRY", 5)                                                     # backtest.EXPIRY_SESSIONS
+PRIOR_UPTREND_PCT, PRIOR_UPTREND_WINDOW = fenv("E2_PRIOR_UPTREND_PCT", 60.0), ienv("E2_PRIOR_UPTREND_WINDOW", 120)
+
+
+def vcp_armed(b: Bars, ctx: dict, lo: int, hi: int, prior_uptrend: bool = False) -> list[Candidate]:
+    """
+    The vcp pattern (identical geometry, `_vcp_shape`) caught BEFORE the breakout, with the old engine's armed
+    gates ported clause by clause from setups.detect_trigger:
+      * close 2-4% below the pivot                       (ARMED_MIN/MAX_DISTANCE_PCT)
+      * close in the upper half of the base              (lower_half_of_base)
+      * close at or above the 20-EMA                     (below_20ema)
+      * final-third volume <= 1.1x the earlier two-thirds (no_volume_dryup)
+      * the final third did not trade in the lower half  (dryup_in_lower_half)
+      * today is not a distribution candle               (distribution_candle)
+    Entry is a BUY-STOP at pivot x (1 + 0.25%) valid for ARMED_EXPIRY sessions (meta.entry_stop / entry_expiry),
+    filled at max(trigger, open) as the old backtest did. prior_uptrend=True adds the old base finder's
+    >= 60% advance over the 120 sessions into the base (a gate Engine 2's vcp never had).
+    Not in the detector registry: it is measured by e2_actions and enters the live scan only behind an env switch.
+    """
+    out = []
+    blocked_until = -1                                           # one resting order per symbol at a time, as the old engine's one base per symbol
+    for i in range(max(lo, 160), hi):
+        if i <= blocked_until or np.isnan(b.high52[i]) or not _trend_ctx(b, i):
+            continue
+        c = float(b.c[i])
+        for p in record_highs(b.h, i, 200):
+            pivot = float(b.h[p])
+            dist = (pivot / c - 1.0) * 100.0
+            if not (ARMED_MIN_PCT <= dist <= ARMED_MAX_PCT) or i - p < 25 or pivot < 0.85 * b.high52[i]:
+                continue
+            base_low = float(b.l[p:i + 1].min())
+            base_mid = (pivot + base_low) / 2.0
+            if c < base_mid or c < float(b.ema20[i]):
+                continue
+            seg_v = b.v[p:i + 1].astype(float)
+            third = max((i - p) // 3, 3)
+            early = seg_v[:-third].mean() if len(seg_v) > third else 0.0
+            dryup = float(seg_v[-third:].mean() / early) if early > 0 else 1.0
+            if dryup > ARMED_DRYUP_MAX:
+                continue
+            if (float(b.h[i - third + 1:i + 1].max()) + float(b.l[i - third + 1:i + 1].min())) / 2.0 < base_mid:
+                continue
+            rng, atr = float(b.h[i] - b.l[i]), float(b.atr14[i])
+            if atr > 0 and rng > 0.5 * atr and (float(b.h[i]) - c) / rng > 0.5 and c < float(b.o[i]):
+                continue
+            if prior_uptrend:
+                w = b.c[max(0, p - PRIOR_UPTREND_WINDOW):p + 1]
+                if len(w) < 20 or (float(w[-1]) / float(w.min()) - 1.0) * 100.0 < PRIOR_UPTREND_PCT:
+                    continue
+            depths = _vcp_shape(b, i, p, i)
+            if depths is None:
+                continue
+            shape = 0.5 * band_score(depths[-1], 1.0, 6.0, 6.0) + 0.5 * min(len(depths) / 4.0, 1.0) * 100
+            q = 0.6 * shape + 0.4 * dryup_score(b, max(p, i - 10), i)
+            cand = make(b, "vcp", int(i), pivot, float(b.l[i - 10:i + 1].min()), q,
+                        contractions=[round(d, 1) for d in depths], base_len=int(i - p), distance_pct=round(dist, 2),
+                        entry_stop=pivot * (1.0 + ARMED_BUFFER), entry_expiry=ARMED_EXPIRY)
+            cand.detector = "vcp_armed_p60" if prior_uptrend else "vcp_armed"
+            out.append(cand)
+            blocked_until = i + ARMED_EXPIRY
             break
     return out
 

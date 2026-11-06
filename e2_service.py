@@ -26,6 +26,8 @@ live strategy engine, the signals table or the live scan.
   POST /jobs/engine2/shadow          same as scan?mode=postclose
   GET  /jobs/engine2-defdiag         pocket_pivot context breakdown (?format=md); logged as E2DEFDIAG| lines
   POST /jobs/engine2/defdiag         run the definition diagnosis now
+  GET  /jobs/engine2-actions         the 6 Nov actions study: detector-specific scoring, strict pocket_pivot, vcp armed port (?format=md)
+  POST /jobs/engine2/actions         run it now (also runs ~20 minutes after a deploy while E2_ACTIONS_BOOT=1)
   POST /jobs/engine2/diagnose        re-run the disabled-pattern diagnosis now (it also runs ahead of every validation)
 """
 from __future__ import annotations
@@ -179,6 +181,15 @@ def _defdiag_if_idle() -> dict:
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/defdiag when it has finished"}
     return _spawn("defdiag", "boot")
+
+
+def _actions_if_idle() -> dict:
+    """Boot job for the 6 Nov actions study (loads the full history twice over: never alongside a validation run)."""
+    if os.environ.get("E2_ACTIONS_BOOT", "1") != "1":
+        return {"skipped": "E2_ACTIONS_BOOT is not 1"}
+    if _running_here():
+        return {"skipped": "a validation run is in progress; POST /jobs/engine2/actions when it has finished"}
+    return _spawn("actions", "boot")
 
 
 def _validate_if_needed() -> dict:
@@ -379,6 +390,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_report_log", log_report], id="engine2_report_log_late", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=15), timezone=ist),
                           args=["engine2_defdiag", _defdiag_if_idle], id="engine2_defdiag_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=22), timezone=ist),
+                          args=["engine2_actions", _actions_if_idle], id="engine2_actions_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
                           args=["engine2_candidates_log", log_candidates], id="engine2_candidates_log_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=8), timezone=ist),
@@ -700,6 +713,27 @@ def register(app, *, require_internal_key, ist) -> None:
             return {"started": False, "reason": "a validation run is in progress"}
         return _spawn("defdiag", "manual")
 
+    @app.get("/jobs/engine2-actions")
+    def e2_actions_view(request: Request, format: str = "json"):
+        """The 6 Nov actions study (measurement only)."""
+        require_internal_key(request)
+        import e2_actions
+        conn = connect()
+        try:
+            d, _ = _get(conn, e2_actions.KEY)
+        finally:
+            conn.close()
+        if not d:
+            raise HTTPException(404, "the actions study has not run yet (POST /jobs/engine2/actions to start it)")
+        return PlainTextResponse(e2_actions.render_markdown(d)) if format == "md" else d
+
+    @app.post("/jobs/engine2/actions")
+    def e2_actions_now(request: Request):
+        require_internal_key(request)
+        if _running_here():
+            return {"started": False, "reason": "a validation run is in progress"}
+        return _spawn("actions", "manual")
+
     @app.get("/jobs/engine2-shadow")
     def e2_shadow(request: Request):
         require_internal_key(request)
@@ -792,6 +826,9 @@ if __name__ == "__main__":                                    # the child proces
     if kind == "defdiag":
         import e2_defdiag
         print(json.dumps({k: v for k, v in e2_defdiag.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "actions":
+        import e2_actions
+        print(json.dumps({k: v for k, v in e2_actions.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "diagnose":
         import e2_diagnosis
         print(json.dumps(e2_diagnosis.brief(e2_diagnosis.run(trigger=trig)), default=str))

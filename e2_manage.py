@@ -110,12 +110,25 @@ def simulate(b: Bars, cand: Candidate, events: np.ndarray | None = None) -> Trad
     if e >= b.n:
         tr.skipped = "no_next_bar"
         return tr
-    entry = float(b.o[e]) * (1 + SLIP)
+    es = cand.meta.get("entry_stop")
+    if es is not None:
+        # BUY-STOP entry (the old engine's "armed" order): resting above the pivot for `entry_expiry` sessions, filled at
+        # max(trigger, open) on the first session whose high reaches it. Nothing else about the trade changes.
+        e = next((t for t in range(cand.idx + 1, min(cand.idx + 1 + int(cand.meta.get("entry_expiry", 5)), b.n))
+                  if b.h[t] >= es), -1)
+        if e < 0:
+            tr.skipped = "never_triggered"
+            return tr
+        ref_open = max(float(es), float(b.o[e]))
+        entry = ref_open * (1 + SLIP)
+    else:
+        ref_open = float(b.o[e])
+        entry = ref_open * (1 + SLIP)
     if _locked(b, e):
         tr.skipped = "entry_bar_circuit_locked"
         return tr
     stop, floored = initial_stop(b, cand, entry)
-    if b.o[e] <= cand.stop or b.o[e] <= stop:
+    if ref_open <= cand.stop or ref_open <= stop:
         tr.skipped = "open_below_stop"                  # the setup's invalidation level is already gone at the open
         return tr
     d_end = b.date[e + 1] if e + 1 < b.n else b.date[e] + np.timedelta64(1, "D")
