@@ -212,7 +212,7 @@ def _exits_if_idle() -> dict:
 
 def _fwd_if_idle() -> dict:
     """Boot job for the forward-return test (loads the full history: never alongside a validation run)."""
-    if os.environ.get("E2_FWD_BOOT", "1") != "1":                  # re-run 7 Nov for the control-relative labels
+    if os.environ.get("E2_FWD_BOOT", "0") != "1":                  # retired 7 Nov after the 1/3/5/10/20-session run was read
         return {"skipped": "E2_FWD_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwd when it has finished"}
