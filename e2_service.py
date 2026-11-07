@@ -230,11 +230,18 @@ def _fwddiag_if_idle() -> dict:
 
 def _swingcheck_if_idle() -> dict:
     """Boot job for the gap_and_hold conditional check (swing engine step 1b; measurement only)."""
-    if os.environ.get("E2_SWINGCHECK_BOOT", "0") != "1":      # read 7 Nov; POST /jobs/engine2/swingcheck to rerun
+    if os.environ.get("E2_SWINGCHECK_BOOT", "1") != "1":      # on for the 7 Nov regime / entry-test run; set to 0 after it is read
         return {"skipped": "E2_SWINGCHECK_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/swingcheck when it has finished"}
     return _spawn("swingcheck", "boot")
+
+
+def _probe30_if_idle() -> dict:
+    """Boot job: log the stored intraday-probe verdict and, with a valid token, probe 15/30-minute history (read-only)."""
+    if os.environ.get("E2_PROBE30_BOOT", "1") != "1":
+        return {"skipped": "E2_PROBE30_BOOT is not 1"}
+    return _spawn("probe30", "boot")
 
 
 def _exits_wl_if_idle() -> dict:
@@ -453,6 +460,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_fwddiag", _fwddiag_if_idle], id="engine2_fwddiag_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=30), timezone=ist),
                           args=["engine2_swingcheck", _swingcheck_if_idle], id="engine2_swingcheck_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=12), timezone=ist),
+                          args=["engine2_probe30", _probe30_if_idle], id="engine2_probe30_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=32), timezone=ist),
                           args=["engine2_exits_wl", _exits_wl_if_idle], id="engine2_exits_wl_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
@@ -993,6 +1002,9 @@ if __name__ == "__main__":                                    # the child proces
     if kind == "defdiag":
         import e2_defdiag
         print(json.dumps({k: v for k, v in e2_defdiag.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "probe30":
+        import e2_probe30
+        print(json.dumps({k: v for k, v in e2_probe30.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "swingcheck":
         import e2_swingcheck
         print(json.dumps({k: v for k, v in e2_swingcheck.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))

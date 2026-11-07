@@ -18,6 +18,22 @@ Pre-declared decision rule (owner): the 3-session hold from the day-3 entry, net
     >= +0.30        build gap_and_hold as the second swing detector
 Both halves are reported next to it; a verdict that rests on one half is called out as such.
 
+REGIME CHECK (owner, 7 Nov 12:38 IST): is the day-3 drift a gap effect or market regime? The same hold test and the same day-3 entry on stocks that did NOT gap:
+  up_day_hold      any up day (close above the previous close) with a gap under 1% that then holds two sessions (every 5th such day, to bound the size)
+  bigmove_nogap    a close-to-close move of 3% or more with a gap under 1% that then holds two sessions (the same move size, no gap)
+plus, for every population, the raw and the market return of each half, and 20-session returns, so that gap_and_go's own second-half pattern is visible.
+
+ENTRY TESTS for the three poor-prior swing candidates (owner, 7 Nov 12:38 IST). Daily-bar approximations, declared before running; signal at the close, entry the next open:
+  intraday_momentum     up day, close in the top decile of the day's range, volume >= 2x its 50-day average, after consolidation (the prior 10 sessions' high-low range
+                        <= 10% of the close)
+  volume_spike_reversal volume >= 5x the 50-day average, an up day closing in the top half of its range, the low within 3% of (or under) the lowest low of the prior 50
+                        sessions (at support), after a decline (the previous close below the close 10 sessions earlier)
+  pullback_10ema        trend intact (close above a rising 50-day average, 10-EMA above 20-EMA); 2 or 3 consecutive down closes ending the session before the signal;
+                        that pullback touched the 10-EMA (low <= 1.01 x EMA10); volume on the last pullback day below the first; the signal day is an up day closing
+                        above its open and above the 10-EMA
+Short-horizon pass (owner's rule, applied to 1, 3 and 5 sessions): beats the control by at least half the control's interval width AND is above it in both halves at
+2 of the 3 horizons. Reported next to net-of-costs figures.
+
 Also, for the episodic_pivot_swing proposal (day-1 hold on the live episodic_pivot candidates): open-to-close, open-to-next-open, how far the day went
 against and for the entry in ATR units (daily bars: what a tight stop would meet), signals per month.
 """
@@ -37,16 +53,19 @@ import e2_det_momentum as DM
 from e2_det_common import WARMUP
 from e2_detectors import detect_all
 from e2_features import compute_features
-from e2_fwd import Acc, _f, _market, _p, COST_PCT
+from e2_core import ema as _ema
+from e2_fwd import Acc, _f, _market, _p, COST_PCT, beats_control
 from e2_manage import _locked
 
 log = logging.getLogger("engine2.swingcheck")
 KEY = "engine2_swingcheck"
 LOG_PREFIX = "E2SWC|"
-H = (1, 3, 5, 10)
+H = (1, 3, 5, 10, 20)
+SHORT = (1, 3, 5)
 GAP_MIN, EP_GAP, EP_VOL, EP_CP = 3.0, 4.0, 5.0, 0.75
 HOLD_BARS, HOLD_FADE = 2, 0.97
-POPS = ("gap3_day1", "ep_detector_day1", "gap_and_hold", "ep_held_day3", "gap_and_go")
+POPS = ("gap3_day1", "ep_detector_day1", "gap_and_hold", "ep_held_day3", "gap_and_go", "up_day_hold", "bigmove_nogap",
+        "intraday_momentum", "volume_spike_reversal", "pullback_10ema")
 
 
 def verdict(net_h3: float | None) -> str:
@@ -65,6 +84,34 @@ def held(b, g: int) -> bool:
         return False
     seg = slice(g + 1, g + HOLD_BARS + 1)
     return bool(not (b.l[seg] < b.c_prev[g]).any() and not (b.c[seg] < b.o[g] * HOLD_FADE).any())
+
+
+def short_signals(b, lo: int) -> dict:
+    """indices (signal bars) of the three entry-test candidates; pure function of the bars, no look-ahead (every input is known at the signal bar's close)."""
+    out = {"intraday_momentum": [], "volume_spike_reversal": [], "pullback_10ema": []}
+    e10 = _ema(np.asarray(b.c, float), 10)
+    e20 = np.asarray(b.ema20, float)
+    for i in range(max(lo, WARMUP, 60), b.n):
+        if np.isnan(b.relvol[i]):
+            continue
+        up = b.c[i] > b.c_prev[i]
+        # intraday_momentum
+        if up and b.close_pos[i] >= 0.90 and b.relvol[i] >= 2.0 and b.c[i] > 0:
+            rng10 = (b.h[i - 10:i].max() - b.l[i - 10:i].min()) / b.c[i]
+            if rng10 <= 0.10:
+                out["intraday_momentum"].append(i)
+        # volume_spike_reversal
+        if b.relvol[i] >= 5.0 and up and b.c[i] > b.o[i] and b.close_pos[i] >= 0.5:
+            if b.l[i] <= 1.03 * float(b.l[i - 50:i].min()) and b.c[i - 1] < b.c[i - 10]:
+                out["volume_spike_reversal"].append(i)
+        # pullback_10ema
+        if (b.c[i] > b.sma50[i] and b.sma50_up[i] and e10[i] > e20[i] and b.c[i] > b.o[i] and b.c[i] > b.c[i - 1] and b.c[i] > e10[i]):
+            k = 0
+            while k < 4 and i - 1 - k - 1 >= 0 and b.c[i - 1 - k] < b.c[i - 2 - k]:
+                k += 1
+            if 2 <= k <= 3 and float(b.l[i - k:i].min()) <= 1.01 * float(e10[i - 1]) * 1.0 and b.v[i - 1] < b.v[i - k]:
+                out["pullback_10ema"].append(i)
+    return out
 
 
 def _cand(b, i: int, name: str, g: int):
@@ -125,6 +172,26 @@ def collect(data, pn, w0):
                         c3 = copy.copy(c2)
                         c3.detector = "ep_held_day3"
                         lists["ep_held_day3"].append((c3, e2))
+        for g in range(max(lo, WARMUP), b.n - 1):                # regime check: the same hold test on stocks that did not gap (every 5th day)
+            if g % 5 or b.c_prev[g] <= 0 or np.isnan(b.gap_pct[g]) or b.gap_pct[g] >= 1.0 or not (b.c[g] > b.c_prev[g]) or not held(b, g):
+                continue
+            c = _cand(b, g + HOLD_BARS, "up_day_hold", g)
+            e = ok(b, sym, c)
+            if e is not None:
+                lists["up_day_hold"].append((c, e))
+        for g in range(max(lo, WARMUP), b.n - 1):                # the same move size without a gap (all days, not sampled)
+            if b.c_prev[g] <= 0 or np.isnan(b.gap_pct[g]) or b.gap_pct[g] >= 1.0 or (b.c[g] / b.c_prev[g] - 1.0) * 100.0 < GAP_MIN or not held(b, g):
+                continue
+            c = _cand(b, g + HOLD_BARS, "bigmove_nogap", g)
+            e = ok(b, sym, c)
+            if e is not None:
+                lists["bigmove_nogap"].append((c, e))
+        for name, idxs in short_signals(b, lo).items():
+            for i in idxs:
+                c = _cand(b, i, name, i)
+                e = ok(b, sym, c)
+                if e is not None:
+                    lists[name].append((c, e))
         cands, _ = detect_all(b, lo=lo)
         for c in cands:
             if c.detector not in ("episodic_pivot", "gap_and_go"):
@@ -151,6 +218,16 @@ def collect(data, pn, w0):
                                                  (100.0 * (b.c[es + h - 1] / b.o[es] - 1.0)).tolist(),
                                                  (100.0 * (mk[es + h - 1] / mk[es - 1] - 1.0)).tolist())
     return acc, day1, gated
+
+
+def _raw_market_halves(a: Acc, h: int, mid64) -> dict:
+    sig, raw, mkt = (np.array(x, float) if k else np.array(x) for k, x in enumerate(a.d[h]))
+    if len(raw) == 0:
+        return {}
+    sig = sig.astype("datetime64[D]")
+    m1 = sig < mid64
+    f = lambda x, m: _f(x[m].mean()) if m.sum() else None
+    return {"raw": [f(raw, m1), f(raw, ~m1)], "market": [f(mkt, m1), f(mkt, ~m1)]}
 
 
 def day1_summary(rows, mid64, months: float) -> dict:
@@ -194,7 +271,23 @@ def compute(data, out: dict) -> dict:
         rows[p] = {"horizons": {str(h): per[h] for h in H},
                    "excess_vs_control_pct": None if ctl_row else {str(h): _f((per[h].get("mean_adj_pct") or 0) - (ctl[h].get("mean_adj_pct") or 0))
                                                                 for h in H if per[h].get("n")}}
+    for p, per in stats.items():                                  # beats-the-control flags, short-horizon pass, raw / market by half
+        if p.startswith("ALL_BARS"):
+            continue
+        rows[p]["beats_control"] = {str(h): beats_control(per[h], ctl[h]) for h in H if per[h].get("n")}
+        both_pos = {str(h): bool(per[h].get("n") and per[h]["h1"]["mean_adj_pct"] is not None and per[h]["h2"]["mean_adj_pct"] is not None
+                                 and per[h]["h1"]["mean_adj_pct"] > 0 and per[h]["h2"]["mean_adj_pct"] > 0) for h in H}
+        rows[p]["both_halves_positive"] = both_pos
+        rows[p]["short_pass"] = bool(sum(rows[p]["beats_control"].get(str(h), False) for h in SHORT) >= 2)
+        rows[p]["net_positive_short"] = [h for h in SHORT if (per[h].get("net_of_costs_pct") or -9) > 0]
+        rows[p]["raw_market_by_half"] = {str(h): _raw_market_halves(acc[p], h, mid64) for h in (3, 5, 10, 20)}
+        rows[p]["second_half_only"] = {str(h): bool(per[h].get("n") and (per[h]["h1"]["mean_adj_pct"] or 0) - (ctl[h]["h1"]["mean_adj_pct"] or 0) <= 0
+                                                    and (per[h]["h2"]["mean_adj_pct"] or 0) - (ctl[h]["h2"]["mean_adj_pct"] or 0) > 0) for h in (3, 5, 10, 20)}
+    rows["ALL_BARS (control)"]["raw_market_by_half"] = {str(h): _raw_market_halves(acc["ALL_BARS (control)"], h, mid64) for h in (3, 5, 10, 20)}
     out["populations"] = rows
+    out["regime_check"] = {"question": "is the day-3 drift of gap_and_hold a gap effect or market regime?",
+                           "second_half_only_pattern": {p: rows[p].get("second_half_only") for p in ("gap_and_hold", "up_day_hold", "bigmove_nogap", "gap3_day1", "gap_and_go")},
+                           "rule": "second_half_only = the first half is not above the control's first half AND the second half is above the control's second half"}
     gh = stats["gap_and_hold"][3]
     net3 = gh.get("net_of_costs_pct")
     out["decision"] = {"population": "gap_and_hold, 3-session hold from the day-3 entry", "net_of_costs_pct": net3,
@@ -221,9 +314,20 @@ def render_markdown(d: dict) -> str:
             if not s.get("n"):
                 parts.append(f"h{h}: n0")
                 continue
-            parts.append(f"h{h}: n{s['n']} adj {_p(s['mean_adj_pct'])}% CI{s['ci95']} halves {_p(s['h1']['mean_adj_pct'])}/{_p(s['h2']['mean_adj_pct'])} "
+            star = "*" if (r.get("beats_control") or {}).get(str(h)) else ""
+            parts.append(f"h{h}{star}: n{s['n']} adj {_p(s['mean_adj_pct'])}% CI{s['ci95']} halves {_p(s['h1']['mean_adj_pct'])}/{_p(s['h2']['mean_adj_pct'])} "
                          f"net {_p(s['net_of_costs_pct'])}")
         L.append(f"{p}" + (f" excess vs control {r['excess_vs_control_pct']}" if r.get("excess_vs_control_pct") else "") + ": " + " | ".join(parts))
+    L.append("## beats the control (half the control's interval width, both halves above it) and short-horizon pass (2 of 3 of h1/h3/h5)")
+    for p, r in (d.get("populations") or {}).items():
+        if r.get("beats_control") is not None:
+            L.append(f"{p}: beats_control {r['beats_control']} short_pass {r.get('short_pass')} net_positive_at {r.get('net_positive_short')} "
+                     f"both_halves_positive {r.get('both_halves_positive')}")
+    L.append("## raw / market return by half (first / second) per horizon")
+    for p, r in (d.get("populations") or {}).items():
+        L.append(f"{p}: {json.dumps(r.get('raw_market_by_half'), default=str)}")
+    L.append("## regime check")
+    L.append(json.dumps(d.get("regime_check"), default=str))
     L.append("## decision (owner's pre-declared rule)")
     L.append(json.dumps(d.get("decision"), default=str))
     L.append("## episodic_pivot day-1 profile (for the episodic_pivot_swing proposal)")
