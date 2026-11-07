@@ -230,7 +230,7 @@ def _fwddiag_if_idle() -> dict:
 
 def _swingcheck_if_idle() -> dict:
     """Boot job for the gap_and_hold conditional check (swing engine step 1b; measurement only)."""
-    if os.environ.get("E2_SWINGCHECK_BOOT", "1") != "1":      # on for the 7 Nov regime / entry-test run; set to 0 after it is read
+    if os.environ.get("E2_SWINGCHECK_BOOT", "0") != "1":      # read 7 Nov; POST /jobs/engine2/swingcheck to rerun
         return {"skipped": "E2_SWINGCHECK_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/swingcheck when it has finished"}
@@ -239,9 +239,22 @@ def _swingcheck_if_idle() -> dict:
 
 def _probe30_if_idle() -> dict:
     """Boot job: log the stored intraday-probe verdict and, with a valid token, probe 15/30-minute history (read-only)."""
-    if os.environ.get("E2_PROBE30_BOOT", "1") != "1":
+    if os.environ.get("E2_PROBE30_BOOT", "0") != "1":
         return {"skipped": "E2_PROBE30_BOOT is not 1"}
     return _spawn("probe30", "boot")
+
+
+def _probe30_retry() -> dict:
+    """Weekdays 20:05 IST, after the owner's evening Upstox login: run the 15/30-minute probe until one fresh probe has actually run (it needs a valid token)."""
+    from ingest import connect
+    conn = connect()
+    try:
+        d, _ = _get(conn, "engine2_probe30")
+    finally:
+        conn.close()
+    if d and (d.get("fresh_probe") or {}).get("ran") and not (d.get("fresh_probe") or {}).get("error"):
+        return {"skipped": "a fresh intraday probe has already run"}
+    return _spawn("probe30", "retry")
 
 
 def _exits_wl_if_idle() -> dict:
@@ -462,6 +475,8 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_swingcheck", _swingcheck_if_idle], id="engine2_swingcheck_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=12), timezone=ist),
                           args=["engine2_probe30", _probe30_if_idle], id="engine2_probe30_boot", replace_existing=True)
+        scheduler.add_job(guarded, CronTrigger(day_of_week="mon-fri", hour=20, minute=5, timezone=ist),
+                          args=["engine2_probe30", _probe30_retry], id="engine2_probe30_retry", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=32), timezone=ist),
                           args=["engine2_exits_wl", _exits_wl_if_idle], id="engine2_exits_wl_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
