@@ -225,7 +225,7 @@ def _fwddiag_if_idle() -> dict:
         return {"skipped": "E2_FWDDIAG_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwddiag when it has finished"}
-    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "pocket_pivot")})
+    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "flag_pennant")})
 
 
 def _swingcheck_if_idle() -> dict:
@@ -1028,7 +1028,7 @@ if __name__ == "__main__":                                    # the child proces
         print(json.dumps({k: v for k, v in e2_exits_wl.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwddiag":
         import e2_fwddiag
-        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "pocket_pivot"), trigger=trig).items()
+        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "flag_pennant"), trigger=trig).items()
                           if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwd":
         import e2_fwd
