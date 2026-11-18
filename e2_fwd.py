@@ -39,6 +39,7 @@ import pandas as pd
 
 import e2_backtest as BT
 import e2_det_momentum as DM
+import e2_swing_shadow as SW
 from e2_det_common import WARMUP
 from e2_detectors import dedupe, detect_all
 from e2_features import compute_features
@@ -170,6 +171,7 @@ def collect(data, pn, w0):
         lo = max(int(np.searchsorted(b.date, np.datetime64(w0, "D"))), WARMUP)
         cands, _ = detect_all(b, lo=lo)
         extra = []
+        extra += [c for c in SW.detect(b, lo=lo) if c.idx >= lo]                     # swing shadow candidates (oversold_dip): same gates, same horizons, same control
         for name, kw in PP_VARIANTS.items():
             for c in dedupe(DM.pocket_pivot(b, {}, lo, b.n, **kw)):
                 c2 = copy.copy(c)

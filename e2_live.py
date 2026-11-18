@@ -34,6 +34,7 @@ import e2_scorer as SC
 import e2_sector as SE
 from e2_core import Candidate
 from e2_detectors import DETECTORS as DETECTOR_NAMES, detect_all
+import e2_swing_shadow as SW
 from e2_features import compute_features
 
 log = logging.getLogger("engine2.live")
@@ -51,6 +52,8 @@ PUBLISH_DETECTORS = {d.strip() for d in os.environ.get("E2_PUBLISH_DETECTORS", "
 
 
 def is_shadow(detector: str) -> bool:
+    if detector in SW.SWING_DETECTORS:                          # swing candidates (18 Nov): shadow-only, whatever the environment says
+        return True
     return detector in SHADOW_DETECTORS or (bool(PUBLISH_DETECTORS) and detector not in PUBLISH_DETECTORS)
 
 
@@ -141,6 +144,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
             det_errors[name] += 1
             det_error_msgs.setdefault(name, msg[:200])
         cs = [c for c in cs if c.idx == b.n - 1]
+        cs = cs + [c for c in SW.detect(b, lo=b.n - 1) if c.idx == b.n - 1]     # shadow-only swing candidates; they never reach the book
         for c in cs:
             by_det[c.detector] += 1
             g = BT.gate(b, c, data.surveillance.get(sym), surv_active)
@@ -232,7 +236,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
             flog.append({"s": r["symbol"], "d": r["detector"], "dt": r["signal_date"], "sc": r["score"], "q": r["quality"],
                          "pv": r["pivot"], "st": r["plan"]["stop"], "sec": r["sector"], "sel": bool(r["selected"]), "fam": r["family"],
                          "rk": r["rank"], "wn": r.get("why_not"),
-                         "cp": [r["points"][k] for k in SC.COMPONENTS], "cs": (r.get("catalyst_source") or "?")[:1]})
+                         "cp": [r["points"][k] for k in SC.COMPONENTS], "cs": (r.get("catalyst_source") or "?")[:1],
+                         **({"x": "swing_shadow"} if r["detector"] in SW.SWING_DETECTORS else {})})
     resolved = 0
     cutoff = (last - pd.Timedelta(days=LOG_KEEP_DAYS)).strftime("%Y-%m-%d")
     for e in flog:
@@ -277,6 +282,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
 
 
 def forward_summary(flog: list[dict]) -> dict:
+    sw_closed = [e for e in flog if e.get("x") == "swing_shadow" and e.get("r") is not None]
+    flog = [e for e in flog if e.get("x") != "swing_shadow"]            # the position engine's forward summary excludes the swing shadow rows
     closed = [e for e in flog if e.get("r") is not None]
     by = defaultdict(list)
     for e in closed:
@@ -287,4 +294,6 @@ def forward_summary(flog: list[dict]) -> dict:
     return {"entries": len(flog), "closed": len(closed), "open_or_unresolved": len(flog) - len(closed),
             "overall": agg([e["r"] for e in closed]) if closed else None,
             "selected_only": agg([e["r"] for e in closed if e.get("sel")]) if any(e.get("sel") for e in closed) else None,
-            "by_detector": {k: agg(v) for k, v in sorted(by.items())}}
+            "by_detector": {k: agg(v) for k, v in sorted(by.items())},
+            "swing_shadow": ({"closed": len(sw_closed), "note": "R under the POSITION engine's exits - the swing exits are not designed; use the forward-return test (E2_FWD) for 1/3/5 sessions",
+                              "by_detector": {d: agg([e["r"] for e in sw_closed if e["d"] == d]) for d in sorted({e["d"] for e in sw_closed})}} if sw_closed else None)}
