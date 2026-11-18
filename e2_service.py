@@ -32,9 +32,13 @@ live strategy engine, the signals table or the live scan.
   GET  /jobs/engine2-fwd             the 7 Nov forward-return test: market-adjusted 5/10/20-session returns by detector, no stops (?format=md); E2FWD| lines
   POST /jobs/engine2/fwd             run it now (also runs ~24 minutes after a deploy while E2_FWD_BOOT=1)
   GET  /jobs/engine2-fwddiag         forward returns inside ONE detector split by signal-bar context (?detector=pullback_ema&format=md); E2FWDD| lines
-  POST /jobs/engine2/fwddiag         run it now (?detector=); also ~28 minutes after a deploy for E2_FWDDIAG_DETECTOR (default breakout_retest) while E2_FWDDIAG_BOOT=1
+  POST /jobs/engine2/fwddiag         run it now (?detector=); also ~28 minutes after a deploy for E2_FWDDIAG_DETECTOR (default undercut_reclaim) while E2_FWDDIAG_BOOT=1
   GET  /jobs/engine2-exits-wl        the 7 Nov exit study on the publishing detectors only + the 5-/20-session mode rulebooks (?format=md); E2EXW| lines
   POST /jobs/engine2/exits-wl        run it now (also ~32 minutes after a deploy while E2_EXITS_WL_BOOT=1)
+  GET  /jobs/engine2-volmatch        18 Nov volatility-matched control (?kind=volmatch|oversold&format=md); E2VM| lines. volmatch = gap_and_hold / gap_and_go / double_bottom; oversold = oversold-bounce entry test
+  POST /jobs/engine2/volmatch        run it now (?kind=); also ~34 (volmatch) and ~40 (oversold) minutes after a deploy while E2_VOLMATCH_BOOT=1 / E2_OVERSOLD_BOOT=1
+  GET  /jobs/engine2-probe-sample    the 15-minute history probe over a sample of symbols across the liquidity range (E2PRB| lines)
+  POST /jobs/engine2/probe-sample    run it now (needs a valid Upstox token); also ~16 minutes after a deploy while E2_PROBESAMPLE_BOOT=1 and weekdays 20:10 IST until it has run
   POST /jobs/engine2/exits           run it now (also runs ~22 minutes after a deploy while E2_EXITS_BOOT=1)
   POST /jobs/engine2/diagnose        re-run the disabled-pattern diagnosis now (it also runs ahead of every validation)
 """
@@ -225,7 +229,7 @@ def _fwddiag_if_idle() -> dict:
         return {"skipped": "E2_FWDDIAG_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwddiag when it has finished"}
-    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "breakout_retest")})
+    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "undercut_reclaim")})
 
 
 def _swingcheck_if_idle() -> dict:
@@ -242,6 +246,40 @@ def _probe30_if_idle() -> dict:
     if os.environ.get("E2_PROBE30_BOOT", "0") != "1":
         return {"skipped": "E2_PROBE30_BOOT is not 1"}
     return _spawn("probe30", "boot")
+
+
+def _volmatch_if_idle(kind: str = "volmatch") -> dict:
+    """Boot job: volatility-matched control (kind volmatch) or the oversold-bounce entry test (kind oversold); measurement only."""
+    var = "E2_VOLMATCH_BOOT" if kind == "volmatch" else "E2_OVERSOLD_BOOT"
+    if os.environ.get(var, "1") != "1":
+        return {"skipped": f"{var} is not 1"}
+    if _running_here():
+        return {"skipped": f"a validation run is in progress; POST /jobs/engine2/volmatch?kind={kind} when it has finished"}
+    return _spawn(f"volmatch:{kind}", "boot")
+
+
+def _oversold_if_idle() -> dict:
+    return _volmatch_if_idle("oversold")
+
+
+def _probe_sample_if_idle() -> dict:
+    if os.environ.get("E2_PROBESAMPLE_BOOT", "1") != "1":
+        return {"skipped": "E2_PROBESAMPLE_BOOT is not 1"}
+    return _spawn("probe_sample", "boot")
+
+
+def _probe_sample_retry() -> dict:
+    """Weekdays 20:10 IST, after the owner's evening Upstox login: run the sample probe until it has actually run (it needs a valid token)."""
+    from ingest import connect
+    import e2_probe30
+    conn = connect()
+    try:
+        d, _ = _get(conn, e2_probe30.SAMPLE_KEY)
+    finally:
+        conn.close()
+    if d and d.get("ran") and d.get("state") == "done":
+        return {"skipped": "the 15-minute sample probe has already run"}
+    return _spawn("probe_sample", "retry")
 
 
 def _probe30_retry() -> dict:
@@ -477,6 +515,14 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_probe30", _probe30_if_idle], id="engine2_probe30_boot", replace_existing=True)
         scheduler.add_job(guarded, CronTrigger(day_of_week="mon-fri", hour=20, minute=5, timezone=ist),
                           args=["engine2_probe30", _probe30_retry], id="engine2_probe30_retry", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=16), timezone=ist),
+                          args=["engine2_probe_sample", _probe_sample_if_idle], id="engine2_probe_sample_boot", replace_existing=True)
+        scheduler.add_job(guarded, CronTrigger(day_of_week="mon-fri", hour=20, minute=10, timezone=ist),
+                          args=["engine2_probe_sample", _probe_sample_retry], id="engine2_probe_sample_retry", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=34), timezone=ist),
+                          args=["engine2_volmatch", _volmatch_if_idle], id="engine2_volmatch_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=40), timezone=ist),
+                          args=["engine2_oversold", _oversold_if_idle], id="engine2_oversold_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=32), timezone=ist),
                           args=["engine2_exits_wl", _exits_wl_if_idle], id="engine2_exits_wl_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=6), timezone=ist),
@@ -884,6 +930,49 @@ def register(app, *, require_internal_key, ist) -> None:
             return {"started": False, "reason": "a validation run is in progress"}
         return _spawn("fwddiag", "manual", {"E2_FWDDIAG_DETECTOR": detector})
 
+    @app.get("/jobs/engine2-volmatch")
+    def e2_volmatch_view(request: Request, kind: str = "volmatch", format: str = "json"):
+        """Volatility-matched control (kind volmatch) / oversold-bounce entry test (kind oversold). Measurement only."""
+        require_internal_key(request)
+        import e2_volmatch
+        if kind not in e2_volmatch.KINDS:
+            raise HTTPException(400, "kind must be volmatch | oversold")
+        conn = connect()
+        try:
+            d, _ = _get(conn, e2_volmatch.KINDS[kind]["key"])
+        finally:
+            conn.close()
+        if not d:
+            raise HTTPException(404, f"has not run yet (POST /jobs/engine2/volmatch?kind={kind})")
+        return PlainTextResponse(e2_volmatch.render_markdown(d)) if format == "md" else d
+
+    @app.post("/jobs/engine2/volmatch")
+    def e2_volmatch_now(request: Request, kind: str = "volmatch"):
+        require_internal_key(request)
+        if kind not in ("volmatch", "oversold"):
+            raise HTTPException(400, "kind must be volmatch | oversold")
+        if _running_here():
+            return {"started": False, "reason": "a validation run is in progress"}
+        return _spawn(f"volmatch:{kind}", "manual")
+
+    @app.get("/jobs/engine2-probe-sample")
+    def e2_probe_sample_view(request: Request, format: str = "json"):
+        require_internal_key(request)
+        import e2_probe30
+        conn = connect()
+        try:
+            d, _ = _get(conn, e2_probe30.SAMPLE_KEY)
+        finally:
+            conn.close()
+        if not d:
+            raise HTTPException(404, "has not run yet (POST /jobs/engine2/probe-sample)")
+        return PlainTextResponse(e2_probe30.render_sample(d)) if format == "md" else d
+
+    @app.post("/jobs/engine2/probe-sample")
+    def e2_probe_sample_now(request: Request):
+        require_internal_key(request)
+        return _spawn("probe_sample", "manual")
+
     @app.get("/jobs/engine2-swingcheck")
     def e2_swingcheck_view(request: Request, format: str = "json"):
         """gap_and_hold conditional check and the episodic_pivot day-1 profile (measurement only)."""
@@ -1017,6 +1106,13 @@ if __name__ == "__main__":                                    # the child proces
     if kind == "defdiag":
         import e2_defdiag
         print(json.dumps({k: v for k, v in e2_defdiag.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind.startswith("volmatch"):
+        import e2_volmatch
+        print(json.dumps({k: v for k, v in e2_volmatch.run(kind.split(":", 1)[1] if ":" in kind else "volmatch", trigger=trig).items()
+                          if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "probe_sample":
+        import e2_probe30
+        print(json.dumps({k: v for k, v in e2_probe30.run_sample(trigger=trig).items() if k in ("state", "runtime_sec", "error", "ran", "reason")}, default=str))
     elif kind == "probe30":
         import e2_probe30
         print(json.dumps({k: v for k, v in e2_probe30.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
@@ -1028,7 +1124,7 @@ if __name__ == "__main__":                                    # the child proces
         print(json.dumps({k: v for k, v in e2_exits_wl.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwddiag":
         import e2_fwddiag
-        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "breakout_retest"), trigger=trig).items()
+        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "undercut_reclaim"), trigger=trig).items()
                           if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwd":
         import e2_fwd

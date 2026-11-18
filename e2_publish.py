@@ -158,7 +158,7 @@ def publish(conn, out: dict, mode: str, today: date | None = None) -> dict:
     reg = out.get("regime") or {}
     res = {"as_of": str(as_of), "mode": mode, "provisional": provisional, "picks_in": len(picks), "inserted": 0, "updated": 0,
            "unchanged": 0, "skipped_already_taken": 0, "skipped_symbol_has_open_position": 0, "withdrawn": 0, "malformed": 0,
-           "malformed_detail": [], "invalidated": 0, "expired": 0, "symbols": []}
+           "malformed_detail": [], "invalidated": 0, "expired": 0, "symbols": [], "withdrawn_symbols": [], "confirmed_symbols": []}
 
     if kill_switch_active(conn):
         log.warning("Kill switch active: Engine 2 publish aborted, nothing written")
@@ -231,6 +231,7 @@ def publish(conn, out: dict, mode: str, today: date | None = None) -> dict:
             res["symbols"].append(f"{p['symbol']}:{p['detector']}")
 
         if not provisional:                                           # the definitive scan settles every provisional row of that date
+            res["confirmed_symbols"] = [f"{k[0]}:{k[1]}" for k, ex in existing.items() if ex["provisional"] and ex["status"] == "pending" and k in keep]
             for key, ex in existing.items():
                 if ex["provisional"] and ex["status"] == "pending" and key not in keep:
                     with conn.cursor() as cur:
@@ -238,6 +239,7 @@ def publish(conn, out: dict, mode: str, today: date | None = None) -> dict:
                                        notes = jsonb_set(notes, '{withdrawn}', to_jsonb(%s::text)) where id = %s""",
                                     (f"provisional intraday signal not confirmed by the {mode} scan", ex["id"]))
                     res["withdrawn"] += 1
+                    res["withdrawn_symbols"].append(f"{key[0]}:{key[1]}")
 
         res.update(lifecycle(conn, today))
         if kill_switch_active(conn):                                  # STOP pressed while this was running: write nothing
@@ -253,6 +255,9 @@ def publish(conn, out: dict, mode: str, today: date | None = None) -> dict:
     log.info("Engine 2 published [%s %s]: %d new, %d updated, %d withdrawn, %d malformed | unchanged %d, already taken %d | signals: %s",
              mode, as_of, res["inserted"], res["updated"], res["withdrawn"], res["malformed"], res["unchanged"],
              res["skipped_already_taken"], ", ".join(res["symbols"]) or "none")
+    if not provisional:                                           # 18 Nov (owner): a provisional row's fate is a log line, not an inference from counts
+        log.info("Engine 2 provisional rows settled [%s %s]: withdrawn %d (%s) | confirmed %d (%s)", mode, as_of, res["withdrawn"],
+                 ", ".join(res["withdrawn_symbols"]) or "none", len(res["confirmed_symbols"]), ", ".join(res["confirmed_symbols"]) or "none")
     return res
 
 
