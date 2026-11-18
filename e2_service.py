@@ -32,13 +32,13 @@ live strategy engine, the signals table or the live scan.
   GET  /jobs/engine2-fwd             the 7 Nov forward-return test: market-adjusted 5/10/20-session returns by detector, no stops (?format=md); E2FWD| lines
   POST /jobs/engine2/fwd             run it now (also runs ~24 minutes after a deploy while E2_FWD_BOOT=1)
   GET  /jobs/engine2-fwddiag         forward returns inside ONE detector split by signal-bar context (?detector=pullback_ema&format=md); E2FWDD| lines
-  POST /jobs/engine2/fwddiag         run it now (?detector=); also ~28 minutes after a deploy for E2_FWDDIAG_DETECTOR (default undercut_reclaim) while E2_FWDDIAG_BOOT=1
+  POST /jobs/engine2/fwddiag         run it now (?detector=); also ~28 minutes after a deploy for E2_FWDDIAG_DETECTOR (default cup_handle) while E2_FWDDIAG_BOOT=1
   GET  /jobs/engine2-exits-wl        the 7 Nov exit study on the publishing detectors only + the 5-/20-session mode rulebooks (?format=md); E2EXW| lines
   POST /jobs/engine2/exits-wl        run it now (also ~32 minutes after a deploy while E2_EXITS_WL_BOOT=1)
   GET  /jobs/engine2-volmatch        18 Nov volatility-matched control (?kind=volmatch|oversold&format=md); E2VM| lines. volmatch = gap_and_hold / gap_and_go / double_bottom; oversold = oversold-bounce entry test
-  POST /jobs/engine2/volmatch        run it now (?kind=); also ~34 (volmatch) and ~40 (oversold) minutes after a deploy while E2_VOLMATCH_BOOT=1 / E2_OVERSOLD_BOOT=1
+  POST /jobs/engine2/volmatch        run it now (?kind=); also ~34 (volmatch) and ~40 (oversold) minutes after a deploy while E2_VOLMATCH_BOOT=1 / E2_OVERSOLD_BOOT=1 (both default off after the 18 Nov read)
   GET  /jobs/engine2-probe-sample    the 15-minute history probe over a sample of symbols across the liquidity range (E2PRB| lines)
-  POST /jobs/engine2/probe-sample    run it now (needs a valid Upstox token); also ~16 minutes after a deploy while E2_PROBESAMPLE_BOOT=1 and weekdays 20:10 IST until it has run
+  POST /jobs/engine2/probe-sample    run it now (needs a valid Upstox token); also ~16 minutes after a deploy while E2_PROBESAMPLE_BOOT=1 (default off) and weekdays 20:10 IST until it has run
   POST /jobs/engine2/exits           run it now (also runs ~22 minutes after a deploy while E2_EXITS_BOOT=1)
   POST /jobs/engine2/diagnose        re-run the disabled-pattern diagnosis now (it also runs ahead of every validation)
 """
@@ -229,7 +229,7 @@ def _fwddiag_if_idle() -> dict:
         return {"skipped": "E2_FWDDIAG_BOOT is not 1"}
     if _running_here():
         return {"skipped": "a validation run is in progress; POST /jobs/engine2/fwddiag when it has finished"}
-    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "undercut_reclaim")})
+    return _spawn("fwddiag", "boot", {"E2_FWDDIAG_DETECTOR": os.environ.get("E2_FWDDIAG_DETECTOR", "cup_handle")})
 
 
 def _swingcheck_if_idle() -> dict:
@@ -251,7 +251,7 @@ def _probe30_if_idle() -> dict:
 def _volmatch_if_idle(kind: str = "volmatch") -> dict:
     """Boot job: volatility-matched control (kind volmatch) or the oversold-bounce entry test (kind oversold); measurement only."""
     var = "E2_VOLMATCH_BOOT" if kind == "volmatch" else "E2_OVERSOLD_BOOT"
-    if os.environ.get(var, "1") != "1":
+    if os.environ.get(var, "0") != "1":                        # read 18 Nov; POST /jobs/engine2/volmatch?kind= to rerun
         return {"skipped": f"{var} is not 1"}
     if _running_here():
         return {"skipped": f"a validation run is in progress; POST /jobs/engine2/volmatch?kind={kind} when it has finished"}
@@ -263,7 +263,7 @@ def _oversold_if_idle() -> dict:
 
 
 def _probe_sample_if_idle() -> dict:
-    if os.environ.get("E2_PROBESAMPLE_BOOT", "1") != "1":
+    if os.environ.get("E2_PROBESAMPLE_BOOT", "0") != "1":
         return {"skipped": "E2_PROBESAMPLE_BOOT is not 1"}
     return _spawn("probe_sample", "boot")
 
@@ -1124,7 +1124,7 @@ if __name__ == "__main__":                                    # the child proces
         print(json.dumps({k: v for k, v in e2_exits_wl.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwddiag":
         import e2_fwddiag
-        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "undercut_reclaim"), trigger=trig).items()
+        print(json.dumps({k: v for k, v in e2_fwddiag.run(os.environ.get("E2_FWDDIAG_DETECTOR", "cup_handle"), trigger=trig).items()
                           if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "fwd":
         import e2_fwd
