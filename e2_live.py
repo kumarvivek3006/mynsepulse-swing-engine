@@ -127,6 +127,7 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
     rows, gated, stale, short = [], Counter(), 0, 0
     by_det = Counter()
     gated_det, stale_names = Counter(), []                      # record-only: which detector lost candidates at which gate / which symbols were stale
+    swing_seen, swing_gated = [], []                            # record-only (26 Nov): the swing shadow candidates of this scan and the ones a gate removed, by symbol
     det_errors, det_error_msgs = Counter(), {}                  # a detector that throws is a visible line, never a hole
     bars_cache = {}
     for sym, df in sorted(data.frames.items()):
@@ -148,6 +149,11 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
         for c in cs:
             by_det[c.detector] += 1
             g = BT.gate(b, c, data.surveillance.get(sym), surv_active)
+            if c.detector in SW.SWING_DETECTORS:
+                swing_seen.append(f"{sym}:{c.detector}")
+                if g:
+                    sv = data.surveillance.get(sym)
+                    swing_gated.append(f"{sym}:{c.detector}:{g}" + (f" (flagged on {len(sv)} snapshot(s), latest {str(sv[-1])[:10]})" if g == "surveillance" and sv is not None and len(sv) else ""))
             if g:
                 gated[g] += 1
                 gated_det[(c.detector, g)] += 1
@@ -174,6 +180,8 @@ def scan(conn, mode: str = "postclose", data=None, extra: dict | None = None) ->
                          "components": {k: round(float(v), 3) for k, v in frac.items() if not k.startswith("_")},
                          "points": SC.points_for(frac, c.detector),   # what each component added under the weights in force (detector or spec)
                          "catalyst_source": frac["_catalyst_source"], "next_results": nxt, "plan": plan, "meta": c.meta})
+    log.info("swing shadow [%s %s]: %d candidate(s) %s | gated %s | surveillance list %d symbol(s)", mode, str(last.date()), len(swing_seen),
+             swing_seen[:20], swing_gated[:20], sum(1 for v in data.surveillance.values() if len(v)))
     for r_ in rows:
         r_["shadow"] = is_shadow(r_["detector"])
     rows.sort(key=lambda r: (r["shadow"], -r["score"]))             # shadowed detectors rank after every publishable candidate
