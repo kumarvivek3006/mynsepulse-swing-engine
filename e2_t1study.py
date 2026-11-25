@@ -118,8 +118,12 @@ def enrich(data, pn, delivery: dict, trades, prog=None) -> list[dict]:
             e = t.signal_idx + 1
             rec = {"det": t.detector, "family": t.family, "date": d64, "r": float(t.r), "old": {c: float(t.frac[c]) for c in SC.COMPONENTS},
                    "new": {c: float(fnew[c]) for c in T1.NEW_COMPONENTS}, "deliv_lag1": T1.delivery_fraction(d1p),
-                   "deliv_missing": bool(fnew["_delivery_missing"]), "earn": fnew["_catalyst_source"] == "earnings",
-                   "sector_known": not (rk is None or np.isnan(rk)), "d1": np.nan, **{f"f{h}": np.nan for h in HORIZONS}}
+                   "deliv_missing": bool(fnew["_delivery_missing"]),
+                   "deliv_pct": float(d0) if d0 is not None else np.nan, "deliv_pct1": float(d1p) if d1p is not None else np.nan, "earn": fnew["_catalyst_source"] == "earnings",
+                   "sector_known": not (rk is None or np.isnan(rk)), "d1": np.nan, **{f"f{h}": np.nan for h in HORIZONS},
+                   "atrp": float(b.atr_pct[t.signal_idx]) if t.signal_idx < b.n else np.nan,
+                   "dist52": float(100.0 * (b.c[t.signal_idx] / b.high52[t.signal_idx] - 1.0)) if t.signal_idx < b.n and b.high52[t.signal_idx] > 0 else np.nan,
+                   "week": int((d64 - np.datetime64("2000-01-03", "D")).astype(int) // 7), "sym": sym}
             if e < b.n and b.o[e] > 0:
                 rec["d1"] = 100.0 * (b.c[e] / b.o[e] - 1.0)
                 for h in HORIZONS:
@@ -272,7 +276,8 @@ def log_markdown(md: str) -> int:
     return n
 
 
-def compute(data, delivery: dict, out: dict, prog=None) -> dict:
+def collect_recs(data, delivery: dict, out: dict, prog=None):
+    """The round-1 trades (BT.per_symbol) enriched with the new fractions; returns (records, split timestamp). Fills out['window']."""
     import e2_det_momentum as DM
     pn = BT.build_panels(data)
     w0 = pn.cal[max(0, len(pn.cal) - BT.WINDOW_BARS)]
@@ -284,7 +289,11 @@ def compute(data, delivery: dict, out: dict, prog=None) -> dict:
         ps = BT.per_symbol(data, pn, w0, prog)
     finally:
         DM.PP_STRICT = keep
-    recs = enrich(data, pn, delivery, ps["trades"], prog)
+    return enrich(data, pn, delivery, ps["trades"], prog), mid
+
+
+def compute(data, delivery: dict, out: dict, prog=None) -> dict:
+    recs, mid = collect_recs(data, delivery, out, prog)
     out.update(study(recs, mid))
     return out
 

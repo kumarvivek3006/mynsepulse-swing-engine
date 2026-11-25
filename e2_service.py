@@ -241,6 +241,24 @@ def _t1study_if_idle() -> dict:
     return _spawn("t1study", "boot")
 
 
+def _nearhigh_if_idle() -> dict:
+    """Boot job: 52-week-high standalone filter study (owner's order of 26 Nov 03:22 IST). Loads the full history; measurement only."""
+    if os.environ.get("E2_NEARHIGH_BOOT", "1") != "1":
+        return {"skipped": "E2_NEARHIGH_BOOT is not 1"}
+    if _running_here():
+        return {"skipped": "a validation run is in progress"}
+    return _spawn("nearhigh", "boot")
+
+
+def _t1inv_if_idle() -> dict:
+    """Boot job: inverse-delivery test (owner's order of 26 Nov 03:22 IST). Loads the full history; measurement only."""
+    if os.environ.get("E2_T1INV_BOOT", "1") != "1":
+        return {"skipped": "E2_T1INV_BOOT is not 1"}
+    if _running_here():
+        return {"skipped": "a validation run is in progress"}
+    return _spawn("t1inv", "boot")
+
+
 def _t1cov_if_idle() -> dict:
     """Boot job: Tier 1 data coverage probe (delivery %, results calendar, sector map). Read-only; measurement only."""
     if os.environ.get("E2_T1COV_BOOT", "0") != "1":
@@ -531,6 +549,10 @@ def schedule(scheduler, guarded, ist) -> None:
                           args=["engine2_t1cov", _t1cov_if_idle], id="engine2_t1cov_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=40), timezone=ist),
                           args=["engine2_t1study", _t1study_if_idle], id="engine2_t1study_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=34), timezone=ist),
+                          args=["engine2_nearhigh", _nearhigh_if_idle], id="engine2_nearhigh_boot", replace_existing=True)
+        scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=44), timezone=ist),
+                          args=["engine2_t1inv", _t1inv_if_idle], id="engine2_t1inv_boot", replace_existing=True)
         scheduler.add_job(guarded, DateTrigger(run_date=now + timedelta(minutes=12), timezone=ist),
                           args=["engine2_probe30", _probe30_if_idle], id="engine2_probe30_boot", replace_existing=True)
         scheduler.add_job(guarded, CronTrigger(day_of_week="mon-fri", hour=20, minute=5, timezone=ist),
@@ -1139,6 +1161,12 @@ if __name__ == "__main__":                                    # the child proces
     elif kind == "t1study":
         import e2_t1study
         print(json.dumps({k: v for k, v in e2_t1study.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "nearhigh":
+        import e2_nearhigh
+        print(json.dumps({k: v for k, v in e2_nearhigh.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
+    elif kind == "t1inv":
+        import e2_t1inv
+        print(json.dumps({k: v for k, v in e2_t1inv.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
     elif kind == "t1cov":
         import e2_t1cov
         print(json.dumps({k: v for k, v in e2_t1cov.run(trigger=trig).items() if k in ("state", "runtime_sec", "error")}, default=str))
